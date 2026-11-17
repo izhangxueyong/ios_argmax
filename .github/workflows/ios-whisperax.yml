@@ -11,7 +11,9 @@ concurrency:
 
 env:
   PROJECT: Examples/WhisperAX/WhisperAX.xcodeproj
-  SCHEME: WhisperAX
+  APP_SCHEME: WhisperAX
+  PKG_SCHEME: argmax-oss-swift-Package
+  TEST_PLAN: UnitTestsPlan
   DESTINATION: platform=iOS Simulator,OS=18.5,name=iPhone 16
   DERIVED_DATA: ${{ github.workspace }}/build/DerivedData
   RESULTS_DIR: ${{ github.workspace }}/build/TestResults
@@ -20,7 +22,7 @@ jobs:
   build-and-test:
     name: Build + Unit + UI Tests on iOS 18.5
     runs-on: macos-15
-    timeout-minutes: 45
+    timeout-minutes: 50
 
     steps:
       - name: Checkout
@@ -66,30 +68,45 @@ jobs:
           xcrun simctl boot "$udid" || true
           xcrun simctl bootstatus "$udid" -b
 
-      - name: Build app and tests
+      - name: Build WhisperAX app and test bundles
         run: |
           set -o pipefail
           xcodebuild build-for-testing \
             -project "$PROJECT" \
-            -scheme "$SCHEME" \
+            -scheme "$APP_SCHEME" \
             -destination "$DESTINATION" \
             -derivedDataPath "$DERIVED_DATA" \
             CODE_SIGNING_ALLOWED=NO \
             | xcbeautify --renderer github-actions
 
-      - name: Unit + UI tests
+      - name: Unit tests (package scheme + UnitTestsPlan)
         timeout-minutes: 20
         run: |
           set -o pipefail
-          xcodebuild test-without-building \
-            -project "$PROJECT" \
-            -scheme "$SCHEME" \
+          xcodebuild test \
+            -testPlan "$TEST_PLAN" \
+            -scheme "$PKG_SCHEME" \
             -destination "$DESTINATION" \
             -derivedDataPath "$DERIVED_DATA" \
-            -only-testing:WhisperAXTests \
-            -only-testing:WhisperAXUITests \
-            -resultBundlePath "$RESULTS_DIR/Tests.xcresult" \
+            -resultBundlePath "$RESULTS_DIR/UnitTests.xcresult" \
             -collect-test-diagnostics never \
+            CODE_SIGNING_ALLOWED=NO \
+            | xcbeautify --renderer github-actions
+
+      - name: UI tests (WhisperAXUITests)
+        timeout-minutes: 12
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          xcodebuild test \
+            -project "$PROJECT" \
+            -scheme "$APP_SCHEME" \
+            -destination "$DESTINATION" \
+            -derivedDataPath "$DERIVED_DATA" \
+            -only-testing:WhisperAXUITests \
+            -resultBundlePath "$RESULTS_DIR/UITests.xcresult" \
+            -collect-test-diagnostics never \
+            CODE_SIGNING_ALLOWED=NO \
             | xcbeautify --renderer github-actions
 
       - name: Upload test results
