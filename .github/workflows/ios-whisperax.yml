@@ -119,11 +119,29 @@ jobs:
           ls -d "$APP_PATH"
           BUNDLE_ID=$(/usr/libexec/PlistBuddy -c "Print CFBundleIdentifier" "$APP_PATH/Info.plist")
           echo "Bundle ID: $BUNDLE_ID"
-          xcrun simctl install booted "$APP_PATH"
-          xcrun simctl launch booted "$BUNDLE_ID"
+
+          # xcodebuild test shuts the simulator down, so re-boot it explicitly
+          UDID=$(xcrun simctl list devices -j | python3 -c '
+          import json, sys
+          d = json.load(sys.stdin)
+          for runtime, devices in d["devices"].items():
+              if "iOS-18-5" not in runtime:
+                  continue
+              for dev in devices:
+                  if dev["name"] == "iPhone 16" and dev.get("isAvailable"):
+                      print(dev["udid"])
+                      break
+          ' | head -1)
+          echo "Simulator UDID: $UDID"
+          xcrun simctl boot "$UDID" || true
+          xcrun simctl bootstatus "$UDID" -b
+
+          xcrun simctl terminate "$UDID" "$BUNDLE_ID" 2>/dev/null || true
+          xcrun simctl install "$UDID" "$APP_PATH"
+          xcrun simctl launch "$UDID" "$BUNDLE_ID"
           sleep 12
           mkdir -p build/Screenshots
-          xcrun simctl io booted screenshot build/Screenshots/WhisperAX-home.png
+          xcrun simctl io "$UDID" screenshot build/Screenshots/WhisperAX-home.png
           ls -lh build/Screenshots/
 
       - name: Upload test results
