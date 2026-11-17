@@ -49,6 +49,23 @@ jobs:
       - name: Prepare output directories
         run: mkdir -p "$RESULTS_DIR"
 
+      - name: Boot iOS Simulator
+        run: |
+          udid=$(xcrun simctl list devices -j | python3 -c '
+          import json, sys
+          d = json.load(sys.stdin)
+          for runtime, devices in d["devices"].items():
+              if "iOS-18-5" not in runtime:
+                  continue
+              for dev in devices:
+                  if dev["name"] == "iPhone 16" and dev.get("isAvailable"):
+                      print(dev["udid"])
+                      break
+          ' | head -1)
+          echo "Simulator UDID: $udid"
+          xcrun simctl boot "$udid" || true
+          xcrun simctl bootstatus "$udid" -b
+
       - name: Build app and tests
         run: |
           set -o pipefail
@@ -60,7 +77,8 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             | xcbeautify --renderer github-actions
 
-      - name: Unit tests
+      - name: Unit + UI tests
+        timeout-minutes: 20
         run: |
           set -o pipefail
           xcodebuild test-without-building \
@@ -69,20 +87,8 @@ jobs:
             -destination "$DESTINATION" \
             -derivedDataPath "$DERIVED_DATA" \
             -only-testing:WhisperAXTests \
-            -resultBundlePath "$RESULTS_DIR/UnitTests.xcresult" \
-            -collect-test-diagnostics never \
-            | xcbeautify --renderer github-actions
-
-      - name: UI tests
-        run: |
-          set -o pipefail
-          xcodebuild test-without-building \
-            -project "$PROJECT" \
-            -scheme "$SCHEME" \
-            -destination "$DESTINATION" \
-            -derivedDataPath "$DERIVED_DATA" \
             -only-testing:WhisperAXUITests \
-            -resultBundlePath "$RESULTS_DIR/UITests.xcresult" \
+            -resultBundlePath "$RESULTS_DIR/Tests.xcresult" \
             -collect-test-diagnostics never \
             | xcbeautify --renderer github-actions
 
