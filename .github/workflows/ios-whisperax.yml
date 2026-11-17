@@ -109,8 +109,8 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             | xcbeautify --renderer github-actions
 
-      - name: Launch app and capture screenshot
-        timeout-minutes: 10
+      - name: Launch app, record demo video and capture screenshot
+        timeout-minutes: 12
         continue-on-error: true
         run: |
           set -e
@@ -138,10 +138,25 @@ jobs:
 
           xcrun simctl terminate "$UDID" "$BUNDLE_ID" 2>/dev/null || true
           xcrun simctl install "$UDID" "$APP_PATH"
-          xcrun simctl launch "$UDID" "$BUNDLE_ID"
-          sleep 12
+
           mkdir -p build/Screenshots
+
+          # Record the launch animation + home screen.
+          # SIGINT is required so simctl finalizes a playable MP4.
+          echo "Starting screen recording..."
+          xcrun simctl io "$UDID" recordVideo --codec=h264 build/Screenshots/WhisperAX-demo.mp4 &
+          RECORD_PID=$!
+          sleep 2
+
+          xcrun simctl launch "$UDID" "$BUNDLE_ID"
+          sleep 16
+
           xcrun simctl io "$UDID" screenshot build/Screenshots/WhisperAX-home.png
+
+          echo "Stopping screen recording (PID $RECORD_PID)..."
+          kill -SIGINT "$RECORD_PID"
+          wait "$RECORD_PID" || true
+
           ls -lh build/Screenshots/
 
       - name: Upload test results
@@ -153,11 +168,13 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
-      - name: Upload app screenshot
+      - name: Upload app screenshot and demo video
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: whisperax-ios-screenshot
-          path: build/Screenshots/*.png
+          name: whisperax-ios-demo
+          path: |
+            build/Screenshots/*.png
+            build/Screenshots/*.mp4
           if-no-files-found: warn
           retention-days: 7
