@@ -1,0 +1,145 @@
+name: AutoTranscribe (whisper-base, full run recording)
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: autotranscribe-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PROJECT: Examples/AutoTranscribe/AutoTranscribe.xcodeproj
+  SCHEME: AutoTranscribe
+  BUNDLE_ID: com.argmax.autotranscribe
+  DESTINATION: platform=iOS Simulator,OS=18.5,name=iPhone 16
+  DERIVED_DATA: ${{ github.workspace }}/build/AutoTranscribeDerivedData
+  MEDIA_DIR: ${{ github.workspace }}/build/AutoTranscribeMedia
+
+jobs:
+  autotranscribe:
+    name: Build + run automatic transcription, record full run
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Xcode 16.4
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '16.4'
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          swift --version
+
+      - name: Cache Swift Package Manager
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/Library/Caches/org.swift.swiftpm
+            ${{ env.DERIVED_DATA }}/SourcePackages
+          key: ${{ runner.os }}-spm-${{ hashFiles('**/Package.resolved') }}
+          restore-keys: ${{ runner.os }}-spm-
+
+      - name: Prepare directories
+        run: mkdir -p "$MEDIA_DIR"
+
+      - name: Boot iOS Simulator
+        run: |
+          UDID=$(xcrun simctl list devices -j | python3 -c '
+          import json, sys
+          d = json.load(sys.stdin)
+          for runtime, devices in d["devices"].items():
+              if "iOS-18-5" not in runtime:
+                  continue
+              for dev in devices:
+                  if dev["name"] == "iPhone 16" and dev.get("isAvailable"):
+                      print(dev["udid"]); break
+          ' | head -1)
+          echo "UDID=$UDID" >> "$GITHUB_ENV"
+          echo "Simulator UDID: $UDID"
+          xcrun simctl boot "$UDID" || true
+          xcrun simctl bootstatus "$UDID" -b
+
+      - name: Build AutoTranscribe app
+        run: |
+          set -o pipefail
+          xcodebuild build \
+            -project "$PROJECT" \
+            -scheme "$SCHEME" \
+            -destination "$DESTINATION" \
+            -derivedDataPath "$DERIVED_DATA" \
+            CODE_SIGNING_ALLOWED=NO \
+            | xcbeautify --renderer github-actions
+
+      - name: Install app on simulator
+        run: |
+          APP_PATH="$DERIVED_DATA/Build/Products/Debug-iphonesimulator/AutoTranscribe.app"
+          echo "App: $APP_PATH"
+          test -d "$APP_PATH"
+          xcrun simctl install "$UDID" "$APP_PATH"
+          echo "Installed $BUNDLE_ID"
+
+      - name: Run app and record full pipeline (launch -> result)
+        timeout-minutes: 40
+        run: |
+          set -e
+          CONTAINER=$(xcrun simctl get_app_container "$UDID" "$BUNDLE_ID" data)
+          echo "App data container: $CONTAINER"
+          DOCS="$CONTAINER/Documents"
+          rm -f "$DOCS/transcription_done.txt" "$DOCS/progress.log" 2>/dev/null || true
+
+          # Start recording BEFORE launch so the launch animation is captured.
+          echo "Starting screen recording..."
+          xcrun simctl io "$UDID" recordVideo --codec=h264 "$MEDIA_DIR/AutoTranscribe-full-run.mp4" &
+          RECORD_PID=$!
+          sleep 2
+
+          xcrun simctl launch "$UDID" "$BUNDLE_ID"
+
+          # Poll for the completion sentinel written by the app.
+          echo "Waiting for transcription to finish..."
+          DONE=0
+          for i in $(seq 1 120); do
+            if [ -f "$DOCS/transcription_done.txt" ]; then
+              echo "Sentinel found at check $i"
+              DONE=1
+              break
+            fi
+            # Stream progress log into the workflow log for visibility.
+            if [ -f "$DOCS/progress.log" ]; then
+              tail -n 1 "$DOCS/progress.log" | sed 's/^/  [app] /' || true
+            fi
+            sleep 15
+          done
+
+          if [ "$DONE" -ne 1 ]; then
+            echo "WARNING: completion sentinel not found within 30 min"
+          fi
+
+          # Let the final result stay on screen for a few seconds.
+          sleep 8
+
+          echo "Stopping screen recording (PID $RECORD_PID)..."
+          kill -SIGINT "$RECORD_PID"
+          wait "$RECORD_PID" || true
+
+          echo "=== transcription_done.txt ==="
+          cat "$DOCS/transcription_done.txt" 2>/dev/null || echo "(missing)"
+          echo "=== progress.log ==="
+          cat "$DOCS/progress.log" 2>/dev/null || echo "(missing)"
+
+          ls -lh "$MEDIA_DIR/"
+
+      - name: Upload full-run video
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: autotranscribe-full-run
+          path: ${{ env.MEDIA_DIR }}/*.mp4
+          if-no-files-found: warn
+          retention-days: 7
