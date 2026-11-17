@@ -78,3 +78,6 @@ fastlane/upload_folder
 *.swiftdeps
 *.swiftmodule
 *.swiftdoc
+
+# WorkBuddy project memory
+.workbuddy/
