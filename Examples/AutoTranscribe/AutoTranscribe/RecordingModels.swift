@@ -86,21 +86,41 @@ enum WaveformExtractor {
         for bar in 0..<bars {
             let start = bar * step
             guard start < frames else { break }
-            let end = min(start + step, frames)
+            let end = Swift.min(start + step, frames)
             var sum: Float = 0
-            for i in start..<end { sum += channel[i] * channel[i] }
-            values[bar] = Double(sqrt(sum / Float(end - start)))
+            for i in start..<end {
+                let sample: Float = channel[i]
+                sum += sample * sample
+            }
+            let count: Float = Float(end - start)
+            let mean: Float = sum / count
+            values[bar] = Double(sqrt(mean))
         }
 
-        let peak = values.max() ?? 0
+        let peak: Double = values.max() ?? 0
         guard peak > 0 else { return fallback(bars: bars) }
-        return values.map { min(1, max(0.08, $0 / peak)) }
+        var normalized = [Double]()
+        normalized.reserveCapacity(bars)
+        for value in values {
+            let ratio: Double = value / peak
+            let lower: Double = Swift.max(0.08, ratio)
+            let clamped: Double = Swift.min(1.0, lower)
+            normalized.append(clamped)
+        }
+        return normalized
     }
 
     static func fallback(bars: Int = 48) -> [Double] {
-        (0..<bars).map { i in
-            0.18 + 0.62 * abs(sin(Double(i) * 0.47) * cos(Double(i) * 0.19))
+        var values = [Double]()
+        values.reserveCapacity(bars)
+        for i in 0..<bars {
+            let phase: Double = Double(i)
+            let wave: Double = sin(phase * 0.47) * cos(phase * 0.19)
+            let amplitude: Double = abs(wave)
+            let value: Double = 0.18 + 0.62 * amplitude
+            values.append(value)
         }
+        return values
     }
 }
 
