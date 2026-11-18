@@ -57,6 +57,7 @@
 				A2000000000000000000002 /* ContentView.swift */,
 				A2000000000000000000007 /* RecordingModels.swift */,
 				A2000000000000000000008 /* TranscriptionService.swift */,
+				A5000000000000000000005 /* Models */,
 				A5000000000000000000004 /* Resources */,
 			);
 			path = AutoTranscribe;
@@ -74,7 +75,6 @@
 			isa = PBXGroup;
 			children = (
 				A2000000000000000000003 /* recording.wav */,
-				A5000000000000000000005 /* Models */,
 			);
 			path = Resources;
 			sourceTree = "<group>";
