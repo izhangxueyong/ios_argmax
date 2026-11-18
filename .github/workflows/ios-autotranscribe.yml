@@ -121,8 +121,10 @@ jobs:
             echo "WARNING: completion sentinel not found within 30 min"
           fi
 
-          # Let the final result stay on screen for a few seconds.
-          sleep 8
+          # Let the final result settle and stay on screen. The simulator screen
+          # can lag behind the app state after a long background download, so
+          # give it enough time to repaint before stopping the recording.
+          sleep 20
 
           echo "Stopping screen recording (PID $RECORD_PID)..."
           kill -SIGINT "$RECORD_PID"

@@ -245,6 +245,10 @@ struct ContentView: View {
                 self.stage = .done
                 self.detail = "识别完成，共 \(seconds.formatted(.number.precision(.fractionLength(1)))) 秒"
             }
+            // Give SwiftUI time to repaint the result on screen BEFORE the CI
+            // sees the sentinel, otherwise the recorder stops while the last
+            // frame still shows the recording stage.
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
             writeSentinel(status: "DONE", text: text, seconds: seconds)
         } catch {
             let msg = "\(error)"
