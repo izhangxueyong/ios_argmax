@@ -210,29 +210,16 @@ struct ContentView: View {
             await setStage(.transcribing, detail: "正在用 whisper-base 转写…", progress: 0.8)
             log("Transcription started")
 
-            // The bundled clip is the canonical OpenAI "jfk.wav" test audio
-            // (real speech), so WhisperKit's default VAD / no-speech filters work
-            // correctly. Force English only; keep the default quality filters so
-            // the output is a clean transcript rather than hallucinated text.
-            // NOTE: arguments must follow the declaration order in DecodingOptions.
-            let options = DecodingOptions(
-                verbose: true,
-                task: .transcribe,
-                language: "en",
-                detectLanguage: false,
-                skipSpecialTokens: true
-            )
+            // Use WhisperKit's fully default decoding options — this is the exact
+            // path the official FunctionalTests use to transcribe jfk.wav. Custom
+            // language / filter overrides caused empty or hallucinated output on
+            // the simulator's CPU-only decode.
+            let options = DecodingOptions(verbose: true)
             let results = try await whisperKit.transcribe(
                 audioPath: audioURL.path,
                 decodeOptions: options
             )
             log("Transcription results count: \(results.count), segments: \(results.first?.segments.count ?? 0)")
-            for (ri, r) in results.enumerated() {
-                log("  result[\(ri)] text='\(r.text)' segments=\(r.segments.count)")
-                for (si, seg) in r.segments.enumerated() {
-                    log("    seg[\(si)] text='\(seg.text)' noSpeech=\(seg.noSpeechProb) avgLogProb=\(seg.avgLogprob)")
-                }
-            }
 
             // WhisperKit aggregates `result.text` after applying no-speech
             // filtering. On the simulator that filter can blank the aggregate
