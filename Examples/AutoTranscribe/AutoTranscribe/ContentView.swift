@@ -226,22 +226,17 @@ struct ContentView: View {
                 decodeOptions: options
             )
             log("Transcription results count: \(results.count), segments: \(results.first?.segments.count ?? 0)")
-            var text: String = results.compactMap { $0.text }
-                .joined(separator: " ")
-                .trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
 
-            // Fallback: decode the raw 16kHz float array directly, bypassing file
-            // loading / VAD chunking. Guarantees the UI always shows a result.
+            // WhisperKit aggregates `result.text` after applying no-speech
+            // filtering. On the simulator that filter can blank the aggregate
+            // even when the decoder produced a valid segment. Prefer the raw
+            // segment texts, which are always populated.
+            var text: String = results.flatMap { $0.segments }
+                .map { $0.text }
+                .joined()
+                .trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
             if text.isEmpty {
-                log("Primary path empty, trying direct audioArray decode…")
-                let samples = try AudioProcessor.loadAudioAsFloatArray(fromPath: audioURL.path)
-                log("Loaded \(samples.count) float samples")
-                let arrayResults = try await whisperKit.transcribe(
-                    audioArray: samples,
-                    decodeOptions: options
-                )
-                log("Array results count: \(arrayResults.count)")
-                text = arrayResults.compactMap { $0.text }
+                text = results.compactMap { $0.text }
                     .joined(separator: " ")
                     .trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
             }
