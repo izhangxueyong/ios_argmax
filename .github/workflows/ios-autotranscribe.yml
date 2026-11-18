@@ -1,4 +1,4 @@
-name: AutoTranscribe (dual mode + recording list, full run recording)
+name: "AutoTranscribe (interactive demo: round record buttons + replay, full run recording)"
 
 on:
   push:
@@ -21,7 +21,7 @@ jobs:
   autotranscribe:
     name: Build + run automatic transcription, record full run
     runs-on: macos-15
-    timeout-minutes: 150
+    timeout-minutes: 180
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -133,43 +133,44 @@ jobs:
           echo "Installed $BUNDLE_ID"
 
       - name: Run app and record full pipeline (launch -> result)
-        timeout-minutes: 90
+        timeout-minutes: 120
         run: |
           set -e
           CONTAINER=$(xcrun simctl get_app_container "$UDID" "$BUNDLE_ID" data)
           echo "App data container: $CONTAINER"
           DOCS="$CONTAINER/Documents"
-          rm -f "$DOCS/transcription_done.txt" "$DOCS/progress.log" "$DOCS/recordings.json" 2>/dev/null || true
+          rm -f "$DOCS/transcription_done.txt" "$DOCS/demo_done.txt" "$DOCS/progress.log" "$DOCS/recordings.json" 2>/dev/null || true
 
           # Start recording BEFORE launch so the launch animation is captured.
           echo "Starting screen recording..."
-          xcrun simctl io "$UDID" recordVideo --codec=h264 "$MEDIA_DIR/AutoTranscribe-dual-mode-full-run.mp4" &
+          xcrun simctl io "$UDID" recordVideo --codec=h264 "$MEDIA_DIR/AutoTranscribe-interaction-demo-full-run.mp4" &
           RECORD_PID=$!
           sleep 2
 
           xcrun simctl launch "$UDID" "$BUNDLE_ID" --args --auto-run
 
-          # Poll for the completion sentinel written by the app.
-          echo "Waiting for transcription to finish..."
+          # Poll for the demo completion sentinel: 4 recordings + transcription
+          # + replay of every saved result + return to the list.
+          echo "Waiting for interaction demo to finish..."
           DONE=0
-          for i in $(seq 1 240); do
-            if [ -f "$DOCS/transcription_done.txt" ]; then
-              echo "Sentinel found at check $i"
+          for i in $(seq 1 400); do
+            if [ -f "$DOCS/demo_done.txt" ]; then
+              echo "Demo sentinel found at check $i"
               DONE=1
               break
             fi
             # Stream progress log into the workflow log for visibility.
             if [ -f "$DOCS/progress.log" ]; then
-              tail -n 1 "$DOCS/progress.log" | sed 's/^/  [app] /' || true
+              tail -n 2 "$DOCS/progress.log" | sed 's/^/  [app] /' || true
             fi
             if [ $((i % 20)) -eq 0 ]; then
-              echo "  [ci] still waiting for bundled whisper-turbo ($i/240 checks, ~$((i / 4))min)"
+              echo "  [ci] still waiting for interaction demo ($i/400 checks, ~$((i / 4))min)"
             fi
             sleep 15
           done
 
           if [ "$DONE" -ne 1 ]; then
-            echo "WARNING: completion sentinel not found within 60 min"
+            echo "WARNING: demo completion sentinel not found within 100 min"
           fi
 
           # Let the final result settle and stay on screen. The simulator screen
@@ -182,16 +183,18 @@ jobs:
           # work; a fresh screenshot forces a repaint and is a reliable artifact.
           echo "Capturing result screenshot..."
           mkdir -p "$MEDIA_DIR"
-          xcrun simctl io "$UDID" screenshot "$MEDIA_DIR/AutoTranscribe-dual-mode-result.png" || true
-          ls -lh "$MEDIA_DIR/AutoTranscribe-dual-mode-result.png" 2>/dev/null || true
+          xcrun simctl io "$UDID" screenshot "$MEDIA_DIR/AutoTranscribe-interaction-demo-result.png" || true
+          ls -lh "$MEDIA_DIR/AutoTranscribe-interaction-demo-result.png" 2>/dev/null || true
           sleep 12
 
           echo "Stopping screen recording (PID $RECORD_PID)..."
           kill -SIGINT "$RECORD_PID"
           wait "$RECORD_PID" || true
 
-          echo "=== transcription_done.txt ==="
-          cat "$DOCS/transcription_done.txt" 2>/dev/null || echo "(missing)"
+          echo "=== demo_done.txt ==="
+          cat "$DOCS/demo_done.txt" 2>/dev/null || echo "(missing)"
+          echo "=== saved recording count ==="
+          python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print("recordings:", len(d)); [print(" -", x.get("source"), x.get("name"), x.get("fileName"), "transcript=" + str(bool(x.get("transcript")))) for x in d]' "$DOCS/recordings.json" 2>/dev/null || echo "(recordings.json missing)"
           echo "=== progress.log ==="
           cat "$DOCS/progress.log" 2>/dev/null || echo "(missing)"
 
@@ -201,7 +204,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: autotranscribe-dual-mode-full-run
+          name: autotranscribe-interaction-demo-full-run
           path: |
             ${{ env.MEDIA_DIR }}/*.mp4
             ${{ env.MEDIA_DIR }}/*.png

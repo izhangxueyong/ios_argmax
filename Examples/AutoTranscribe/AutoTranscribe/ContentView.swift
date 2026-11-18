@@ -1,6 +1,12 @@
 //  AutoTranscribe
 //  Two on-device ASR modes with bundled models + a recording list.
 //  Models are copied into the app bundle at build time; the app never downloads at runtime.
+//
+//  --auto-run drives a scripted UI demo used by CI:
+//    standard mode: hold-to-talk, then tap record
+//    precise mode:  tap record, then tap record
+//    each clip is transcribed, saved locally, then replayed in a detail viewer,
+//    and finally the app returns to the list (home).
 
 import AVFoundation
 import SwiftUI
@@ -23,6 +29,11 @@ struct ContentView: View {
     @State private var recordingStartedAt: Date?
     @State private var showingImporter = false
     @State private var started = false
+
+    // Result-review sheet (auto-demo replays saved results through this).
+    @State private var reviewingItem: RecordingItem?
+    @State private var reviewIndex = 0
+    @State private var demoReplaying = false
 
     enum Stage: String {
         case idle = "准备就绪"
@@ -59,17 +70,15 @@ struct ContentView: View {
             .fileImporter(isPresented: $showingImporter, allowedContentTypes: [.audio]) { result in
                 importAudio(result)
             }
+            .sheet(item: $reviewingItem) { item in
+                ResultDetailView(item: item, isDemo: demoReplaying)
+            }
             .task {
                 guard !started else { return }
                 started = true
                 log("App launched")
                 if CommandLine.arguments.contains("--auto-run") {
-                    selectedMode = .precise
-                    setStage(.loading, detail: "准备内置 Whisper Turbo 模型…", progress: 0.05)
-                    try? await Task.sleep(nanoseconds: 1_000_000_000)
-                    if let sample = store.bundledSample() {
-                        await transcribe(sample)
-                    }
+                    Task { await runDemo() }
                 }
             }
         }
@@ -118,46 +127,16 @@ struct ContentView: View {
         .background(RoundedRectangle(cornerRadius: 14).fill(Color(.secondarySystemGroupedBackground)))
     }
 
-    // MARK: - Recording controls
+    // MARK: - Recording controls (round red icon buttons)
 
     private var controlsCard: some View {
-        VStack(spacing: 10) {
-            HStack(spacing: 12) {
-                Button {
-                    // Handled by the long-press gesture below.
-                } label: {
-                    Label(isRecording && activeSource == .pushToTalk ? "松开结束" : "按住说话",
-                          systemImage: "mic.circle.fill")
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 10)
-                        .background(isRecording && activeSource == .pushToTalk ? Color.red.opacity(0.16) : Color.blue.opacity(0.12))
-                        .cornerRadius(10)
-                }
-                .buttonStyle(.plain)
-                .onLongPressGesture(minimumDuration: 0.1, pressing: { pressing in
-                    if pressing {
-                        startRecording(source: .pushToTalk)
-                    } else if activeSource == .pushToTalk {
-                        stopRecording()
-                    }
-                }, perform: {})
-
-                Button {
-                    if isRecording && activeSource == .tap {
-                        stopRecording()
-                    } else {
-                        startRecording(source: .tap)
-                    }
-                } label: {
-                    Label(isRecording && activeSource == .tap ? "停止录音" : "单击录音",
-                          systemImage: isRecording && activeSource == .tap ? "stop.circle.fill" : "record.circle")
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 10)
-                        .background(isRecording && activeSource == .tap ? Color.red.opacity(0.16) : Color(.tertiarySystemGroupedBackground))
-                        .cornerRadius(10)
-                }
-                .buttonStyle(.plain)
+        VStack(spacing: 14) {
+            HStack(alignment: .top, spacing: 0) {
+                holdToTalkButton
+                Spacer(minLength: 16)
+                tapRecordButton
             }
+            .padding(.horizontal, 8)
 
             Button {
                 showingImporter = true
@@ -168,6 +147,82 @@ struct ContentView: View {
         }
         .padding(14)
         .background(RoundedRectangle(cornerRadius: 14).fill(Color(.secondarySystemGroupedBackground)))
+    }
+
+    private var holdToTalkButton: some View {
+        let active = isRecording && activeSource == .pushToTalk
+        return VStack(spacing: 8) {
+            ZStack {
+                Circle()
+                    .fill(active ? Color.red.opacity(0.35) : Color.red.opacity(0.12))
+                    .frame(width: 92, height: 92)
+                Circle()
+                    .fill(Color.red)
+                    .frame(width: 74, height: 74)
+                    .shadow(color: .red.opacity(0.4), radius: 8, y: 4)
+                Image(systemName: active ? "waveform.circle.fill" : "mic.fill")
+                    .font(.system(size: 30, weight: .semibold))
+                    .foregroundColor(.white)
+                if active {
+                    Circle()
+                        .stroke(Color.red.opacity(0.5), lineWidth: 3)
+                        .frame(width: 92, height: 92)
+                        .scaleEffect(active ? 1.1 : 1.0)
+                        .animation(.easeInOut(duration: 0.7).repeatForever(autoreverses: true), value: active)
+                }
+            }
+            .frame(width: 96, height: 96)
+            .contentShape(Circle())
+            .onLongPressGesture(minimumDuration: 0.15, pressing: { pressing in
+                if pressing {
+                    startRecording(source: .pushToTalk)
+                } else if activeSource == .pushToTalk {
+                    stopRecording()
+                }
+            }, perform: {})
+            Text(active ? "松开结束" : "按住说话")
+                .font(.caption.bold())
+                .foregroundColor(active ? .red : .secondary)
+        }
+        .frame(width: 120)
+    }
+
+    private var tapRecordButton: some View {
+        let active = isRecording && activeSource == .tap
+        return VStack(spacing: 8) {
+            ZStack {
+                Circle()
+                    .fill(active ? Color.red.opacity(0.35) : Color.red.opacity(0.12))
+                    .frame(width: 92, height: 92)
+                Circle()
+                    .fill(Color.red)
+                    .frame(width: 74, height: 74)
+                    .shadow(color: .red.opacity(0.4), radius: 8, y: 4)
+                Image(systemName: active ? "stop.fill" : "record.circle.fill")
+                    .font(.system(size: 30, weight: .semibold))
+                    .foregroundColor(.white)
+                if active {
+                    Circle()
+                        .stroke(Color.red.opacity(0.5), lineWidth: 3)
+                        .frame(width: 92, height: 92)
+                        .scaleEffect(active ? 1.1 : 1.0)
+                        .animation(.easeInOut(duration: 0.7).repeatForever(autoreverses: true), value: active)
+                }
+            }
+            .frame(width: 96, height: 96)
+            .contentShape(Circle())
+            .onTapGesture {
+                if isRecording && activeSource == .tap {
+                    stopRecording()
+                } else if !isRecording {
+                    startRecording(source: .tap)
+                }
+            }
+            Text(active ? "点击停止" : "点击录音")
+                .font(.caption.bold())
+                .foregroundColor(active ? .red : .secondary)
+        }
+        .frame(width: 120)
     }
 
     // MARK: - Status / Result
@@ -202,7 +257,7 @@ struct ContentView: View {
                 Spacer()
                 Text(currentItemName).font(.caption2).foregroundColor(.secondary)
             }
-            Text(transcript.isEmpty ? "点按下方任一录音开始转写" : transcript)
+            Text(transcript.isEmpty ? "点按圆形录音键开始" : transcript)
                 .font(.body)
                 .foregroundColor(transcript.isEmpty ? .secondary : .primary)
                 .frame(maxWidth: .infinity, minHeight: 62, alignment: .topLeading)
@@ -247,7 +302,7 @@ struct ContentView: View {
     private func row(for item: RecordingItem, source: RecordingSource) -> some View {
         switch source {
         case .long:
-            Button { Task { await transcribe(item) } } label: {
+            Button { openResult(item) } label: {
                 HStack(spacing: 10) {
                     Image(systemName: "waveform.rectangle")
                         .foregroundColor(.blue)
@@ -268,7 +323,7 @@ struct ContentView: View {
         case .pushToTalk:
             HStack {
                 Spacer(minLength: 48)
-                Button { Task { await transcribe(item) } } label: {
+                Button { openResult(item) } label: {
                     VStack(alignment: .trailing, spacing: 4) {
                         HStack(spacing: 8) {
                             Image(systemName: "mic.fill").font(.caption).foregroundColor(.white)
@@ -278,7 +333,7 @@ struct ContentView: View {
                         }
                         .padding(.horizontal, 12)
                         .padding(.vertical, 9)
-                        .background(RoundedRectangle(cornerRadius: 16).fill(Color.blue))
+                        .background(RoundedRectangle(cornerRadius: 16).fill(Color.red))
                         Text(item.fileName).font(.caption2).foregroundColor(.secondary)
                     }
                 }
@@ -286,7 +341,7 @@ struct ContentView: View {
             }
 
         case .tap:
-            Button { Task { await transcribe(item) } } label: {
+            Button { openResult(item) } label: {
                 VStack(alignment: .leading, spacing: 6) {
                     HStack {
                         Image(systemName: "record.circle").foregroundColor(.red)
@@ -295,7 +350,7 @@ struct ContentView: View {
                         Text(durationText(item.duration)).font(.caption2).foregroundColor(.secondary)
                     }
                     Text(item.fileName).font(.caption2).foregroundColor(.secondary)
-                    WaveformView(samples: item.waveform, color: .gray, height: 18, barCount: 40)
+                    WaveformView(samples: item.waveform, color: .red, height: 18, barCount: 40)
                     if let text = item.transcript, !text.isEmpty {
                         Text(text).font(.caption2).foregroundColor(.secondary).lineLimit(1)
                     }
@@ -307,7 +362,14 @@ struct ContentView: View {
         }
     }
 
-    // MARK: - Actions
+    private func openResult(_ item: RecordingItem) {
+        demoReplaying = false
+        currentItemName = item.name
+        transcript = item.transcript ?? ""
+        reviewingItem = item
+    }
+
+    // MARK: - Real recording actions
 
     private func startRecording(source: RecordingSource) {
         guard !isRecording else { return }
@@ -414,6 +476,91 @@ struct ContentView: View {
         }
     }
 
+    // MARK: - Scripted demo (CI)
+
+    private func runDemo() async {
+        log("DEMO started")
+        // 1. Standard mode: hold-to-talk
+        selectedMode = .standard
+        await demoRecord(source: .pushToTalk, label: "普通 · 按住说话")
+
+        // 2. Standard mode: tap record
+        await demoRecord(source: .tap, label: "普通 · 单击录音")
+
+        // 3. Precise mode: tap record
+        selectedMode = .precise
+        await demoRecord(source: .tap, label: "精准 · 单击录音")
+
+        // 4. Precise mode: tap record again
+        await demoRecord(source: .tap, label: "精准 · 单击录音")
+
+        // 5. Replay every saved result in the detail viewer.
+        await demoReviewResults()
+
+        // 6. Return to list (home) and signal completion.
+        stage = .done
+        detail = "演示完成 · 已返回录音列表"
+        log("DEMO finished")
+        writeDemoSentinel(status: "DONE", count: store.items.count)
+    }
+
+    private func demoRecord(source: RecordingSource, label: String) async {
+        setStage(.idle, detail: "准备 \(label)…", progress: 0.02)
+        try? await Task.sleep(nanoseconds: 900_000_000)
+
+        // Drive the round button into its active (recording) state so the camera
+        // captures the red pulse animation. The simulator has no microphone, so
+        // the actual clip is the bundled JFK sample (see below).
+        activeSource = source
+        isRecording = true
+        setStage(.recording, detail: "\(label) · 录音中…", progress: 0.06)
+        log("DEMO recording started: \(label)")
+        try? await Task.sleep(nanoseconds: 2_000_000_000)
+        isRecording = false
+        activeSource = nil
+
+        guard let sampleURL = Bundle.main.url(forResource: "recording", withExtension: "wav"),
+              let data = try? Data(contentsOf: sampleURL) else {
+            setStage(.failed, detail: "内置示例音频缺失", progress: 0)
+            log("DEMO failed: bundled sample missing")
+            return
+        }
+
+        let item = store.add(
+            name: name(for: source),
+            fileName: "jfk_sample.wav",
+            source: source,
+            duration: duration(of: sampleURL),
+            waveform: WaveformExtractor.samples(from: sampleURL),
+            audioData: data
+        )
+        log("DEMO recording saved: \(item.fileName)")
+
+        // Give the saved row a moment to appear before transcribing.
+        try? await Task.sleep(nanoseconds: 700_000_000)
+        currentItemName = item.name
+        await transcribe(item)
+        try? await Task.sleep(nanoseconds: 1_200_000_000)
+    }
+
+    private func demoReviewResults() async {
+        demoReplaying = true
+        let items = store.items
+        log("DEMO review \(items.count) saved results")
+        for (index, item) in items.enumerated() {
+            reviewIndex = index
+            transcript = item.transcript ?? ""
+            currentItemName = item.name
+            setStage(.done, detail: "查看结果 \(index + 1)/\(items.count) · \(item.name)", progress: 1)
+            reviewingItem = item
+            log("DEMO review open \(index + 1)/\(items.count): \(item.name)")
+            try? await Task.sleep(nanoseconds: 4_000_000_000)
+            reviewingItem = nil
+            try? await Task.sleep(nanoseconds: 700_000_000)
+        }
+        demoReplaying = false
+    }
+
     // MARK: - Helpers
 
     private func setStage(_ s: Stage, detail: String, progress: Double) {
@@ -473,6 +620,80 @@ struct ContentView: View {
         let content = "status=\(status)\nseconds=\(String(format: "%.2f", seconds))\ntext=\(text)\n"
         let url = documentsURL().appendingPathComponent("transcription_done.txt")
         try? content.write(to: url, atomically: true, encoding: .utf8)
+    }
+
+    private func writeDemoSentinel(status: String, count: Int) {
+        let content = "status=\(status)\nsaved=\(count)\n"
+        let url = documentsURL().appendingPathComponent("demo_done.txt")
+        try? content.write(to: url, atomically: true, encoding: .utf8)
+    }
+}
+
+// MARK: - Result detail viewer
+
+struct ResultDetailView: View {
+    let item: RecordingItem
+    var isDemo: Bool = false
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack {
+                            Image(systemName: "waveform.circle.fill")
+                                .foregroundColor(.red)
+                            Text(item.name).font(.title3.bold())
+                        }
+                        Text("文件：\(item.fileName)")
+                            .font(.caption.monospacedDigit())
+                            .foregroundColor(.secondary)
+                        Text("来源：\(item.source.sectionTitle)　时长：\(String(format: "%.1f", item.duration)) 秒")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("录音波形").font(.subheadline.bold()).foregroundColor(.secondary)
+                        WaveformView(samples: item.waveform, color: .red, height: 56, barCount: 48)
+                            .padding(12)
+                            .frame(maxWidth: .infinity)
+                            .background(RoundedRectangle(cornerRadius: 12).fill(Color(.secondarySystemGroupedBackground)))
+                    }
+
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack {
+                            Label("转写内容", systemImage: "text.bubble.fill")
+                                .font(.subheadline.bold())
+                            Spacer()
+                            Image(systemName: "checkmark.circle.fill").foregroundColor(.green)
+                        }
+                        Text(item.transcript ?? "（暂无转写内容）")
+                            .font(.body)
+                            .frame(maxWidth: .infinity, minHeight: 120, alignment: .topLeading)
+                            .padding(12)
+                            .background(RoundedRectangle(cornerRadius: 12).fill(Color(.secondarySystemGroupedBackground)))
+                    }
+
+                    if isDemo {
+                        HStack {
+                            ProgressView()
+                            Text("演示自动翻页中…").font(.caption).foregroundColor(.secondary)
+                        }
+                    }
+                }
+                .padding(20)
+            }
+            .background(Color(.systemGroupedBackground))
+            .navigationTitle("转写详情")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("返回") { dismiss() }
+                }
+            }
+        }
     }
 }
 
