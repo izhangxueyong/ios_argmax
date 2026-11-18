@@ -124,7 +124,16 @@ jobs:
           # Let the final result settle and stay on screen. The simulator screen
           # can lag behind the app state after a long background download, so
           # give it enough time to repaint before stopping the recording.
-          sleep 20
+          sleep 8
+
+          # Capture a still of the result screen. simctl's virtual display can
+          # freeze the recorded video on an earlier frame during long background
+          # work; a fresh screenshot forces a repaint and is a reliable artifact.
+          echo "Capturing result screenshot..."
+          mkdir -p "$MEDIA_DIR"
+          xcrun simctl io "$UDID" screenshot "$MEDIA_DIR/AutoTranscribe-result.png" || true
+          ls -lh "$MEDIA_DIR/AutoTranscribe-result.png" 2>/dev/null || true
+          sleep 12
 
           echo "Stopping screen recording (PID $RECORD_PID)..."
           kill -SIGINT "$RECORD_PID"
@@ -142,6 +151,8 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: autotranscribe-full-run
-          path: ${{ env.MEDIA_DIR }}/*.mp4
+          path: |
+            ${{ env.MEDIA_DIR }}/*.mp4
+            ${{ env.MEDIA_DIR }}/*.png
           if-no-files-found: warn
           retention-days: 7
