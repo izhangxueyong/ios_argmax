@@ -190,7 +190,7 @@ struct ContentView: View {
             await setStage(.loading, detail: "编译并加载 Core ML 模型…", progress: 0.42)
             let config = WhisperKitConfig(
                 modelFolder: folder.path,
-                verbose: false,
+                verbose: true,
                 logLevel: .info,
                 prewarm: false,
                 load: true,
@@ -209,8 +209,44 @@ struct ContentView: View {
             // Step 4: transcribe
             await setStage(.transcribing, detail: "正在用 whisper-base 转写…", progress: 0.8)
             log("Transcription started")
-            let results = try await whisperKit.transcribe(audioPath: audioURL.path)
-            let text = results.first?.text.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+
+            // The bundled clip is synthetic (Samantha TTS). WhisperKit's default
+            // noSpeechThreshold (0.6) can classify it as silence and drop every
+            // segment, yielding an empty transcript. Force English and disable
+            // the no-speech filter so the result is always produced.
+            let options = DecodingOptions(
+                verbose: true,
+                task: .transcribe,
+                language: "en",
+                detectLanguage: false,
+                noSpeechThreshold: nil,
+                compressionRatioThreshold: nil,
+                logProbThreshold: nil
+            )
+            let results = try await whisperKit.transcribe(
+                audioPath: audioURL.path,
+                decodeOptions: options
+            )
+            log("Transcription results count: \(results.count), segments: \(results.first?.segments.count ?? 0)")
+            var text = results.compactMap { $0.text }
+                .joined(separator: " ")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+
+            // Fallback: decode the raw 16kHz float array directly, bypassing file
+            // loading / VAD chunking. Guarantees the UI always shows a result.
+            if text.isEmpty {
+                log("Primary path empty, trying direct audioArray decode…")
+                let samples = try AudioProcessor.loadAudioAsFloatArray(fromPath: audioURL.path)
+                log("Loaded \(samples.count) float samples")
+                let arrayResults = try await whisperKit.transcribe(
+                    audioArray: samples,
+                    decodeOptions: options
+                )
+                log("Array results count: \(arrayResults.count)")
+                text = arrayResults.compactMap { $0.text }
+                    .joined(separator: " ")
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+            }
             log("Transcription finished: \(text)")
 
             let seconds = Date().timeIntervalSince(start)
