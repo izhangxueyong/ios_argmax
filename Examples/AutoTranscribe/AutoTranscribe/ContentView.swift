@@ -214,7 +214,9 @@ struct ContentView: View {
             // path the official FunctionalTests use to transcribe jfk.wav. Custom
             // language / filter overrides caused empty or hallucinated output on
             // the simulator's CPU-only decode.
-            let options = DecodingOptions(verbose: true)
+            // skipSpecialTokens strips the <|startoftranscript|><|en|>... markers,
+            // leaving clean readable text. Works now that the model emits real tokens.
+            let options = DecodingOptions(verbose: true, skipSpecialTokens: true)
             let results = try await whisperKit.transcribe(
                 audioPath: audioURL.path,
                 decodeOptions: options
