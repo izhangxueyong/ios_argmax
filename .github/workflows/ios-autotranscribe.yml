@@ -52,10 +52,12 @@ jobs:
         timeout-minutes: 45
         run: |
           set -e
-          python3 -m pip install -q --upgrade huggingface_hub
+          python3 -m venv "$RUNNER_TEMP/hf-venv"
+          source "$RUNNER_TEMP/hf-venv/bin/activate"
+          python -m pip install -q --upgrade huggingface_hub
           export MODELS_DIR="$GITHUB_WORKSPACE/Examples/AutoTranscribe/AutoTranscribe/Models"
           mkdir -p "$MODELS_DIR/sensevoice-small" "$MODELS_DIR/whisper-turbo"
-          python3 - <<'PY'
+          python - <<'PY'
           import os
           from huggingface_hub import snapshot_download
 
