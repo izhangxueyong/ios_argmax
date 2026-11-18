@@ -1,134 +1,197 @@
 //  AutoTranscribe
-//  A fully automatic speech-recognition demo:
-//  1. Download + load the 632MB large-v3-turbo WhisperKit model
-//  2. "Record" a clip (a bundled 16kHz English wav, since the simulator has no mic)
-//  3. Transcribe it and display the result
-//  Every step writes a log + a completion sentinel into Documents so CI can
-//  record the whole run from launch to final result.
+//  Two on-device ASR modes with bundled models + a recording list.
+//  Models are copied into the app bundle at build time; the app never downloads at runtime.
 
-import SwiftUI
-import WhisperKit
 import AVFoundation
+import SwiftUI
+import UniformTypeIdentifiers
 
 struct ContentView: View {
-    @State private var stage: Stage = .idle
-    @State private var detail = "等待启动"
-    @State private var downloadProgress: Double = 0
-    @State private var transcript = ""
-    @State private var recordSeconds: Double = 0
-    @State private var waveform: [CGFloat] = Array(repeating: 0.15, count: 44)
-    @State private var player: AVAudioPlayer?
-    @State private var started = false
-    @State private var modelName = "openai_whisper-large-v3-v20240930_turbo"
-    @State private var elapsedText = "0.0s"
+    @StateObject private var store = RecordingStore()
+    @StateObject private var service = TranscriptionService()
 
-    private var modelDisplayName: String { "large-v3-turbo · 632MB" }
+    @State private var selectedMode: TranscriptionMode = .standard
+    @State private var stage: Stage = .idle
+    @State private var detail = "等待选择录音"
+    @State private var progress: Double = 0
+    @State private var transcript = ""
+    @State private var currentItemName = "—"
+    @State private var isRecording = false
+    @State private var activeSource: RecordingSource?
+    @State private var recorder: AVAudioRecorder?
+    @State private var recordingURL: URL?
+    @State private var recordingStartedAt: Date?
+    @State private var showingImporter = false
+    @State private var started = false
 
     enum Stage: String {
         case idle = "准备就绪"
-        case downloading = "下载模型"
-        case loading = "加载模型"
         case recording = "录音中"
+        case loading = "加载内置模型"
         case transcribing = "转写中"
         case done = "转写完成"
         case failed = "发生错误"
     }
 
     var body: some View {
-        VStack(spacing: 16) {
-            header
-            stageCard
-            progressBar
-            waveformCard
-            resultCard
-            Spacer(minLength: 4)
-            footer
-        }
-        .padding(22)
-        .background(Color(.systemBackground))
-        .task {
-            guard !started else { return }
-            started = true
-            await runPipeline()
+        NavigationStack {
+            ScrollView {
+                VStack(spacing: 16) {
+                    header
+                    modeCard
+                    controlsCard
+                    statusCard
+                    resultCard
+                    recordingList
+                }
+                .padding(20)
+            }
+            .background(Color(.systemGroupedBackground))
+            .navigationTitle("AutoTranscribe")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                Button {
+                    showingImporter = true
+                } label: {
+                    Image(systemName: "folder.badge.plus")
+                }
+            }
+            .fileImporter(isPresented: $showingImporter, allowedContentTypes: [.audio]) { result in
+                importAudio(result)
+            }
+            .task {
+                guard !started else { return }
+                started = true
+                log("App launched")
+                if CommandLine.arguments.contains("--auto-run") {
+                    selectedMode = .precise
+                    setStage(.loading, detail: "准备内置 Whisper Turbo 模型…", progress: 0.05)
+                    try? await Task.sleep(nanoseconds: 1_000_000_000)
+                    if let sample = store.bundledSample() {
+                        await transcribe(sample)
+                    }
+                }
+            }
         }
     }
 
-    // MARK: - UI pieces
+    // MARK: - Header / Mode
 
     private var header: some View {
         VStack(spacing: 6) {
             Image(systemName: "waveform.circle.fill")
-                .font(.system(size: 44))
+                .font(.system(size: 42))
                 .foregroundColor(.blue)
-            Text("AutoTranscribe")
+            Text("本地语音转写")
                 .font(.title2.bold())
-            Text("自动语音识别 · \(modelDisplayName) · on-device")
+            Text("内置模型 · 运行时零下载 · on-device")
                 .font(.caption)
                 .foregroundColor(.secondary)
         }
-        .padding(.top, 6)
+        .frame(maxWidth: .infinity)
     }
 
-    private var stageCard: some View {
-        HStack(spacing: 14) {
-            Image(systemName: icon(for: stage))
-                .font(.title)
-                .foregroundColor(stage == .failed ? .red : (stage == .done ? .green : .blue))
-            VStack(alignment: .leading, spacing: 3) {
-                Text(stage.rawValue)
-                    .font(.headline)
-                Text(detail)
-                    .font(.subheadline)
-                    .foregroundColor(.secondary)
-                    .lineLimit(2)
+    private var modeCard: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("识别模式").font(.subheadline.bold())
+            Picker("识别模式", selection: $selectedMode) {
+                ForEach(TranscriptionMode.allCases) { mode in
+                    Text(mode.title).tag(mode)
+                }
             }
-            Spacer()
-            if stage == .done || stage == .failed {
-                Image(systemName: stage == .done ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
-                    .foregroundColor(stage == .done ? .green : .red)
+            .pickerStyle(.segmented)
+
+            HStack {
+                Image(systemName: selectedMode == .standard ? "bolt.fill" : "sparkles")
+                    .foregroundColor(selectedMode == .standard ? .orange : .purple)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(selectedMode.modelTitle)
+                        .font(.caption.bold())
+                    Text("Models/\(selectedMode.folderName) · 已打包进 App")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                }
+                Spacer()
             }
         }
         .padding(14)
-        .background(RoundedRectangle(cornerRadius: 14).fill(Color(.secondarySystemBackground)))
+        .background(RoundedRectangle(cornerRadius: 14).fill(Color(.secondarySystemGroupedBackground)))
     }
 
-    private var progressBar: some View {
-        VStack(spacing: 6) {
-            HStack {
-                Text("流程").font(.caption).foregroundColor(.secondary)
-                Spacer()
-                Text(elapsedText).font(.caption.monospacedDigit()).foregroundColor(.secondary)
+    // MARK: - Recording controls
+
+    private var controlsCard: some View {
+        VStack(spacing: 10) {
+            HStack(spacing: 12) {
+                Button {
+                    // Handled by the long-press gesture below.
+                } label: {
+                    Label(isRecording && activeSource == .pushToTalk ? "松开结束" : "按住说话",
+                          systemImage: "mic.circle.fill")
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 10)
+                        .background(isRecording && activeSource == .pushToTalk ? Color.red.opacity(0.16) : Color.blue.opacity(0.12))
+                        .cornerRadius(10)
+                }
+                .buttonStyle(.plain)
+                .onLongPressGesture(minimumDuration: 0.1, pressing: { pressing in
+                    if pressing {
+                        startRecording(source: .pushToTalk)
+                    } else if activeSource == .pushToTalk {
+                        stopRecording()
+                    }
+                }, perform: {})
+
+                Button {
+                    if isRecording && activeSource == .tap {
+                        stopRecording()
+                    } else {
+                        startRecording(source: .tap)
+                    }
+                } label: {
+                    Label(isRecording && activeSource == .tap ? "停止录音" : "单击录音",
+                          systemImage: isRecording && activeSource == .tap ? "stop.circle.fill" : "record.circle")
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 10)
+                        .background(isRecording && activeSource == .tap ? Color.red.opacity(0.16) : Color(.tertiarySystemGroupedBackground))
+                        .cornerRadius(10)
+                }
+                .buttonStyle(.plain)
             }
-            ProgressView(value: stage == .done ? 1.0 : downloadProgress, total: 1.0)
-                .progressViewStyle(.linear)
-                .tint(.blue)
+
+            Button {
+                showingImporter = true
+            } label: {
+                Label("导入长录音文件", systemImage: "square.and.arrow.down")
+                    .font(.subheadline)
+            }
         }
+        .padding(14)
+        .background(RoundedRectangle(cornerRadius: 14).fill(Color(.secondarySystemGroupedBackground)))
     }
 
-    private var waveformCard: some View {
-        VStack(alignment: .leading, spacing: 8) {
+    // MARK: - Status / Result
+
+    private var statusCard: some View {
+        VStack(spacing: 8) {
             HStack {
-                Label("录音 / 音频输入", systemImage: "mic.fill")
-                    .font(.subheadline.bold())
+                Image(systemName: icon(for: stage))
+                    .foregroundColor(stage == .failed ? .red : (stage == .done ? .green : .blue))
+                Text(stage.rawValue).font(.headline)
                 Spacer()
-                Text(String(format: "%.1fs", recordSeconds))
+                Text(String(format: "%.0f%%", progress * 100))
                     .font(.caption.monospacedDigit())
                     .foregroundColor(.secondary)
             }
-            HStack(spacing: 3) {
-                ForEach(waveform.indices, id: \.self) { i in
-                    Capsule()
-                        .fill(stage == .recording ? Color.blue : Color.gray.opacity(0.35))
-                        .frame(width: 4, height: max(6, waveform[i] * 46))
-                }
-            }
-            .frame(height: 52)
-            Text("音频: jfk.wav · 16kHz 单声道 · 11s")
-                .font(.caption2)
+            Text(detail)
+                .font(.subheadline)
                 .foregroundColor(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            ProgressView(value: progress, total: 1)
+                .tint(.blue)
         }
         .padding(14)
-        .background(RoundedRectangle(cornerRadius: 14).fill(Color(.secondarySystemBackground)))
+        .background(RoundedRectangle(cornerRadius: 14).fill(Color(.secondarySystemGroupedBackground)))
     }
 
     private var resultCard: some View {
@@ -137,180 +200,257 @@ struct ContentView: View {
                 Label("转写结果", systemImage: "text.bubble.fill")
                     .font(.subheadline.bold())
                 Spacer()
-                if !transcript.isEmpty { Text("EN").font(.caption2).foregroundColor(.secondary) }
+                Text(currentItemName).font(.caption2).foregroundColor(.secondary)
             }
-            Text(transcript.isEmpty ? "—" : transcript)
+            Text(transcript.isEmpty ? "点按下方任一录音开始转写" : transcript)
                 .font(.body)
                 .foregroundColor(transcript.isEmpty ? .secondary : .primary)
-                .frame(maxWidth: .infinity, minHeight: 70, alignment: .topLeading)
+                .frame(maxWidth: .infinity, minHeight: 62, alignment: .topLeading)
+            if !transcript.isEmpty {
+                Text("已加载模型：\(service.loadedModelSummary)")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+            }
         }
         .padding(14)
-        .background(RoundedRectangle(cornerRadius: 14).fill(Color(.secondarySystemBackground)))
+        .background(RoundedRectangle(cornerRadius: 14).fill(Color(.secondarySystemGroupedBackground)))
     }
 
-    private var footer: some View {
-        HStack {
-            Text("Model: \(modelName)")
-            Spacer()
-            Text("Compute: CPU (Simulator)")
+    // MARK: - Recording list
+
+    private var recordingList: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("录音列表").font(.headline)
+                Spacer()
+                Text("\(store.items.count) 条").font(.caption).foregroundColor(.secondary)
+            }
+
+            ForEach(RecordingSource.allCases, id: \.self) { source in
+                let rows = store.items(for: source)
+                if !rows.isEmpty {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text(source.sectionTitle)
+                            .font(.caption.bold())
+                            .foregroundColor(.secondary)
+                        ForEach(rows) { item in
+                            row(for: item, source: source)
+                        }
+                    }
+                }
+            }
         }
-        .font(.caption2)
-        .foregroundColor(.secondary)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    @ViewBuilder
+    private func row(for item: RecordingItem, source: RecordingSource) -> some View {
+        switch source {
+        case .long:
+            Button { Task { await transcribe(item) } } label: {
+                HStack(spacing: 10) {
+                    Image(systemName: "waveform.rectangle")
+                        .foregroundColor(.blue)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(item.name).font(.subheadline.bold())
+                        Text(item.fileName).font(.caption2).foregroundColor(.secondary)
+                    }
+                    Spacer(minLength: 4)
+                    WaveformView(samples: item.waveform, color: .blue, height: 24, barCount: 20)
+                        .frame(width: 86)
+                    Text(durationText(item.duration)).font(.caption2).foregroundColor(.secondary)
+                }
+                .padding(12)
+                .background(RoundedRectangle(cornerRadius: 12).fill(Color(.secondarySystemGroupedBackground)))
+            }
+            .buttonStyle(.plain)
+
+        case .pushToTalk:
+            HStack {
+                Spacer(minLength: 48)
+                Button { Task { await transcribe(item) } } label: {
+                    VStack(alignment: .trailing, spacing: 4) {
+                        HStack(spacing: 8) {
+                            Image(systemName: "mic.fill").font(.caption).foregroundColor(.white)
+                            WaveformView(samples: item.waveform, color: .white.opacity(0.9), height: 22, barCount: 22)
+                                .frame(width: 96)
+                            Text(durationText(item.duration)).font(.caption2).foregroundColor(.white.opacity(0.85))
+                        }
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 9)
+                        .background(RoundedRectangle(cornerRadius: 16).fill(Color.blue))
+                        Text(item.fileName).font(.caption2).foregroundColor(.secondary)
+                    }
+                }
+                .buttonStyle(.plain)
+            }
+
+        case .tap:
+            Button { Task { await transcribe(item) } } label: {
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack {
+                        Image(systemName: "record.circle").foregroundColor(.red)
+                        Text(item.name).font(.subheadline.bold())
+                        Spacer()
+                        Text(durationText(item.duration)).font(.caption2).foregroundColor(.secondary)
+                    }
+                    Text(item.fileName).font(.caption2).foregroundColor(.secondary)
+                    WaveformView(samples: item.waveform, color: .gray, height: 18, barCount: 40)
+                    if let text = item.transcript, !text.isEmpty {
+                        Text(text).font(.caption2).foregroundColor(.secondary).lineLimit(1)
+                    }
+                }
+                .padding(12)
+                .background(RoundedRectangle(cornerRadius: 12).fill(Color(.secondarySystemGroupedBackground)))
+            }
+            .buttonStyle(.plain)
+        }
+    }
+
+    // MARK: - Actions
+
+    private func startRecording(source: RecordingSource) {
+        guard !isRecording else { return }
+        let session = AVAudioSession.sharedInstance()
+        try? session.setCategory(.playAndRecord, mode: .default, options: [.defaultToSpeaker])
+        try? session.setActive(true)
+
+        let url = store.documentsDirectory
+            .appendingPathComponent("recording_\(Int(Date().timeIntervalSince1970)).wav")
+        let settings: [String: Any] = [
+            AVFormatIDKey: Int(kAudioFormatLinearPCM),
+            AVSampleRateKey: 16_000,
+            AVNumberOfChannelsKey: 1,
+            AVLinearPCMBitDepthKey: 16,
+            AVLinearPCMIsFloatKey: false
+        ]
+
+        do {
+            let newRecorder = try AVAudioRecorder(url: url, settings: settings)
+            newRecorder.record()
+            recorder = newRecorder
+            recordingURL = url
+            recordingStartedAt = Date()
+            activeSource = source
+            isRecording = true
+            setStage(.recording, detail: "\(source.sectionTitle)录音中…", progress: 0.08)
+            log("Recording started: \(source.rawValue)")
+        } catch {
+            setStage(.failed, detail: "录音失败：\(error.localizedDescription)", progress: 0)
+            log("Recording failed: \(error)")
+        }
+    }
+
+    private func stopRecording() {
+        guard isRecording, let source = activeSource else { return }
+        recorder?.stop()
+        recorder = nil
+        let duration = recordingStartedAt.map { Date().timeIntervalSince($0) } ?? 0
+        let url = recordingURL
+        isRecording = false
+        activeSource = nil
+        recordingStartedAt = nil
+        recordingURL = nil
+
+        guard let url, let data = try? Data(contentsOf: url) else {
+            setStage(.idle, detail: "录音未保存", progress: 0)
+            return
+        }
+        let item = store.add(
+            name: name(for: source),
+            fileName: url.lastPathComponent,
+            source: source,
+            duration: duration,
+            waveform: WaveformExtractor.samples(from: url),
+            audioData: data
+        )
+        setStage(.idle, detail: "已保存「\(item.name)」，点按条目可转写", progress: 0)
+        log("Recording saved: \(item.fileName), \(duration)s")
+    }
+
+    private func importAudio(_ result: Result<URL, Error>) {
+        guard let url = try? result.get() else { return }
+        let scoped = url.startAccessingSecurityScopedResource()
+        defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+
+        let name = url.deletingPathExtension().lastPathComponent
+        let data = try? Data(contentsOf: url)
+        let item = store.add(
+            name: name,
+            fileName: url.lastPathComponent,
+            source: .long,
+            duration: duration(of: url),
+            waveform: WaveformExtractor.samples(from: url),
+            audioData: data
+        )
+        setStage(.idle, detail: "已导入「\(item.name)」，点按条目可转写", progress: 0)
+        log("Imported: \(item.fileName)")
+    }
+
+    private func transcribe(_ item: RecordingItem) async {
+        guard let url = store.audioURL(for: item) else {
+            setStage(.failed, detail: "找不到录音文件", progress: 0)
+            return
+        }
+        let start = Date()
+        currentItemName = item.name
+        transcript = ""
+        setStage(.loading, detail: "加载内置 \(selectedMode.modelTitle)…", progress: 0.1)
+        log("Transcribe start: \(item.fileName), mode=\(selectedMode.rawValue)")
+
+        do {
+            let text = try await service.transcribe(audioURL: url, mode: selectedMode)
+            transcript = text
+            store.updateTranscript(for: item.id, text: text)
+            let seconds = Date().timeIntervalSince(start)
+            setStage(.done, detail: "\(selectedMode.title) 完成，共 \(String(format: "%.1f", seconds)) 秒", progress: 1)
+            log("Transcribe finished: \(text)")
+            writeSentinel(status: "DONE", text: text, seconds: seconds)
+        } catch {
+            let msg = error.localizedDescription
+            setStage(.failed, detail: msg, progress: 0)
+            log("Transcribe failed: \(msg)")
+            writeSentinel(status: "FAILED", text: msg, seconds: Date().timeIntervalSince(start))
+        }
+    }
+
+    // MARK: - Helpers
+
+    private func setStage(_ s: Stage, detail: String, progress: Double) {
+        stage = s
+        self.detail = detail
+        self.progress = max(self.progress, progress)
+        log("Stage: \(s.rawValue) - \(detail)")
     }
 
     private func icon(for s: Stage) -> String {
         switch s {
         case .idle: return "play.circle"
-        case .downloading: return "arrow.down.circle.fill"
-        case .loading: return "cpu.fill"
         case .recording: return "waveform.path.ecg"
+        case .loading: return "shippingbox.fill"
         case .transcribing: return "brain"
         case .done: return "checkmark.circle.fill"
         case .failed: return "exclamationmark.triangle.fill"
         }
     }
 
-    // MARK: - Pipeline
-
-    private func runPipeline() async {
-        let start = Date()
-        log("App launched, pipeline started")
-        log("Model variant: \(modelName) (\(modelDisplayName))")
-        do {
-            // Step 1: download the model with progress
-            await setStage(.downloading, detail: "从 HuggingFace 下载 large-v3-turbo（约 632MB）…", progress: 0.02)
-            let folder = try await WhisperKit.download(
-                variant: modelName,
-                from: "argmaxinc/whisperkit-coreml",
-                progressCallback: { p in
-                    let frac = p.fractionCompleted
-                    DispatchQueue.main.async { self.downloadProgress = 0.05 + frac * 0.35 }
-                }
-            )
-            log("Model downloaded to \(folder.lastPathComponent)")
-
-            // Step 2: load model into memory
-            await setStage(.loading, detail: "编译并加载 Core ML 模型…", progress: 0.42)
-            let config = WhisperKitConfig(
-                modelFolder: folder.path,
-                verbose: true,
-                logLevel: .info,
-                prewarm: false,
-                load: true,
-                download: false
-            )
-            let whisperKit = try await WhisperKit(config)
-            log("Model loaded, state=\(whisperKit.modelState)")
-            await setStage(.loading, detail: "模型已就绪", progress: 0.5)
-            try await Task.sleep(nanoseconds: 600_000_000)
-
-            // Step 3: "record" - play bundled wav with live waveform
-            await setStage(.recording, detail: "正在录音（播放内置语音片段）…", progress: 0.55)
-            let audioURL = try bundledAudioURL()
-            await playClip(url: audioURL)
-
-            // Step 4: transcribe
-            await setStage(.transcribing, detail: "正在用 large-v3-turbo 转写…", progress: 0.8)
-            log("Transcription started")
-
-            // Use WhisperKit's default decoding path, same as the official FunctionalTests.
-            // large-v3-turbo can emit EOT during prompt prefill; the SDK now ignores
-            // those throwaway predictions, so keeping prefill enabled is correct.
-            // skipSpecialTokens strips the <|startoftranscript|><|en|>... markers
-            // and leaves clean readable text.
-            let options = DecodingOptions(verbose: true, skipSpecialTokens: true)
-            let results = try await whisperKit.transcribe(
-                audioPath: audioURL.path,
-                decodeOptions: options
-            )
-            log("Transcription results count: \(results.count), segments: \(results.first?.segments.count ?? 0)")
-
-            // WhisperKit aggregates `result.text` after applying no-speech
-            // filtering. On the simulator that filter can blank the aggregate
-            // even when the decoder produced a valid segment. Prefer the raw
-            // segment texts, which are always populated.
-            var text: String = results.flatMap { $0.segments }
-                .map { $0.text }
-                .joined()
-                .trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
-            if text.isEmpty {
-                text = results.compactMap { $0.text }
-                    .joined(separator: " ")
-                    .trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
-            }
-            log("Transcription finished: \(text)")
-
-            let seconds = Date().timeIntervalSince(start)
-            await MainActor.run {
-                self.transcript = text
-                self.elapsedText = String(format: "%.1fs", seconds)
-                self.stage = .done
-                self.detail = "识别完成，共 \(seconds.formatted(.number.precision(.fractionLength(1)))) 秒"
-            }
-            // Give SwiftUI time to repaint the result on screen BEFORE the CI
-            // sees the sentinel, otherwise the recorder stops while the last
-            // frame still shows the recording stage.
-            try? await Task.sleep(nanoseconds: 3_000_000_000)
-            writeSentinel(status: "DONE", text: text, seconds: seconds)
-        } catch {
-            let msg = "\(error)"
-            log("FAILED: \(msg)")
-            await MainActor.run {
-                self.stage = .failed
-                self.detail = msg
-            }
-            writeSentinel(status: "FAILED", text: msg, seconds: Date().timeIntervalSince(start))
+    private func name(for source: RecordingSource) -> String {
+        let count = store.items(for: source).count + 1
+        switch source {
+        case .long: return "长录音 \(count)"
+        case .pushToTalk: return "按住说话 \(count)"
+        case .tap: return "单击录音 \(count)"
         }
     }
 
-    private func setStage(_ s: Stage, detail: String, progress: Double) async {
-        await MainActor.run {
-            self.stage = s
-            self.detail = detail
-            if progress > self.downloadProgress { self.downloadProgress = progress }
-        }
-        log("Stage: \(s.rawValue) - \(detail)")
+    private func durationText(_ seconds: TimeInterval) -> String {
+        String(format: "%.1fs", seconds)
     }
 
-    private func bundledAudioURL() throws -> URL {
-        guard let url = Bundle.main.url(forResource: "recording", withExtension: "wav") else {
-            throw NSError(domain: "AutoTranscribe", code: 1, userInfo: [NSLocalizedDescriptionKey: "recording.wav not found in bundle"])
-        }
-        return url
+    private func duration(of url: URL) -> TimeInterval {
+        guard let file = try? AVAudioFile(forReading: url) else { return 0 }
+        return Double(file.length) / file.processingFormat.sampleRate
     }
-
-    private func playClip(url: URL) async {
-        do {
-            #if os(iOS)
-            try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .default)
-            try? AVAudioSession.sharedInstance().setActive(true)
-            #endif
-            let p = try AVAudioPlayer(contentsOf: url)
-            p.prepareToPlay()
-            await MainActor.run { self.player = p }
-            p.play()
-            while p.isPlaying {
-                let t = p.currentTime
-                await MainActor.run {
-                    self.recordSeconds = t
-                    self.waveform = self.waveform.enumerated().map { i, _ in
-                        CGFloat(0.2 + 0.65 * abs(sin(Double(i) * 0.55 + t * 4.0)))
-                    }
-                }
-                try? await Task.sleep(nanoseconds: 80_000_000)
-            }
-            await MainActor.run {
-                self.recordSeconds = p.duration
-                self.waveform = Array(repeating: 0.15, count: self.waveform.count)
-            }
-            log("Clip playback finished (\(String(format: "%.1f", p.duration))s)")
-        } catch {
-            log("Audio playback error: \(error) - continuing to transcription")
-            try? await Task.sleep(nanoseconds: 3_000_000_000)
-        }
-    }
-
-    // MARK: - CI-facing signals (written into the app's Documents dir)
 
     private func documentsURL() -> URL {
         FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
@@ -333,5 +473,31 @@ struct ContentView: View {
         let content = "status=\(status)\nseconds=\(String(format: "%.2f", seconds))\ntext=\(text)\n"
         let url = documentsURL().appendingPathComponent("transcription_done.txt")
         try? content.write(to: url, atomically: true, encoding: .utf8)
+    }
+}
+
+struct WaveformView: View {
+    let samples: [Double]
+    var color: Color = .blue
+    var height: CGFloat = 28
+    var barCount: Int = 32
+
+    private var displayed: [Double] {
+        guard samples.count > barCount else { return samples }
+        let step = Double(samples.count) / Double(barCount)
+        return (0..<barCount).map { i in
+            samples[min(samples.count - 1, Int(Double(i) * step))]
+        }
+    }
+
+    var body: some View {
+        HStack(spacing: 2) {
+            ForEach(displayed.indices, id: \.self) { i in
+                Capsule()
+                    .fill(color)
+                    .frame(width: 3, height: max(3, displayed[i] * height))
+            }
+        }
+        .frame(height: height)
     }
 }
