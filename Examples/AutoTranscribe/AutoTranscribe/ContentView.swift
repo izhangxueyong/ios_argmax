@@ -219,13 +219,20 @@ struct ContentView: View {
                 verbose: true,
                 task: .transcribe,
                 language: "en",
-                detectLanguage: false
+                detectLanguage: false,
+                skipSpecialTokens: true
             )
             let results = try await whisperKit.transcribe(
                 audioPath: audioURL.path,
                 decodeOptions: options
             )
             log("Transcription results count: \(results.count), segments: \(results.first?.segments.count ?? 0)")
+            for (ri, r) in results.enumerated() {
+                log("  result[\(ri)] text='\(r.text)' segments=\(r.segments.count)")
+                for (si, seg) in r.segments.enumerated() {
+                    log("    seg[\(si)] text='\(seg.text)' noSpeech=\(seg.noSpeechProb) avgLogProb=\(seg.avgLogprob)")
+                }
+            }
 
             // WhisperKit aggregates `result.text` after applying no-speech
             // filtering. On the simulator that filter can blank the aggregate
