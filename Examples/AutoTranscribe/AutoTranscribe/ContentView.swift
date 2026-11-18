@@ -1,6 +1,6 @@
 //  AutoTranscribe
 //  A fully automatic speech-recognition demo:
-//  1. Download + load the whisper-base model
+//  1. Download + load the WhisperKit model
 //  2. "Record" a clip (a bundled 16kHz English wav, since the simulator has no mic)
 //  3. Transcribe it and display the result
 //  Every step writes a log + a completion sentinel into Documents so CI can
@@ -19,7 +19,7 @@ struct ContentView: View {
     @State private var waveform: [CGFloat] = Array(repeating: 0.15, count: 44)
     @State private var player: AVAudioPlayer?
     @State private var started = false
-    @State private var modelName = "openai_whisper-base"
+    @State private var modelName = "openai_whisper-tiny"
     @State private var elapsedText = "0.0s"
 
     enum Stage: String {
@@ -60,7 +60,7 @@ struct ContentView: View {
                 .foregroundColor(.blue)
             Text("AutoTranscribe")
                 .font(.title2.bold())
-            Text("自动语音识别 · whisper-base · on-device")
+            Text("自动语音识别 · whisper-tiny · on-device")
                 .font(.caption)
                 .foregroundColor(.secondary)
         }
@@ -174,8 +174,8 @@ struct ContentView: View {
         let start = Date()
         log("App launched, pipeline started")
         do {
-            // Step 1: download whisper-base with progress
-            await setStage(.downloading, detail: "从 HuggingFace 下载 whisper-base…", progress: 0.02)
+            // Step 1: download the model with progress
+            await setStage(.downloading, detail: "从 HuggingFace 下载 whisper-tiny…", progress: 0.02)
             let folder = try await WhisperKit.download(
                 variant: modelName,
                 from: "argmaxinc/whisperkit-coreml",
@@ -207,7 +207,7 @@ struct ContentView: View {
             await playClip(url: audioURL)
 
             // Step 4: transcribe
-            await setStage(.transcribing, detail: "正在用 whisper-base 转写…", progress: 0.8)
+            await setStage(.transcribing, detail: "正在用 whisper-tiny 转写…", progress: 0.8)
             log("Transcription started")
 
             // Use WhisperKit's fully default decoding options — this is the exact
