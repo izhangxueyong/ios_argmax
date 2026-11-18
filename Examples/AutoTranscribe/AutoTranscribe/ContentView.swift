@@ -1,6 +1,6 @@
 //  AutoTranscribe
 //  A fully automatic speech-recognition demo:
-//  1. Download + load the WhisperKit model
+//  1. Download + load the 632MB large-v3-turbo WhisperKit model
 //  2. "Record" a clip (a bundled 16kHz English wav, since the simulator has no mic)
 //  3. Transcribe it and display the result
 //  Every step writes a log + a completion sentinel into Documents so CI can
@@ -19,8 +19,10 @@ struct ContentView: View {
     @State private var waveform: [CGFloat] = Array(repeating: 0.15, count: 44)
     @State private var player: AVAudioPlayer?
     @State private var started = false
-    @State private var modelName = "openai_whisper-tiny"
+    @State private var modelName = "openai_whisper-large-v3-v20240930_turbo"
     @State private var elapsedText = "0.0s"
+
+    private var modelDisplayName: String { "large-v3-turbo · 632MB" }
 
     enum Stage: String {
         case idle = "准备就绪"
@@ -60,7 +62,7 @@ struct ContentView: View {
                 .foregroundColor(.blue)
             Text("AutoTranscribe")
                 .font(.title2.bold())
-            Text("自动语音识别 · whisper-tiny · on-device")
+            Text("自动语音识别 · \(modelDisplayName) · on-device")
                 .font(.caption)
                 .foregroundColor(.secondary)
         }
@@ -173,9 +175,10 @@ struct ContentView: View {
     private func runPipeline() async {
         let start = Date()
         log("App launched, pipeline started")
+        log("Model variant: \(modelName) (\(modelDisplayName))")
         do {
             // Step 1: download the model with progress
-            await setStage(.downloading, detail: "从 HuggingFace 下载 whisper-tiny…", progress: 0.02)
+            await setStage(.downloading, detail: "从 HuggingFace 下载 large-v3-turbo（约 632MB）…", progress: 0.02)
             let folder = try await WhisperKit.download(
                 variant: modelName,
                 from: "argmaxinc/whisperkit-coreml",
@@ -207,15 +210,14 @@ struct ContentView: View {
             await playClip(url: audioURL)
 
             // Step 4: transcribe
-            await setStage(.transcribing, detail: "正在用 whisper-tiny 转写…", progress: 0.8)
+            await setStage(.transcribing, detail: "正在用 large-v3-turbo 转写…", progress: 0.8)
             log("Transcription started")
 
-            // Use WhisperKit's fully default decoding options — this is the exact
-            // path the official FunctionalTests use to transcribe jfk.wav. Custom
-            // language / filter overrides caused empty or hallucinated output on
-            // the simulator's CPU-only decode.
-            // skipSpecialTokens strips the <|startoftranscript|><|en|>... markers,
-            // leaving clean readable text. Works now that the model emits real tokens.
+            // Use WhisperKit's default decoding path, same as the official FunctionalTests.
+            // large-v3-turbo can emit EOT during prompt prefill; the SDK now ignores
+            // those throwaway predictions, so keeping prefill enabled is correct.
+            // skipSpecialTokens strips the <|startoftranscript|><|en|>... markers
+            // and leaves clean readable text.
             let options = DecodingOptions(verbose: true, skipSpecialTokens: true)
             let results = try await whisperKit.transcribe(
                 audioPath: audioURL.path,
