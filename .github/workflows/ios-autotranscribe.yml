@@ -1,4 +1,4 @@
-name: "AutoTranscribe (interactive demo: round record buttons + replay, full run recording)"
+name: "AutoTranscribe (session archive + full archived list, full run recording)"
 
 on:
   push:
@@ -133,27 +133,53 @@ jobs:
           echo "Installed $BUNDLE_ID"
 
       - name: Run app and record full pipeline (launch -> result)
-        timeout-minutes: 120
+        timeout-minutes: 150
         run: |
           set -e
           CONTAINER=$(xcrun simctl get_app_container "$UDID" "$BUNDLE_ID" data)
           echo "App data container: $CONTAINER"
           DOCS="$CONTAINER/Documents"
-          rm -f "$DOCS/transcription_done.txt" "$DOCS/demo_done.txt" "$DOCS/progress.log" "$DOCS/recordings.json" 2>/dev/null || true
+          rm -f "$DOCS/transcription_done.txt" "$DOCS/demo_done.txt" "$DOCS/progress.log" \
+                "$DOCS/recordings.json" "$DOCS/sessions.json" "$DOCS/archive_action.log" \
+                "$DOCS/archive_scroll_started.txt" "$DOCS/archive_scroll_step.txt" \
+                "$DOCS/archive_scroll_done.txt" "$DOCS/archive_list_full.png" 2>/dev/null || true
 
           # Start recording BEFORE launch so the launch animation is captured.
           echo "Starting screen recording..."
-          xcrun simctl io "$UDID" recordVideo --codec=h264 "$MEDIA_DIR/AutoTranscribe-interaction-demo-full-run.mp4" &
+          xcrun simctl io "$UDID" recordVideo --codec=h264 "$MEDIA_DIR/AutoTranscribe-session-archive-full-run.mp4" &
           RECORD_PID=$!
           sleep 2
 
+          # Background watcher: capture one still for EVERY screen of the
+          # archived-list scroll, so the full list is visible as stills even if
+          # the simulator video freezes during long inference.
+          LAST_STEP=""
+          (
+            seen=""
+            while true; do
+              if [ -f "$DOCS/demo_done.txt" ]; then break; fi
+              if [ -f "$DOCS/archive_scroll_step.txt" ]; then
+                step=$(tr -d '\n' < "$DOCS/archive_scroll_step.txt" 2>/dev/null || true)
+                if [ -n "$step" ] && [ "$step" != "$seen" ]; then
+                  # Let the scroll animation settle before grabbing the still.
+                  sleep 2
+                  label=$(printf "%02d" "$step" 2>/dev/null || echo "$step")
+                  xcrun simctl io "$UDID" screenshot "$MEDIA_DIR/AutoTranscribe-archive-list-$label.png" || true
+                  seen="$step"
+                fi
+              fi
+              sleep 2
+            done
+          ) &
+          WATCH_PID=$!
+
           xcrun simctl launch "$UDID" "$BUNDLE_ID" --args --auto-run
 
-          # Poll for the demo completion sentinel: 4 recordings + transcription
-          # + replay of every saved result + return to the list.
-          echo "Waiting for interaction demo to finish..."
+          # Poll for the demo completion sentinel: multi-clip sessions, two
+          # checkmark archives, full list scroll, result replay, return home.
+          echo "Waiting for session archive demo to finish..."
           DONE=0
-          for i in $(seq 1 400); do
+          for i in $(seq 1 500); do
             if [ -f "$DOCS/demo_done.txt" ]; then
               echo "Demo sentinel found at check $i"
               DONE=1
@@ -164,14 +190,17 @@ jobs:
               tail -n 2 "$DOCS/progress.log" | sed 's/^/  [app] /' || true
             fi
             if [ $((i % 20)) -eq 0 ]; then
-              echo "  [ci] still waiting for interaction demo ($i/400 checks, ~$((i / 4))min)"
+              echo "  [ci] still waiting for session archive demo ($i/500 checks, ~$((i / 4))min)"
             fi
             sleep 15
           done
 
           if [ "$DONE" -ne 1 ]; then
-            echo "WARNING: demo completion sentinel not found within 100 min"
+            echo "WARNING: demo completion sentinel not found within 125 min"
           fi
+
+          # Stop the background still watcher once the demo is over.
+          wait "$WATCH_PID" 2>/dev/null || true
 
           # Let the final result settle and stay on screen. The simulator screen
           # can lag behind the app state after a long local inference run, so
@@ -183,8 +212,18 @@ jobs:
           # work; a fresh screenshot forces a repaint and is a reliable artifact.
           echo "Capturing result screenshot..."
           mkdir -p "$MEDIA_DIR"
-          xcrun simctl io "$UDID" screenshot "$MEDIA_DIR/AutoTranscribe-interaction-demo-result.png" || true
-          ls -lh "$MEDIA_DIR/AutoTranscribe-interaction-demo-result.png" 2>/dev/null || true
+          xcrun simctl io "$UDID" screenshot "$MEDIA_DIR/AutoTranscribe-session-archive-result.png" || true
+          ls -lh "$MEDIA_DIR/AutoTranscribe-session-archive-result.png" 2>/dev/null || true
+
+          # Copy the app-rendered full-height archived list (one tall image that
+          # shows every archived session, clip name, file name and waveform).
+          if [ -f "$DOCS/archive_list_full.png" ]; then
+            cp "$DOCS/archive_list_full.png" "$MEDIA_DIR/AutoTranscribe-archive-list-FULL.png"
+            echo "Full archived list image exported:"
+            ls -lh "$MEDIA_DIR/AutoTranscribe-archive-list-FULL.png"
+          else
+            echo "WARNING: full archived list image missing"
+          fi
           sleep 12
 
           echo "Stopping screen recording (PID $RECORD_PID)..."
@@ -193,7 +232,11 @@ jobs:
 
           echo "=== demo_done.txt ==="
           cat "$DOCS/demo_done.txt" 2>/dev/null || echo "(missing)"
-          echo "=== saved recording count ==="
+          echo "=== archived sessions ==="
+          python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print("sessions:", len(d)); [print(" -", s.get("title", "session#" + str(s.get("index"))), "archived=", s.get("isArchived"), "clips=", len(s.get("itemIDs", []))) for s in d]' "$DOCS/sessions.json" 2>/dev/null || echo "(sessions.json missing)"
+          echo "=== checkmark archive actions ==="
+          cat "$DOCS/archive_action.log" 2>/dev/null || echo "(missing)"
+          echo "=== saved recordings ==="
           python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print("recordings:", len(d)); [print(" -", x.get("source"), x.get("name"), x.get("fileName"), "transcript=" + str(bool(x.get("transcript")))) for x in d]' "$DOCS/recordings.json" 2>/dev/null || echo "(recordings.json missing)"
           echo "=== progress.log ==="
           cat "$DOCS/progress.log" 2>/dev/null || echo "(missing)"
@@ -204,7 +247,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: autotranscribe-interaction-demo-full-run
+          name: autotranscribe-session-archive-full-run
           path: |
             ${{ env.MEDIA_DIR }}/*.mp4
             ${{ env.MEDIA_DIR }}/*.png

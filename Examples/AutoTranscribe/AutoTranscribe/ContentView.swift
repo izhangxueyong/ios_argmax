@@ -1,15 +1,21 @@
 //  AutoTranscribe
-//  Two on-device ASR modes with bundled models + a recording list.
+//  Two on-device ASR modes with bundled models + session-based recording list.
 //  Models are copied into the app bundle at build time; the app never downloads at runtime.
 //
+//  Session rules:
+//   - "Press and hold to talk" clips accumulate in the CURRENT open session.
+//   - The green checkmark button archives that session and opens a new one.
+//   - A session detail lists ALL hold-to-talk clips of that same session.
+//
 //  --auto-run drives a scripted UI demo used by CI:
-//    standard mode: hold-to-talk, then tap record
-//    precise mode:  tap record, then tap record
-//    each clip is transcribed, saved locally, then replayed in a detail viewer,
-//    and finally the app returns to the list (home).
+//    standard mode: 3 hold-to-talk clips in one session, checkmark archive, tap record
+//    precise mode:  tap record, 2 hold-to-talk clips in a new session, checkmark, tap record
+//    then scroll the archived list screen by screen, open every session/result detail,
+//    and finally return to the home screen.
 
 import AVFoundation
 import SwiftUI
+import UIKit
 import UniformTypeIdentifiers
 
 struct ContentView: View {
@@ -29,11 +35,14 @@ struct ContentView: View {
     @State private var recordingStartedAt: Date?
     @State private var showingImporter = false
     @State private var started = false
+    @State private var checkPulse = false
 
-    // Result-review sheet (auto-demo replays saved results through this).
-    @State private var reviewingItem: RecordingItem?
-    @State private var reviewIndex = 0
+    // One sheet is used for both single-result and whole-session review.
+    @State private var reviewTarget: ReviewTarget?
     @State private var demoReplaying = false
+
+    // ScrollViewReader anchor used by the scripted demo to reveal the full list.
+    @State private var scrollAnchor = ""
 
     enum Stage: String {
         case idle = "准备就绪"
@@ -44,20 +53,44 @@ struct ContentView: View {
         case failed = "发生错误"
     }
 
+    enum ReviewTarget: Identifiable {
+        case item(RecordingItem)
+        case session(RecordingSession)
+
+        var id: String {
+            switch self {
+            case .item(let item): return "item-\(item.id.uuidString)"
+            case .session(let session): return "session-\(session.id.uuidString)"
+            }
+        }
+    }
+
     var body: some View {
         NavigationStack {
-            ScrollView {
-                VStack(spacing: 16) {
-                    header
-                    modeCard
-                    controlsCard
-                    statusCard
-                    resultCard
-                    recordingList
+            ScrollViewReader { proxy in
+                ScrollView {
+                    VStack(spacing: 16) {
+                        header.id("top")
+                        modeCard.id("mode")
+                        controlsCard.id("controls")
+                        sessionCard.id("session-card")
+                        statusCard.id("status")
+                        resultCard.id("result")
+                        recordingList.id("archive-list")
+                        longSection.id("section-long")
+                        tapSection.id("section-tap")
+                        Color.clear.frame(height: 40).id("list-bottom")
+                    }
+                    .padding(20)
                 }
-                .padding(20)
+                .background(Color(.systemGroupedBackground))
+                .onChange(of: scrollAnchor) { _, anchor in
+                    guard !anchor.isEmpty else { return }
+                    withAnimation(.easeInOut(duration: 0.7)) {
+                        proxy.scrollTo(anchor, anchor: .top)
+                    }
+                }
             }
-            .background(Color(.systemGroupedBackground))
             .navigationTitle("AutoTranscribe")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -70,8 +103,12 @@ struct ContentView: View {
             .fileImporter(isPresented: $showingImporter, allowedContentTypes: [.audio]) { result in
                 importAudio(result)
             }
-            .sheet(item: $reviewingItem) { item in
-                ResultDetailView(item: item, isDemo: demoReplaying)
+            .sheet(item: $reviewTarget) { target in
+                ReviewSheet(
+                    target: target,
+                    sessionItems: sessionItems(for: target),
+                    isDemo: demoReplaying
+                )
             }
             .task {
                 guard !started else { return }
@@ -93,7 +130,7 @@ struct ContentView: View {
                 .foregroundColor(.blue)
             Text("本地语音转写")
                 .font(.title2.bold())
-            Text("内置模型 · 运行时零下载 · on-device")
+            Text("内置模型 · 运行时零下载 · 会话归档")
                 .font(.caption)
                 .foregroundColor(.secondary)
         }
@@ -127,16 +164,24 @@ struct ContentView: View {
         .background(RoundedRectangle(cornerRadius: 14).fill(Color(.secondarySystemGroupedBackground)))
     }
 
-    // MARK: - Recording controls (round red icon buttons)
+    // MARK: - Recording controls (two round red buttons + green checkmark)
 
     private var controlsCard: some View {
         VStack(spacing: 14) {
-            HStack(alignment: .top, spacing: 0) {
+            HStack(alignment: .top, spacing: 6) {
                 holdToTalkButton
-                Spacer(minLength: 16)
+                Spacer(minLength: 4)
                 tapRecordButton
+                Spacer(minLength: 4)
+                checkmarkButton
             }
-            .padding(.horizontal, 8)
+            .padding(.horizontal, 2)
+
+            Text("多次「按住说话」会累积在同一会话；点右侧绿色打勾才归档并新建会话")
+                .font(.caption2)
+                .foregroundColor(.secondary)
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: .infinity)
 
             Button {
                 showingImporter = true
@@ -155,23 +200,23 @@ struct ContentView: View {
             ZStack {
                 Circle()
                     .fill(active ? Color.red.opacity(0.35) : Color.red.opacity(0.12))
-                    .frame(width: 92, height: 92)
+                    .frame(width: 86, height: 86)
                 Circle()
                     .fill(Color.red)
-                    .frame(width: 74, height: 74)
+                    .frame(width: 70, height: 70)
                     .shadow(color: .red.opacity(0.4), radius: 8, y: 4)
                 Image(systemName: active ? "waveform.circle.fill" : "mic.fill")
-                    .font(.system(size: 30, weight: .semibold))
+                    .font(.system(size: 28, weight: .semibold))
                     .foregroundColor(.white)
                 if active {
                     Circle()
                         .stroke(Color.red.opacity(0.5), lineWidth: 3)
-                        .frame(width: 92, height: 92)
+                        .frame(width: 86, height: 86)
                         .scaleEffect(active ? 1.1 : 1.0)
                         .animation(.easeInOut(duration: 0.7).repeatForever(autoreverses: true), value: active)
                 }
             }
-            .frame(width: 96, height: 96)
+            .frame(width: 90, height: 90)
             .contentShape(Circle())
             .onLongPressGesture(minimumDuration: 0.15, pressing: { pressing in
                 if pressing {
@@ -184,7 +229,7 @@ struct ContentView: View {
                 .font(.caption.bold())
                 .foregroundColor(active ? .red : .secondary)
         }
-        .frame(width: 120)
+        .frame(width: 100)
     }
 
     private var tapRecordButton: some View {
@@ -193,23 +238,23 @@ struct ContentView: View {
             ZStack {
                 Circle()
                     .fill(active ? Color.red.opacity(0.35) : Color.red.opacity(0.12))
-                    .frame(width: 92, height: 92)
+                    .frame(width: 86, height: 86)
                 Circle()
                     .fill(Color.red)
-                    .frame(width: 74, height: 74)
+                    .frame(width: 70, height: 70)
                     .shadow(color: .red.opacity(0.4), radius: 8, y: 4)
                 Image(systemName: active ? "stop.fill" : "record.circle.fill")
-                    .font(.system(size: 30, weight: .semibold))
+                    .font(.system(size: 28, weight: .semibold))
                     .foregroundColor(.white)
                 if active {
                     Circle()
                         .stroke(Color.red.opacity(0.5), lineWidth: 3)
-                        .frame(width: 92, height: 92)
+                        .frame(width: 86, height: 86)
                         .scaleEffect(active ? 1.1 : 1.0)
                         .animation(.easeInOut(duration: 0.7).repeatForever(autoreverses: true), value: active)
                 }
             }
-            .frame(width: 96, height: 96)
+            .frame(width: 90, height: 90)
             .contentShape(Circle())
             .onTapGesture {
                 if isRecording && activeSource == .tap {
@@ -222,7 +267,101 @@ struct ContentView: View {
                 .font(.caption.bold())
                 .foregroundColor(active ? .red : .secondary)
         }
-        .frame(width: 120)
+        .frame(width: 100)
+    }
+
+    /// The checkmark archives the current session and opens a new one.
+    private var checkmarkButton: some View {
+        let count = currentSessionClipCount
+        let enabled = count > 0
+        return VStack(spacing: 8) {
+            ZStack {
+                Circle()
+                    .fill(checkPulse ? Color.green.opacity(0.45) : (enabled ? Color.green.opacity(0.16) : Color.gray.opacity(0.12)))
+                    .frame(width: 86, height: 86)
+                Circle()
+                    .fill(enabled ? Color.green : Color.gray)
+                    .frame(width: 62, height: 62)
+                    .shadow(color: Color.green.opacity(0.35), radius: 8, y: 4)
+                Image(systemName: checkPulse ? "checkmark.circle.fill" : "checkmark")
+                    .font(.system(size: 27, weight: .bold))
+                    .foregroundColor(.white)
+                if checkPulse {
+                    Circle()
+                        .stroke(Color.green.opacity(0.65), lineWidth: 3)
+                        .frame(width: 86, height: 86)
+                        .scaleEffect(1.12)
+                }
+            }
+            .frame(width: 90, height: 90)
+            .contentShape(Circle())
+            .onTapGesture {
+                archiveAndOpenNewSession()
+            }
+            Text(checkPulse ? "已归档" : "打勾归档")
+                .font(.caption.bold())
+                .foregroundColor(enabled ? .green : .secondary)
+            Text("新建会话")
+                .font(.caption2)
+                .foregroundColor(.secondary)
+        }
+        .frame(width: 100)
+    }
+
+    private var currentSessionClipCount: Int {
+        guard let current = store.currentSession else { return 0 }
+        return store.items(in: current).count
+    }
+
+    // MARK: - Current session card
+
+    private var sessionCard: some View {
+        let current = store.currentSession
+        var clips: [RecordingItem] = []
+        if let current {
+            clips = store.items(in: current)
+        }
+        return VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Image(systemName: "bubble.left.and.bubble.right.fill")
+                    .foregroundColor(.orange)
+                Text(current?.title ?? "会话")
+                    .font(.subheadline.bold())
+                Spacer()
+                Text("进行中 · 未归档")
+                    .font(.caption2.bold())
+                    .foregroundColor(.orange)
+            }
+            Text("本会话已录 \(clips.count) 段按住说话录音；点绿色打勾后归档，之后的录音进入新会话")
+                .font(.caption2)
+                .foregroundColor(.secondary)
+
+            if clips.isEmpty {
+                Text("暂无说话录音")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            } else {
+                ForEach(clips.indices, id: \.self) { index in
+                    let clip = clips[index]
+                    HStack {
+                        Text("\(index + 1).")
+                            .font(.caption2.monospacedDigit())
+                            .foregroundColor(.secondary)
+                        Text(clip.name)
+                            .font(.caption.bold())
+                        Text(clip.fileName)
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                        Spacer(minLength: 4)
+                        WaveformView(samples: clip.waveform, color: .red, height: 16, barCount: 18)
+                            .frame(width: 70)
+                    }
+                }
+            }
+        }
+        .padding(14)
+        .background(RoundedRectangle(cornerRadius: 14).fill(Color(.secondarySystemGroupedBackground)))
     }
 
     // MARK: - Status / Result
@@ -271,102 +410,201 @@ struct ContentView: View {
         .background(RoundedRectangle(cornerRadius: 14).fill(Color(.secondarySystemGroupedBackground)))
     }
 
-    // MARK: - Recording list
+    // MARK: - Archived recording list (grouped by session)
 
     private var recordingList: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        let archived = store.archivedSessions
+        return VStack(alignment: .leading, spacing: 12) {
             HStack {
-                Text("录音列表").font(.headline)
+                Label("归档录音列表", systemImage: "archivebox.fill")
+                    .font(.headline)
                 Spacer()
-                Text("\(store.items.count) 条").font(.caption).foregroundColor(.secondary)
+                Text("\(archived.count) 个会话")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
             }
+            Text("每个会话详情内含该会话全部按住说话录音")
+                .font(.caption2)
+                .foregroundColor(.secondary)
 
-            ForEach(RecordingSource.allCases, id: \.self) { source in
-                let rows = store.items(for: source)
-                if !rows.isEmpty {
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text(source.sectionTitle)
-                            .font(.caption.bold())
-                            .foregroundColor(.secondary)
-                        ForEach(rows) { item in
-                            row(for: item, source: source)
-                        }
-                    }
+            if archived.isEmpty {
+                Text("还没有归档会话 · 录音后点绿色打勾")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .frame(maxWidth: .infinity, minHeight: 46, alignment: .leading)
+            } else {
+                ForEach(archived) { session in
+                    archivedSessionCard(session)
+                        .id("archive-session-\(session.index)")
                 }
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
-    @ViewBuilder
-    private func row(for item: RecordingItem, source: RecordingSource) -> some View {
-        switch source {
-        case .long:
-            Button { openResult(item) } label: {
-                HStack(spacing: 10) {
-                    Image(systemName: "waveform.rectangle")
-                        .foregroundColor(.blue)
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(item.name).font(.subheadline.bold())
-                        Text(item.fileName).font(.caption2).foregroundColor(.secondary)
-                    }
-                    Spacer(minLength: 4)
-                    WaveformView(samples: item.waveform, color: .blue, height: 24, barCount: 20)
-                        .frame(width: 86)
-                    Text(durationText(item.duration)).font(.caption2).foregroundColor(.secondary)
+    private func archivedSessionCard(_ session: RecordingSession) -> some View {
+        let clips = store.items(in: session)
+        var total: Double = 0
+        for clip in clips {
+            total += clip.duration
+        }
+        let wave = WaveformExtractor.merged(clips, bars: 48)
+        return Button {
+            openSession(session)
+        } label: {
+            VStack(alignment: .leading, spacing: 9) {
+                HStack {
+                    Image(systemName: "checkmark.seal.fill")
+                        .foregroundColor(.green)
+                    Text(session.title)
+                        .font(.subheadline.bold())
+                    Spacer()
+                    Text("已归档")
+                        .font(.caption2.bold())
+                        .foregroundColor(.green)
                 }
-                .padding(12)
-                .background(RoundedRectangle(cornerRadius: 12).fill(Color(.secondarySystemGroupedBackground)))
-            }
-            .buttonStyle(.plain)
+                HStack(spacing: 6) {
+                    Text("\(clips.count) 段按住说话")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                    Text("·").font(.caption2).foregroundColor(.secondary)
+                    Text(String(format: "总时长 %.1fs", total))
+                        .font(.caption2.monospacedDigit())
+                        .foregroundColor(.secondary)
+                    Spacer()
+                    Text("查看全部 →")
+                        .font(.caption2.bold())
+                        .foregroundColor(.blue)
+                }
 
-        case .pushToTalk:
-            HStack {
-                Spacer(minLength: 48)
-                Button { openResult(item) } label: {
-                    VStack(alignment: .trailing, spacing: 4) {
-                        HStack(spacing: 8) {
-                            Image(systemName: "mic.fill").font(.caption).foregroundColor(.white)
-                            WaveformView(samples: item.waveform, color: .white.opacity(0.9), height: 22, barCount: 22)
-                                .frame(width: 96)
-                            Text(durationText(item.duration)).font(.caption2).foregroundColor(.white.opacity(0.85))
+                WaveformView(samples: wave, color: .blue, height: 26, barCount: 40)
+                    .frame(maxWidth: .infinity)
+
+                // Bubble thumbnails of every clip in this session.
+                ForEach(clips.indices, id: \.self) { index in
+                    let clip = clips[index]
+                    HStack {
+                        Spacer(minLength: 30)
+                        HStack(spacing: 6) {
+                            Image(systemName: "mic.fill")
+                                .font(.caption2)
+                                .foregroundColor(.white)
+                            Text("\(index + 1). \(clip.name)")
+                                .font(.caption2.bold())
+                                .foregroundColor(.white)
+                            WaveformView(samples: clip.waveform, color: .white.opacity(0.9), height: 14, barCount: 14)
+                                .frame(width: 54)
+                            Text(String(format: "%.1fs", clip.duration))
+                                .font(.caption2.monospacedDigit())
+                                .foregroundColor(.white.opacity(0.85))
                         }
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 9)
-                        .background(RoundedRectangle(cornerRadius: 16).fill(Color.red))
-                        Text(item.fileName).font(.caption2).foregroundColor(.secondary)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 6)
+                        .background(Capsule().fill(Color.red.opacity(0.9)))
                     }
+                }
+            }
+            .padding(12)
+            .background(RoundedRectangle(cornerRadius: 12).fill(Color(.secondarySystemGroupedBackground)))
+        }
+        .buttonStyle(.plain)
+    }
+
+    // MARK: - Long / tap sections
+
+    private var longSection: some View {
+        let rows = store.items(for: .long)
+        return VStack(alignment: .leading, spacing: 10) {
+            Text("长录音").font(.subheadline.bold())
+            ForEach(rows) { item in
+                Button { openResult(item) } label: {
+                    HStack(spacing: 10) {
+                        Image(systemName: "waveform.rectangle")
+                            .foregroundColor(.blue)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(item.name).font(.subheadline.bold())
+                            Text(item.fileName).font(.caption2).foregroundColor(.secondary)
+                        }
+                        Spacer(minLength: 4)
+                        WaveformView(samples: item.waveform, color: .blue, height: 24, barCount: 20)
+                            .frame(width: 86)
+                        Text(durationText(item.duration)).font(.caption2).foregroundColor(.secondary)
+                    }
+                    .padding(12)
+                    .background(RoundedRectangle(cornerRadius: 12).fill(Color(.secondarySystemGroupedBackground)))
                 }
                 .buttonStyle(.plain)
             }
-
-        case .tap:
-            Button { openResult(item) } label: {
-                VStack(alignment: .leading, spacing: 6) {
-                    HStack {
-                        Image(systemName: "record.circle").foregroundColor(.red)
-                        Text(item.name).font(.subheadline.bold())
-                        Spacer()
-                        Text(durationText(item.duration)).font(.caption2).foregroundColor(.secondary)
-                    }
-                    Text(item.fileName).font(.caption2).foregroundColor(.secondary)
-                    WaveformView(samples: item.waveform, color: .red, height: 18, barCount: 40)
-                    if let text = item.transcript, !text.isEmpty {
-                        Text(text).font(.caption2).foregroundColor(.secondary).lineLimit(1)
-                    }
-                }
-                .padding(12)
-                .background(RoundedRectangle(cornerRadius: 12).fill(Color(.secondarySystemGroupedBackground)))
-            }
-            .buttonStyle(.plain)
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
+
+    private var tapSection: some View {
+        let rows = store.items(for: .tap)
+        return VStack(alignment: .leading, spacing: 10) {
+            Text("单击录音").font(.subheadline.bold())
+            ForEach(rows) { item in
+                Button { openResult(item) } label: {
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack {
+                            Image(systemName: "record.circle").foregroundColor(.red)
+                            Text(item.name).font(.subheadline.bold())
+                            Spacer()
+                            Text(durationText(item.duration)).font(.caption2).foregroundColor(.secondary)
+                        }
+                        Text(item.fileName).font(.caption2).foregroundColor(.secondary)
+                        WaveformView(samples: item.waveform, color: .red, height: 18, barCount: 40)
+                        if let text = item.transcript, !text.isEmpty {
+                            Text(text).font(.caption2).foregroundColor(.secondary).lineLimit(1)
+                        }
+                    }
+                    .padding(12)
+                    .background(RoundedRectangle(cornerRadius: 12).fill(Color(.secondarySystemGroupedBackground)))
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    // MARK: - Opening details
 
     private func openResult(_ item: RecordingItem) {
         demoReplaying = false
         currentItemName = item.name
         transcript = item.transcript ?? ""
-        reviewingItem = item
+        reviewTarget = .item(item)
+    }
+
+    private func openSession(_ session: RecordingSession) {
+        demoReplaying = false
+        reviewTarget = .session(session)
+    }
+
+    private func sessionItems(for target: ReviewTarget) -> [RecordingItem] {
+        switch target {
+        case .item:
+            return []
+        case .session(let session):
+            return store.items(in: session)
+        }
+    }
+
+    private func archiveAndOpenNewSession() {
+        let before = store.currentSession?.title ?? "会话"
+        guard let archived = store.archiveCurrentSession() else {
+            setStage(.idle, detail: "当前还没有说话录音，无需归档", progress: 0)
+            return
+        }
+        let after = store.currentSession?.title ?? "新会话"
+        checkPulse = true
+        setStage(.done, detail: "✓ 已归档「\(before)」(\(archived.itemIDs.count) 段)，新建「\(after)」", progress: 1)
+        log("Session archived: \(before) clips=\(archived.itemIDs.count), opened \(after)")
+        writeText("\(before) archived\n", fileName: "archive_action.log", append: true)
+        Task {
+            try? await Task.sleep(nanoseconds: 1_600_000_000)
+            checkPulse = false
+        }
     }
 
     // MARK: - Real recording actions
@@ -378,7 +616,7 @@ struct ContentView: View {
         try? session.setActive(true)
 
         let url = store.documentsDirectory
-            .appendingPathComponent("recording_\(Int(Date().timeIntervalSince1970)).wav")
+            .appendingPathComponent("recording_\(UUID().uuidString.prefix(8)).wav")
         let settings: [String: Any] = [
             AVFormatIDKey: Int(kAudioFormatLinearPCM),
             AVSampleRateKey: 16_000,
@@ -426,7 +664,7 @@ struct ContentView: View {
             waveform: WaveformExtractor.samples(from: url),
             audioData: data
         )
-        setStage(.idle, detail: "已保存「\(item.name)」，点按条目可转写", progress: 0)
+        setStage(.idle, detail: "已保存「\(item.name)」到当前会话，点按条目可转写", progress: 0)
         log("Recording saved: \(item.fileName), \(duration)s")
     }
 
@@ -480,42 +718,46 @@ struct ContentView: View {
 
     private func runDemo() async {
         log("DEMO started")
-        // 1. Standard mode: hold-to-talk
-        selectedMode = .standard
-        await demoRecord(source: .pushToTalk, label: "普通 · 按住说话")
 
-        // 2. Standard mode: tap record
+        // ---- Standard mode: three hold-to-talk clips in ONE session ----
+        selectedMode = .standard
+        await demoRecord(source: .pushToTalk, label: "普通 · 会话1 按住说话 1/3")
+        await demoRecord(source: .pushToTalk, label: "普通 · 会话1 按住说话 2/3")
+        await demoRecord(source: .pushToTalk, label: "普通 · 会话1 按住说话 3/3")
+        await demoCheckmark(label: "普通 · 打勾归档会话1 / 新建会话2")
         await demoRecord(source: .tap, label: "普通 · 单击录音")
 
-        // 3. Precise mode: tap record
+        // ---- Precise mode ----
         selectedMode = .precise
-        await demoRecord(source: .tap, label: "精准 · 单击录音")
+        await demoRecord(source: .tap, label: "精准 · 单击录音 1/2")
+        await demoRecord(source: .pushToTalk, label: "精准 · 会话2 按住说话 1/2")
+        await demoRecord(source: .pushToTalk, label: "精准 · 会话2 按住说话 2/2")
+        await demoCheckmark(label: "精准 · 打勾归档会话2 / 新建会话3")
+        await demoRecord(source: .tap, label: "精准 · 单击录音 2/2")
 
-        // 4. Precise mode: tap record again
-        await demoRecord(source: .tap, label: "精准 · 单击录音")
+        // ---- Scroll down the archived list screen by screen ----
+        await demoScrollArchivedList()
 
-        // 5. Replay every saved result in the detail viewer.
+        // ---- Open every saved result detail, then return ----
         await demoReviewResults()
 
-        // 6. Return to list (home) and signal completion.
+        // ---- Return to home: leave the archived list fully in view ----
+        scrollAnchor = "archive-list"
         stage = .done
-        detail = "演示完成 · 已返回录音列表"
+        detail = "演示完成 · 已返回桌面（归档录音列表）"
         log("DEMO finished")
-        writeDemoSentinel(status: "DONE", count: store.items.count)
+        writeDemoSentinel(status: "DONE", sessions: store.archivedSessions.count, items: store.items.count)
     }
 
     private func demoRecord(source: RecordingSource, label: String) async {
         setStage(.idle, detail: "准备 \(label)…", progress: 0.02)
-        try? await Task.sleep(nanoseconds: 900_000_000)
+        try? await Task.sleep(nanoseconds: 600_000_000)
 
-        // Drive the round button into its active (recording) state so the camera
-        // captures the red pulse animation. The simulator has no microphone, so
-        // the actual clip is the bundled JFK sample (see below).
         activeSource = source
         isRecording = true
         setStage(.recording, detail: "\(label) · 录音中…", progress: 0.06)
         log("DEMO recording started: \(label)")
-        try? await Task.sleep(nanoseconds: 2_000_000_000)
+        try? await Task.sleep(nanoseconds: 1_300_000_000)
         isRecording = false
         activeSource = nil
 
@@ -526,37 +768,99 @@ struct ContentView: View {
             return
         }
 
+        let number = store.items.count + 1
+        let fileName = "\(source.rawValue)_\(number).wav"
         let item = store.add(
             name: name(for: source),
-            fileName: "jfk_sample.wav",
+            fileName: fileName,
             source: source,
             duration: duration(of: sampleURL),
             waveform: WaveformExtractor.samples(from: sampleURL),
             audioData: data
         )
-        log("DEMO recording saved: \(item.fileName)")
+        log("DEMO recording saved: \(item.fileName) in \(store.currentSession?.title ?? "session")")
 
-        // Give the saved row a moment to appear before transcribing.
-        try? await Task.sleep(nanoseconds: 700_000_000)
+        try? await Task.sleep(nanoseconds: 400_000_000)
         currentItemName = item.name
         await transcribe(item)
-        try? await Task.sleep(nanoseconds: 1_200_000_000)
+        try? await Task.sleep(nanoseconds: 800_000_000)
+    }
+
+    private func demoCheckmark(label: String) async {
+        setStage(.idle, detail: "准备 \(label)…", progress: 0.2)
+        try? await Task.sleep(nanoseconds: 700_000_000)
+        checkPulse = true
+        let before = store.currentSession?.title ?? "会话"
+        guard let archived = store.archiveCurrentSession() else {
+            log("DEMO checkmark: nothing to archive")
+            checkPulse = false
+            return
+        }
+        let after = store.currentSession?.title ?? "新会话"
+        setStage(.done, detail: "✓ 已归档「\(before)」(\(archived.itemIDs.count) 段)，新建「\(after)」", progress: 1)
+        log("DEMO checkmark: archived \(before) clips=\(archived.itemIDs.count), opened \(after)")
+        writeText("\(before) archived with \(archived.itemIDs.count) clips\n", fileName: "archive_action.log", append: true)
+        try? await Task.sleep(nanoseconds: 1_800_000_000)
+        checkPulse = false
+        try? await Task.sleep(nanoseconds: 400_000_000)
+    }
+
+    /// Scroll the archived recording list one screen at a time so the whole
+    /// list is visible in the recording. A marker file lets CI capture one
+    /// still per screen.
+    private func demoScrollArchivedList() async {
+        writeText("started\n", fileName: "archive_scroll_started.txt")
+        log("DEMO archive scroll started")
+        exportArchiveSnapshot()
+
+        var anchors: [String] = ["session-card", "archive-list"]
+        for session in store.archivedSessions {
+            anchors.append("archive-session-\(session.index)")
+        }
+        anchors.append("section-long")
+        anchors.append("section-tap")
+        anchors.append("list-bottom")
+
+        for (index, anchor) in anchors.enumerated() {
+            scrollAnchor = anchor
+            let step = index + 1
+            writeText("\(step)\n", fileName: "archive_scroll_step.txt")
+            setStage(.done, detail: "下滑查看归档录音列表 · 第 \(step)/\(anchors.count) 屏", progress: 1)
+            log("DEMO archive scroll \(step)/\(anchors.count) -> \(anchor)")
+            try? await Task.sleep(nanoseconds: 6_000_000_000)
+        }
+
+        writeText("done\n", fileName: "archive_scroll_done.txt")
+        log("DEMO archive scroll done")
     }
 
     private func demoReviewResults() async {
         demoReplaying = true
-        let items = store.items
-        log("DEMO review \(items.count) saved results")
-        for (index, item) in items.enumerated() {
-            reviewIndex = index
+
+        // Open every archived session detail first: each one shows ALL of that
+        // session's hold-to-talk clips.
+        let sessions = store.archivedSessions
+        for (index, session) in sessions.enumerated() {
+            let clips = store.items(in: session)
+            setStage(.done, detail: "查看会话详情 \(index + 1)/\(sessions.count) · \(session.title)（\(clips.count) 段）", progress: 1)
+            reviewTarget = .session(session)
+            log("DEMO review session \(index + 1)/\(sessions.count): \(session.title) with \(clips.count) clips")
+            try? await Task.sleep(nanoseconds: 5_000_000_000)
+            reviewTarget = nil
+            try? await Task.sleep(nanoseconds: 700_000_000)
+        }
+
+        // Then every standalone result (long + tap recordings).
+        let singles = store.items.filter { $0.source != .pushToTalk }
+        for (index, item) in singles.enumerated() {
             transcript = item.transcript ?? ""
             currentItemName = item.name
-            setStage(.done, detail: "查看结果 \(index + 1)/\(items.count) · \(item.name)", progress: 1)
-            reviewingItem = item
-            log("DEMO review open \(index + 1)/\(items.count): \(item.name)")
-            try? await Task.sleep(nanoseconds: 4_000_000_000)
-            reviewingItem = nil
-            try? await Task.sleep(nanoseconds: 700_000_000)
+            setStage(.done, detail: "查看结果 \(index + 1)/\(singles.count) · \(item.name)", progress: 1)
+            reviewTarget = .item(item)
+            log("DEMO review item \(index + 1)/\(singles.count): \(item.name)")
+            try? await Task.sleep(nanoseconds: 3_500_000_000)
+            reviewTarget = nil
+            try? await Task.sleep(nanoseconds: 600_000_000)
         }
         demoReplaying = false
     }
@@ -585,7 +889,10 @@ struct ContentView: View {
         let count = store.items(for: source).count + 1
         switch source {
         case .long: return "长录音 \(count)"
-        case .pushToTalk: return "按住说话 \(count)"
+        case .pushToTalk:
+            let sessionTitle = store.currentSession?.title ?? "会话"
+            let clipCount = currentSessionClipCount + 1
+            return "\(sessionTitle) · 说话 \(clipCount)"
         case .tap: return "单击录音 \(count)"
         }
     }
@@ -605,31 +912,197 @@ struct ContentView: View {
 
     private func log(_ message: String) {
         let line = "\(ISO8601DateFormatter().string(from: Date())) \(message)\n"
-        let url = documentsURL().appendingPathComponent("progress.log")
-        if let handle = FileHandle(forWritingAtPath: url.path) {
+        writeText(line, fileName: "progress.log", append: true)
+        print("[AutoTranscribe] \(message)")
+    }
+
+    private func writeText(_ text: String, fileName: String, append: Bool = false) {
+        let url = documentsURL().appendingPathComponent(fileName)
+        if append, let handle = FileHandle(forWritingAtPath: url.path) {
             handle.seekToEndOfFile()
-            handle.write(line.data(using: .utf8)!)
+            handle.write(text.data(using: .utf8)!)
             handle.closeFile()
         } else {
-            try? line.write(to: url, atomically: true, encoding: .utf8)
+            try? text.write(to: url, atomically: true, encoding: .utf8)
         }
-        print("[AutoTranscribe] \(message)")
     }
 
     private func writeSentinel(status: String, text: String, seconds: Double) {
         let content = "status=\(status)\nseconds=\(String(format: "%.2f", seconds))\ntext=\(text)\n"
-        let url = documentsURL().appendingPathComponent("transcription_done.txt")
-        try? content.write(to: url, atomically: true, encoding: .utf8)
+        writeText(content, fileName: "transcription_done.txt")
     }
 
-    private func writeDemoSentinel(status: String, count: Int) {
-        let content = "status=\(status)\nsaved=\(count)\n"
-        let url = documentsURL().appendingPathComponent("demo_done.txt")
-        try? content.write(to: url, atomically: true, encoding: .utf8)
+    private func writeDemoSentinel(status: String, sessions: Int, items: Int) {
+        let content = "status=\(status)\nsessions=\(sessions)\nitems=\(items)\n"
+        writeText(content, fileName: "demo_done.txt")
+    }
+
+    /// Render the whole archived list into one tall PNG, so the complete list
+    /// can be reviewed without being cut off by the screen height.
+    private func exportArchiveSnapshot() {
+        var sections: [ArchiveSnapshotSection] = []
+        for session in store.archivedSessions {
+            let clips = store.items(in: session)
+            sections.append(ArchiveSnapshotSection(session: session, clips: clips))
+        }
+        let totalCount = store.items.count
+        let snapshot = ArchiveSnapshotView(
+            sections: sections,
+            longItems: store.items(for: .long),
+            tapItems: store.items(for: .tap),
+            totalCount: totalCount
+        )
+        .frame(width: 390, alignment: .top)
+        .fixedSize(horizontal: false, vertical: true)
+        .background(Color(.systemGroupedBackground))
+        let renderer = ImageRenderer(content: snapshot)
+        renderer.proposedSize = ProposedViewSize(width: 390, height: nil)
+        renderer.scale = 2
+        guard let image = renderer.uiImage, let data = image.pngData() else {
+            log("Archive snapshot render failed")
+            return
+        }
+        let url = documentsURL().appendingPathComponent("archive_list_full.png")
+        try? data.write(to: url, options: .atomic)
+        log("Archive snapshot exported: \(sections.count) sessions, \(totalCount) items")
     }
 }
 
-// MARK: - Result detail viewer
+// MARK: - Full-height snapshot of the archived recording list
+
+struct ArchiveSnapshotSection: Identifiable {
+    let id: UUID
+    let session: RecordingSession
+    let clips: [RecordingItem]
+
+    init(session: RecordingSession, clips: [RecordingItem]) {
+        self.id = session.id
+        self.session = session
+        self.clips = clips
+    }
+}
+
+struct ArchiveSnapshotView: View {
+    let sections: [ArchiveSnapshotSection]
+    let longItems: [RecordingItem]
+    let tapItems: [RecordingItem]
+    let totalCount: Int
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("归档录音列表 · 完整视图")
+                    .font(.title3.bold())
+                Text("共 \(sections.count) 个已归档会话 · \(totalCount) 条录音 · 全部保存在本地")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+
+            ForEach(sections) { section in
+                snapshotSession(section)
+            }
+
+            snapshotSection(title: "长录音", rows: longItems, color: .blue)
+            snapshotSection(title: "单击录音", rows: tapItems, color: .red)
+
+            HStack {
+                Image(systemName: "checkmark.seal.fill").foregroundColor(.green)
+                Text("以上为全部归档内容 · 演示结束")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+        }
+        .padding(20)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func snapshotSession(_ section: ArchiveSnapshotSection) -> some View {
+        let session = section.session
+        let clips = section.clips
+        var total: Double = 0
+        for clip in clips {
+            total += clip.duration
+        }
+        return VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Image(systemName: "checkmark.seal.fill").foregroundColor(.green)
+                Text(session.title).font(.headline)
+                Spacer()
+                Text("已归档 · \(clips.count) 段按住说话 · \(String(format: "%.1f", total))s")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+            }
+            ForEach(clips.indices, id: \.self) { index in
+                let clip = clips[index]
+                HStack(spacing: 8) {
+                    Text("\(index + 1).")
+                        .font(.caption2.monospacedDigit())
+                        .foregroundColor(.secondary)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(clip.name).font(.caption.bold())
+                        Text(clip.fileName)
+                            .font(.caption2.monospacedDigit())
+                            .foregroundColor(.secondary)
+                    }
+                    Spacer(minLength: 6)
+                    WaveformView(samples: clip.waveform, color: .red, height: 18, barCount: 20)
+                        .frame(width: 90)
+                    Text(String(format: "%.1fs", clip.duration))
+                        .font(.caption2.monospacedDigit())
+                        .foregroundColor(.secondary)
+                }
+                .padding(.vertical, 4)
+            }
+        }
+        .padding(12)
+        .background(RoundedRectangle(cornerRadius: 12).fill(Color(.secondarySystemGroupedBackground)))
+    }
+
+    private func snapshotSection(title: String, rows: [RecordingItem], color: Color) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(title).font(.headline)
+            ForEach(rows) { item in
+                HStack(spacing: 8) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(item.name).font(.caption.bold())
+                        Text(item.fileName)
+                            .font(.caption2.monospacedDigit())
+                            .foregroundColor(.secondary)
+                    }
+                    Spacer(minLength: 6)
+                    WaveformView(samples: item.waveform, color: color, height: 18, barCount: 20)
+                        .frame(width: 90)
+                    Text(String(format: "%.1fs", item.duration))
+                        .font(.caption2.monospacedDigit())
+                        .foregroundColor(.secondary)
+                }
+                .padding(.vertical, 4)
+            }
+        }
+        .padding(12)
+        .background(RoundedRectangle(cornerRadius: 12).fill(Color(.secondarySystemGroupedBackground)))
+    }
+}
+
+// MARK: - Review sheet dispatcher
+
+struct ReviewSheet: View {
+    let target: ContentView.ReviewTarget
+    let sessionItems: [RecordingItem]
+    let isDemo: Bool
+
+    var body: some View {
+        Group {
+            if case .item(let item) = target {
+                ResultDetailView(item: item, isDemo: isDemo)
+            } else if case .session(let session) = target {
+                SessionDetailView(session: session, items: sessionItems, isDemo: isDemo)
+            }
+        }
+    }
+}
+
+// MARK: - Single result detail
 
 struct ResultDetailView: View {
     let item: RecordingItem
@@ -697,6 +1170,143 @@ struct ResultDetailView: View {
     }
 }
 
+// MARK: - Session detail: ALL hold-to-talk clips of one conversation
+
+struct SessionDetailView: View {
+    let session: RecordingSession
+    let items: [RecordingItem]
+    var isDemo: Bool = false
+    @Environment(\.dismiss) private var dismiss
+
+    private var totalDuration: Double {
+        var total: Double = 0
+        for item in items {
+            total += item.duration
+        }
+        return total
+    }
+
+    private var fullTranscript: String {
+        var lines: [String] = []
+        for (index, item) in items.enumerated() {
+            let text = item.transcript ?? "（暂无转写）"
+            lines.append("\(index + 1). \(text)")
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    private var mergedWaveform: [Double] {
+        WaveformExtractor.merged(items, bars: 48)
+    }
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    // Header
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack {
+                            Image(systemName: "bubble.left.and.bubble.right.fill")
+                                .foregroundColor(.green)
+                            Text(session.title).font(.title3.bold())
+                            Spacer()
+                            Text(session.isArchived ? "已归档" : "进行中")
+                                .font(.caption.bold())
+                                .foregroundColor(session.isArchived ? .green : .orange)
+                        }
+                        Text("本会话共 \(items.count) 段按住说话录音 · 总时长 \(String(format: "%.1f", totalDuration)) 秒")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                        Text("全部说话录音均保存在本地，按说话顺序排列")
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                    }
+
+                    // Merged waveform of the whole conversation
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("会话整体波形").font(.subheadline.bold()).foregroundColor(.secondary)
+                        WaveformView(samples: mergedWaveform, color: .blue, height: 44, barCount: 48)
+                            .padding(12)
+                            .frame(maxWidth: .infinity)
+                            .background(RoundedRectangle(cornerRadius: 12).fill(Color(.secondarySystemGroupedBackground)))
+                    }
+
+                    // Every clip of this session
+                    Text("本会话全部说话录音").font(.subheadline.bold())
+                    ForEach(items.indices, id: \.self) { index in
+                        let clip = items[index]
+                        VStack(alignment: .trailing, spacing: 6) {
+                            HStack {
+                                Text("第 \(index + 1) 段 · \(clip.name)")
+                                    .font(.caption.bold())
+                                    .foregroundColor(.secondary)
+                                Spacer()
+                            }
+                            HStack {
+                                Spacer(minLength: 44)
+                                VStack(alignment: .trailing, spacing: 4) {
+                                    HStack(spacing: 8) {
+                                        Image(systemName: "mic.fill")
+                                            .font(.caption)
+                                            .foregroundColor(.white)
+                                        WaveformView(samples: clip.waveform, color: .white.opacity(0.9), height: 22, barCount: 24)
+                                            .frame(width: 110)
+                                        Text(String(format: "%.1fs", clip.duration))
+                                            .font(.caption2.monospacedDigit())
+                                            .foregroundColor(.white.opacity(0.85))
+                                    }
+                                    .padding(.horizontal, 12)
+                                    .padding(.vertical, 9)
+                                    .background(RoundedRectangle(cornerRadius: 16).fill(Color.red.opacity(0.92)))
+                                    Text("文件：\(clip.fileName)")
+                                        .font(.caption2.monospacedDigit())
+                                        .foregroundColor(.secondary)
+                                }
+                            }
+                            Text(clip.transcript ?? "（暂无转写）")
+                                .font(.caption)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(10)
+                                .background(RoundedRectangle(cornerRadius: 10).fill(Color(.secondarySystemGroupedBackground)))
+                        }
+                        .padding(10)
+                        .background(RoundedRectangle(cornerRadius: 12).stroke(Color.red.opacity(0.25), lineWidth: 1))
+                    }
+
+                    // Combined transcript
+                    VStack(alignment: .leading, spacing: 8) {
+                        Label("会话全文", systemImage: "text.bubble.fill")
+                            .font(.subheadline.bold())
+                        Text(fullTranscript.isEmpty ? "（暂无转写内容）" : fullTranscript)
+                            .font(.body)
+                            .frame(maxWidth: .infinity, minHeight: 90, alignment: .topLeading)
+                            .padding(12)
+                            .background(RoundedRectangle(cornerRadius: 12).fill(Color(.secondarySystemGroupedBackground)))
+                    }
+
+                    if isDemo {
+                        HStack {
+                            ProgressView()
+                            Text("演示自动翻页中…").font(.caption).foregroundColor(.secondary)
+                        }
+                    }
+                }
+                .padding(20)
+            }
+            .background(Color(.systemGroupedBackground))
+            .navigationTitle("会话详情")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("返回") { dismiss() }
+                }
+            }
+        }
+    }
+}
+
+// MARK: - Waveform
+
 struct WaveformView: View {
     let samples: [Double]
     var color: Color = .blue
@@ -707,7 +1317,7 @@ struct WaveformView: View {
         guard samples.count > barCount else { return samples }
         let step = Double(samples.count) / Double(barCount)
         return (0..<barCount).map { i in
-            samples[min(samples.count - 1, Int(Double(i) * step))]
+            samples[Swift.min(samples.count - 1, Int(Double(i) * step))]
         }
     }
 
@@ -716,7 +1326,7 @@ struct WaveformView: View {
             ForEach(displayed.indices, id: \.self) { i in
                 Capsule()
                     .fill(color)
-                    .frame(width: 3, height: max(3, displayed[i] * height))
+                    .frame(width: 3, height: Swift.max(3, displayed[i] * height))
             }
         }
         .frame(height: height)

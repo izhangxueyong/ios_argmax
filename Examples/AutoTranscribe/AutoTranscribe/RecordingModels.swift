@@ -1,5 +1,13 @@
 //  RecordingModels.swift
-//  Recording list data, persistence and waveform extraction for AutoTranscribe.
+//  Recording list data, conversation sessions, persistence and waveform extraction.
+//
+//  Session model:
+//   - Every "press and hold to talk" clip belongs to the CURRENT session.
+//   - A session stays open (not archived) until the user taps the checkmark
+//     button next to the round record buttons.
+//   - Tapping the checkmark archives that session and opens a fresh one.
+//   - Only archived sessions appear in the "archived recording list", and a
+//     session detail shows ALL of its hold-to-talk clips in one view.
 
 import AVFoundation
 import Foundation
@@ -13,7 +21,7 @@ enum RecordingSource: String, Codable, CaseIterable, Sendable {
     var sectionTitle: String {
         switch self {
         case .long: return "长录音"
-        case .pushToTalk: return "长按语音"
+        case .pushToTalk: return "按住说话"
         case .tap: return "单击录音"
         }
     }
@@ -60,6 +68,35 @@ struct RecordingItem: Codable, Identifiable, Sendable {
         self.usesBundledSample = usesBundledSample
         self.storedFileName = storedFileName
         self.transcript = transcript
+    }
+}
+
+struct RecordingSession: Codable, Identifiable, Sendable {
+    let id: UUID
+    var index: Int
+    var createdAt: Date
+    var archivedAt: Date?
+    var isArchived: Bool
+    var itemIDs: [UUID]
+
+    init(
+        id: UUID = UUID(),
+        index: Int,
+        createdAt: Date = Date(),
+        archivedAt: Date? = nil,
+        isArchived: Bool = false,
+        itemIDs: [UUID] = []
+    ) {
+        self.id = id
+        self.index = index
+        self.createdAt = createdAt
+        self.archivedAt = archivedAt
+        self.isArchived = isArchived
+        self.itemIDs = itemIDs
+    }
+
+    var title: String {
+        "会话 \(index)"
     }
 }
 
@@ -122,24 +159,104 @@ enum WaveformExtractor {
         }
         return values
     }
+
+    /// Concatenate several clip waveforms into one long thumbnail waveform.
+    static func merged(_ clips: [RecordingItem], bars: Int = 48) -> [Double] {
+        guard !clips.isEmpty else { return fallback(bars: bars) }
+        let perClip = Swift.max(6, bars / clips.count)
+        var combined: [Double] = []
+        combined.reserveCapacity(bars)
+        for clip in clips {
+            let source = clip.waveform
+            let count = Swift.min(perClip, source.count)
+            for i in 0..<count {
+                combined.append(source[i])
+            }
+        }
+        guard combined.count >= bars else {
+            return combined + [Double](repeating: 0.12, count: bars - combined.count)
+        }
+        let step = Swift.max(1, combined.count / bars)
+        var result: [Double] = []
+        result.reserveCapacity(bars)
+        for i in 0..<bars {
+            let position = Swift.min(combined.count - 1, i * step)
+            result.append(combined[position])
+        }
+        return result
+    }
 }
 
 @MainActor
 final class RecordingStore: ObservableObject {
     @Published private(set) var items: [RecordingItem] = []
+    @Published private(set) var sessions: [RecordingSession] = []
 
     private let metadataURL: URL
+    private let sessionsURL: URL
     private let documentsURL: URL
 
     init() {
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
         self.documentsURL = docs
         self.metadataURL = docs.appendingPathComponent("recordings.json")
+        self.sessionsURL = docs.appendingPathComponent("sessions.json")
         load()
+        if sessions.isEmpty {
+            sessions = [RecordingSession(index: 1)]
+            saveSessions()
+        }
         if items.isEmpty { seed() }
     }
 
     var documentsDirectory: URL { documentsURL }
+
+    // MARK: - Sessions
+
+    /// The one open (unarchived) session. All new hold-to-talk clips go here.
+    var currentSession: RecordingSession? {
+        sessions.first { !$0.isArchived }
+    }
+
+    var archivedSessions: [RecordingSession] {
+        let list = sessions.filter { $0.isArchived && !$0.itemIDs.isEmpty }
+        return list.sorted { $0.index > $1.index }
+    }
+
+    /// All hold-to-talk clips of a session, in the order they were spoken.
+    func items(in session: RecordingSession) -> [RecordingItem] {
+        var result: [RecordingItem] = []
+        for id in session.itemIDs {
+            if let match = items.first(where: { $0.id == id }) {
+                result.append(match)
+            }
+        }
+        return result
+    }
+
+    /// Archive the open session and immediately open a fresh one.
+    /// Returns the archived session, or nil when there is nothing to archive.
+    @discardableResult
+    func archiveCurrentSession() -> RecordingSession? {
+        guard let index = sessions.firstIndex(where: { !$0.isArchived }) else { return nil }
+        let open = sessions[index]
+        guard !open.itemIDs.isEmpty else { return nil }
+
+        sessions[index].isArchived = true
+        sessions[index].archivedAt = Date()
+        let archived = sessions[index]
+
+        var highest = 0
+        for session in sessions {
+            if session.index > highest { highest = session.index }
+        }
+        let fresh = RecordingSession(index: highest + 1)
+        sessions.append(fresh)
+        saveSessions()
+        return archived
+    }
+
+    // MARK: - Items
 
     func items(for source: RecordingSource) -> [RecordingItem] {
         items.filter { $0.source == source }.sorted { $0.createdAt > $1.createdAt }
@@ -165,7 +282,7 @@ final class RecordingStore: ObservableObject {
     ) -> RecordingItem {
         var storedName: String?
         if let audioData {
-            storedName = "recording_\(Int(Date().timeIntervalSince1970)).wav"
+            storedName = "recording_\(UUID().uuidString.prefix(8)).wav"
             try? audioData.write(to: documentsURL.appendingPathComponent(storedName!), options: .atomic)
         }
         let item = RecordingItem(
@@ -178,6 +295,14 @@ final class RecordingStore: ObservableObject {
             storedFileName: storedName
         )
         items.insert(item, at: 0)
+
+        // A hold-to-talk clip always belongs to the current open session.
+        if source == .pushToTalk {
+            if let openIndex = sessions.firstIndex(where: { !$0.isArchived }) {
+                sessions[openIndex].itemIDs.append(item.id)
+                saveSessions()
+            }
+        }
         save()
         return item
     }
@@ -191,6 +316,8 @@ final class RecordingStore: ObservableObject {
     func bundledSample() -> RecordingItem? {
         items.first { $0.usesBundledSample }
     }
+
+    // MARK: - Persistence
 
     private func seed() {
         if let url = Bundle.main.url(forResource: "recording", withExtension: "wav") {
@@ -208,13 +335,23 @@ final class RecordingStore: ObservableObject {
     }
 
     private func load() {
-        guard let data = try? Data(contentsOf: metadataURL),
-              let decoded = try? JSONDecoder().decode([RecordingItem].self, from: data) else { return }
-        items = decoded
+        if let data = try? Data(contentsOf: metadataURL),
+           let decoded = try? JSONDecoder().decode([RecordingItem].self, from: data) {
+            items = decoded
+        }
+        if let data = try? Data(contentsOf: sessionsURL),
+           let decoded = try? JSONDecoder().decode([RecordingSession].self, from: data) {
+            sessions = decoded
+        }
     }
 
     private func save() {
         guard let data = try? JSONEncoder().encode(items) else { return }
         try? data.write(to: metadataURL, options: .atomic)
+    }
+
+    private func saveSessions() {
+        guard let data = try? JSONEncoder().encode(sessions) else { return }
+        try? data.write(to: sessionsURL, options: .atomic)
     }
 }
