@@ -153,20 +153,23 @@ jobs:
           # Background watcher: capture one still for EVERY screen of the
           # archived-list scroll, so the full list is visible as stills even if
           # the simulator video freezes during long inference.
-          LAST_STEP=""
           (
             seen=""
+            idle_after_done=0
             while true; do
-              if [ -f "$DOCS/demo_done.txt" ]; then break; fi
               if [ -f "$DOCS/archive_scroll_step.txt" ]; then
                 step=$(tr -d '\n' < "$DOCS/archive_scroll_step.txt" 2>/dev/null || true)
                 if [ -n "$step" ] && [ "$step" != "$seen" ]; then
-                  # Let the scroll animation settle before grabbing the still.
+                  # Let the scroll/sheet animation settle before grabbing the still.
                   sleep 2
                   label=$(printf "%02d" "$step" 2>/dev/null || echo "$step")
-                  xcrun simctl io "$UDID" screenshot "$MEDIA_DIR/AutoTranscribe-archive-list-$label.png" || true
+                  xcrun simctl io "$UDID" screenshot "$MEDIA_DIR/AutoTranscribe-frame-$label.png" || true
                   seen="$step"
                 fi
+              fi
+              if [ -f "$DOCS/demo_done.txt" ]; then
+                idle_after_done=$((idle_after_done + 1))
+                if [ "$idle_after_done" -ge 3 ]; then break; fi
               fi
               sleep 2
             done

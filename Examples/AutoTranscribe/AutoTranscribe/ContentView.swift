@@ -43,6 +43,8 @@ struct ContentView: View {
 
     // ScrollViewReader anchor used by the scripted demo to reveal the full list.
     @State private var scrollAnchor = ""
+    // Monotonic screen marker: CI screenshots every new value.
+    @State private var shotStep = 0
 
     enum Stage: String {
         case idle = "准备就绪"
@@ -719,6 +721,10 @@ struct ContentView: View {
     private func runDemo() async {
         log("DEMO started")
 
+        // Capture the top control area: two round red buttons + green checkmark.
+        markScreen("home controls")
+        try? await Task.sleep(nanoseconds: 6_000_000_000)
+
         // ---- Standard mode: three hold-to-talk clips in ONE session ----
         selectedMode = .standard
         await demoRecord(source: .pushToTalk, label: "普通 · 会话1 按住说话 1/3")
@@ -746,7 +752,16 @@ struct ContentView: View {
         stage = .done
         detail = "演示完成 · 已返回桌面（归档录音列表）"
         log("DEMO finished")
+        markScreen("final archived list")
+        try? await Task.sleep(nanoseconds: 6_000_000_000)
         writeDemoSentinel(status: "DONE", sessions: store.archivedSessions.count, items: store.items.count)
+    }
+
+    /// Bump a monotonic marker; the CI watcher screenshots each new value.
+    private func markScreen(_ label: String) {
+        shotStep += 1
+        writeText("\(shotStep)\n", fileName: "archive_scroll_step.txt")
+        log("DEMO screen \(shotStep): \(label)")
     }
 
     private func demoRecord(source: RecordingSource, label: String) async {
@@ -800,7 +815,8 @@ struct ContentView: View {
         setStage(.done, detail: "✓ 已归档「\(before)」(\(archived.itemIDs.count) 段)，新建「\(after)」", progress: 1)
         log("DEMO checkmark: archived \(before) clips=\(archived.itemIDs.count), opened \(after)")
         writeText("\(before) archived with \(archived.itemIDs.count) clips\n", fileName: "archive_action.log", append: true)
-        try? await Task.sleep(nanoseconds: 1_800_000_000)
+        markScreen("checkmark archived \(before) -> \(after)")
+        try? await Task.sleep(nanoseconds: 4_500_000_000)
         checkPulse = false
         try? await Task.sleep(nanoseconds: 400_000_000)
     }
@@ -824,9 +840,8 @@ struct ContentView: View {
         for (index, anchor) in anchors.enumerated() {
             scrollAnchor = anchor
             let step = index + 1
-            writeText("\(step)\n", fileName: "archive_scroll_step.txt")
+            markScreen("archive list scroll \(step)/\(anchors.count) -> \(anchor)")
             setStage(.done, detail: "下滑查看归档录音列表 · 第 \(step)/\(anchors.count) 屏", progress: 1)
-            log("DEMO archive scroll \(step)/\(anchors.count) -> \(anchor)")
             try? await Task.sleep(nanoseconds: 6_000_000_000)
         }
 
@@ -845,6 +860,7 @@ struct ContentView: View {
             setStage(.done, detail: "查看会话详情 \(index + 1)/\(sessions.count) · \(session.title)（\(clips.count) 段）", progress: 1)
             reviewTarget = .session(session)
             log("DEMO review session \(index + 1)/\(sessions.count): \(session.title) with \(clips.count) clips")
+            markScreen("session detail \(session.title) with \(clips.count) clips")
             try? await Task.sleep(nanoseconds: 5_000_000_000)
             reviewTarget = nil
             try? await Task.sleep(nanoseconds: 700_000_000)
@@ -858,7 +874,8 @@ struct ContentView: View {
             setStage(.done, detail: "查看结果 \(index + 1)/\(singles.count) · \(item.name)", progress: 1)
             reviewTarget = .item(item)
             log("DEMO review item \(index + 1)/\(singles.count): \(item.name)")
-            try? await Task.sleep(nanoseconds: 3_500_000_000)
+            markScreen("result detail \(item.name)")
+            try? await Task.sleep(nanoseconds: 4_500_000_000)
             reviewTarget = nil
             try? await Task.sleep(nanoseconds: 600_000_000)
         }
