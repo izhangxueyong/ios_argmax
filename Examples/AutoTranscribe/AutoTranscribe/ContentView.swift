@@ -121,7 +121,7 @@ struct ContentView: View {
                 }
             }
             .frame(height: 52)
-            Text("音频: recording.wav · 16kHz 单声道")
+            Text("音频: jfk.wav · 16kHz 单声道 · 11s")
                 .font(.caption2)
                 .foregroundColor(.secondary)
         }
@@ -210,19 +210,16 @@ struct ContentView: View {
             await setStage(.transcribing, detail: "正在用 whisper-base 转写…", progress: 0.8)
             log("Transcription started")
 
-            // The bundled clip is synthetic (Samantha TTS). WhisperKit's default
-            // noSpeechThreshold (0.6) can classify it as silence and drop every
-            // segment, yielding an empty transcript. Force English and disable
-            // the no-speech filter so the result is always produced.
+            // The bundled clip is the canonical OpenAI "jfk.wav" test audio
+            // (real speech), so WhisperKit's default VAD / no-speech filters work
+            // correctly. Force English only; keep the default quality filters so
+            // the output is a clean transcript rather than hallucinated text.
             // NOTE: arguments must follow the declaration order in DecodingOptions.
             let options = DecodingOptions(
                 verbose: true,
                 task: .transcribe,
                 language: "en",
-                detectLanguage: false,
-                compressionRatioThreshold: nil,
-                logProbThreshold: nil,
-                noSpeechThreshold: nil
+                detectLanguage: false
             )
             let results = try await whisperKit.transcribe(
                 audioPath: audioURL.path,
@@ -256,7 +253,6 @@ struct ContentView: View {
                 self.elapsedText = String(format: "%.1fs", seconds)
                 self.stage = .done
                 self.detail = "识别完成，共 \(seconds.formatted(.number.precision(.fractionLength(1)))) 秒"
-                self.recordSeconds = 5.9
             }
             writeSentinel(status: "DONE", text: text, seconds: seconds)
         } catch {
