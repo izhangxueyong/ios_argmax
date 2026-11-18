@@ -214,14 +214,15 @@ struct ContentView: View {
             // noSpeechThreshold (0.6) can classify it as silence and drop every
             // segment, yielding an empty transcript. Force English and disable
             // the no-speech filter so the result is always produced.
+            // NOTE: arguments must follow the declaration order in DecodingOptions.
             let options = DecodingOptions(
                 verbose: true,
                 task: .transcribe,
                 language: "en",
                 detectLanguage: false,
-                noSpeechThreshold: nil,
                 compressionRatioThreshold: nil,
-                logProbThreshold: nil
+                logProbThreshold: nil,
+                noSpeechThreshold: nil
             )
             let results = try await whisperKit.transcribe(
                 audioPath: audioURL.path,
