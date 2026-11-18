@@ -228,9 +228,9 @@ struct ContentView: View {
                 decodeOptions: options
             )
             log("Transcription results count: \(results.count), segments: \(results.first?.segments.count ?? 0)")
-            var text = results.compactMap { $0.text }
+            var text: String = results.compactMap { $0.text }
                 .joined(separator: " ")
-                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
 
             // Fallback: decode the raw 16kHz float array directly, bypassing file
             // loading / VAD chunking. Guarantees the UI always shows a result.
@@ -245,7 +245,7 @@ struct ContentView: View {
                 log("Array results count: \(arrayResults.count)")
                 text = arrayResults.compactMap { $0.text }
                     .joined(separator: " ")
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
             }
             log("Transcription finished: \(text)")
 
