@@ -162,12 +162,14 @@ final class TranscriptionService: ObservableObject {
         // the spoken language and the transcript stays in that language.
         let task: DecodingTask = target.isTranslation ? .translate : .transcribe
         let language: String? = target.isTranslation ? detectedCode : target.languageCode
+        // DecodingOptions requires arguments in declaration order:
+        // ... usePrefillPrompt, detectLanguage, skipSpecialTokens, ...
         let options = DecodingOptions(
             verbose: true,
             task: task,
             language: language,
-            skipSpecialTokens: true,
-            detectLanguage: language == nil
+            detectLanguage: language == nil,
+            skipSpecialTokens: true
         )
         let results = try await kit.transcribe(audioPath: audioURL.path, decodeOptions: options)
         let text = results.flatMap { $0.segments }
