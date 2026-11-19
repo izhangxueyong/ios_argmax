@@ -12,11 +12,13 @@
 //   * `base` uses the original 99-language tokenizer (no Cantonese `yue`);
 //     large-v3-turbo added `yue`, hence 100 codes. LanguageCatalog therefore
 //     keeps two separate target lists instead of sharing one.
-//   * detectLanguage(audioPath:) reports the source language for the item's
-//     info note. For the small base checkpoint the detected code is passed
-//     explicitly to DecodingOptions instead of letting the decoder detect it
-//     again: an implicit detection pass historically produced only special
-//     tokens for whisper-base on CPU-only simulators.
+//  Detect-and-recover: the small base checkpoint running on a CPU-only iOS
+//  Simulator used to decode a whole 30s window into timestamp/special tokens
+//  (rendered as ">> >> >>") or into nothing at all. For that model only we
+//  request a timestamp-free greedy decode with an explicit language token,
+//  relax the quality gates in `SegmentSeeker`, and validate that the result
+//  contains real words before accepting it. A second pass with a different
+//  decoding strategy uses the SAME bundled model, never a different engine.
 
 import AVFoundation
 import Foundation
@@ -63,7 +65,8 @@ struct TranscriptionOutcome: Sendable {
     let elapsed: TimeInterval
     /// ISO-639 style code reported by the model, nil when it could not detect one.
     let sourceCode: String?
-    /// Raw decoder output when the transcript ended up empty, for CI triage.
+    /// Raw decoder output when the transcript is empty or only special-token
+    /// noise, for CI triage. nil when a meaningful transcript was produced.
     var diagnostic: String? = nil
 }
 
@@ -119,52 +122,71 @@ final class TranscriptionService: ObservableObject {
             : (target.languageCode ?? detectedCode)
 
         // DecodingOptions requires arguments in declaration order:
-        // verbose, task, language, ..., detectLanguage, skipSpecialTokens.
+        // verbose, task, language, ..., usePrefillPrompt, detectLanguage,
+        // skipSpecialTokens, withoutTimestamps.
+        let options = Self.makeOptions(
+            task: task,
+            language: language,
+            mode: mode,
+            fallback: false
+        )
+        let results = try await kit.transcribe(audioPath: audioURL.path, decodeOptions: options)
+        var text = Self.cleanedText(from: results)
+        var diagnostics = ["primary " + Self.describe(results)]
+
+        // A string such as ">> >> >>" is NOT a transcript. Retry with the SAME
+        // bundled model and a different decoding strategy, then keep whichever
+        // pass produced real words.
+        if !Self.isMeaningful(text) {
+            let fallbackOptions = Self.makeOptions(
+                task: task,
+                language: detectedCode ?? language,
+                mode: mode,
+                fallback: true
+            )
+            let retryResults = try await kit.transcribe(audioPath: audioURL.path, decodeOptions: fallbackOptions)
+            diagnostics.append("fallback " + Self.describe(retryResults))
+            let retryText = Self.cleanedText(from: retryResults)
+            if Self.isMeaningful(retryText) { text = retryText }
+        }
+
+        let valid = Self.isMeaningful(text)
+        return TranscriptionOutcome(
+            text: valid ? text : "",
+            elapsed: Date().timeIntervalSince(start),
+            sourceCode: detectedCode,
+            diagnostic: valid ? nil : diagnostics.joined(separator: " | ")
+        )
+    }
+
+    private static func makeOptions(
+        task: DecodingTask,
+        language: String?,
+        mode: TranscriptionMode,
+        fallback: Bool
+    ) -> DecodingOptions {
+        let isBase = mode == .standard
+        // `usePrefillPrompt` MUST stay true: when false WhisperKit feeds the
+        // decoder only a bare SOT token, dropping the language / task /
+        // timestamp prompt entirely (see TranscribeTask.swift).
         var options = DecodingOptions(
             verbose: true,
             task: task,
             language: language,
+            temperature: fallback ? 0.2 : 0.0,
+            temperatureFallbackCount: fallback ? 3 : 5,
+            usePrefillPrompt: true,
             detectLanguage: language == nil,
-            skipSpecialTokens: true
+            skipSpecialTokens: true,
+            withoutTimestamps: isBase && !fallback
         )
-        if mode == .standard {
+        if isBase {
             // Whisper Base on a CPU-only simulator yields much lower log-probs
             // than large-v3-turbo. With WhisperKit's default quality thresholds
-            // `SegmentSeeker` classifies the whole 30s window as silence and
-            // drops every segment, returning an empty transcript even though
-            // inference ran for 60-90s. Disable those filters for base only.
-            Self.relaxQualityThresholds(&options)
+            // `SegmentSeeker` drops every segment; relax them for base only.
+            relaxQualityThresholds(&options)
         }
-        var results = try await kit.transcribe(audioPath: audioURL.path, decodeOptions: options)
-        var text = Self.joinedText(from: results)
-        var diagnostic: String? = nil
-        if text.isEmpty { diagnostic = Self.describe(results) }
-
-        // If still empty, try a different decoding strategy with the SAME
-        // bundled model: skip the KV-cache prefill prompt and timestamps, and
-        // force an explicit English language token.
-        if text.isEmpty && !target.isTranslation {
-            options = DecodingOptions(
-                verbose: true,
-                task: .transcribe,
-                language: "en",
-                usePrefillPrompt: false,
-                detectLanguage: false,
-                skipSpecialTokens: true,
-                withoutTimestamps: true
-            )
-            if mode == .standard { Self.relaxQualityThresholds(&options) }
-            results = try await kit.transcribe(audioPath: audioURL.path, decodeOptions: options)
-            text = Self.joinedText(from: results)
-            diagnostic = (diagnostic ?? "") + " | retry2 " + Self.describe(results)
-        }
-
-        return TranscriptionOutcome(
-            text: text,
-            elapsed: Date().timeIntervalSince(start),
-            sourceCode: detectedCode,
-            diagnostic: text.isEmpty ? diagnostic : nil
-        )
+        return options
     }
 
     private static func relaxQualityThresholds(_ options: inout DecodingOptions) {
@@ -176,18 +198,45 @@ final class TranscriptionService: ObservableObject {
 
     private static func describe(_ results: [TranscriptionResult]) -> String {
         let raw = results.first?.text ?? "(no result)"
-        return "segments=\(results.first?.segments.count ?? 0), raw=\(String(raw.prefix(160)))"
+        let segments = results.first?.segments ?? []
+        let firstSegment = segments.first?.text ?? ""
+        return "segments=\(segments.count), raw=\(String(raw.prefix(160))), seg0=\(String(firstSegment.prefix(80)))"
     }
 
-    private static func joinedText(from results: [TranscriptionResult]) -> String {
+    /// Strip decoder artefacts before they reach the UI. `skipSpecialTokens`
+    /// removes token IDs, but a byte-level BPE decoder can still leave behind
+    /// runs of ">" / "<" / "|" that look like ">> >> >>".
+    private static func sanitize(_ raw: String) -> String {
+        var value = raw
+        if let specialTokenPattern = try? NSRegularExpression(pattern: "<\\|[^|]*\\|>") {
+            let range = NSRange(value.startIndex..., in: value)
+            value = specialTokenPattern.stringByReplacingMatches(
+                in: value, options: [], range: range, withTemplate: ""
+            )
+        }
+        let symbols = CharacterSet(charactersIn: "<>|")
+        let words = value.split(whereSeparator: { $0.isWhitespace })
+            .map { String($0).trimmingCharacters(in: symbols) }
+            .filter { !$0.isEmpty }
+        return words.joined(separator: " ")
+            .trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
+    }
+
+    /// A real transcript contains at least two letters / CJK characters. This
+    /// rejects empty strings and pure special-token noise while keeping short
+    /// but genuine utterances such as "Hi." or "是的".
+    private static func isMeaningful(_ text: String) -> Bool {
+        let letters = text.unicodeScalars.filter { CharacterSet.letters.contains($0) }.count
+        return letters >= 2
+    }
+
+    private static func cleanedText(from results: [TranscriptionResult]) -> String {
         let fromSegments = results.flatMap { $0.segments }
-            .map { $0.text }
-            .joined()
-            .trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
-        if !fromSegments.isEmpty { return fromSegments }
-        return results.map { $0.text }
+            .map { sanitize($0.text) }
+            .filter { !$0.isEmpty }
             .joined(separator: " ")
-            .trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
+        if isMeaningful(fromSegments) { return fromSegments }
+        return sanitize(results.map { $0.text }.joined(separator: " "))
     }
 
     private func loadKit(for mode: TranscriptionMode) async throws -> WhisperKit {

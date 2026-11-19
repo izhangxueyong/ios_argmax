@@ -840,7 +840,7 @@ struct ContentView: View {
             setStage(.done, detail: "\(mode.title) · \(target.title) 完成，共 \(String(format: "%.1f", outcome.elapsed)) 秒", progress: 1)
             log("Transcribe finished: model=\(meta.modelName), elapsed=\(meta.elapsed), \(meta.direction), text=\(outcome.text)")
             if let diagnostic = outcome.diagnostic {
-                log("EMPTY TRANSCRIPT diagnostic: \(diagnostic)")
+                log("INVALID TRANSCRIPT diagnostic: \(diagnostic)")
             }
             writeSentinel(status: "DONE", text: outcome.text, seconds: outcome.elapsed)
         } catch {
@@ -885,7 +885,7 @@ struct ContentView: View {
             setStage(.done, detail: retranscribeNote, progress: 1)
             log("RETRANSCRIBE done: \(item.fileName), model=\(meta.modelName), elapsed=\(meta.elapsed), \(meta.direction), text=\(outcome.text)")
             if let diagnostic = outcome.diagnostic {
-                log("EMPTY RETRANSCRIPT diagnostic: \(diagnostic)")
+                log("INVALID RETRANSCRIPT diagnostic: \(diagnostic)")
             }
             writeText(
                 "\(item.fileName) retranscribed model=\(meta.modelName) target=\(validated.id) seconds=\(String(format: "%.1f", meta.elapsed))\n",
