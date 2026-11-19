@@ -3,19 +3,27 @@
 //  Models are copied into the app bundle at build time; the app never downloads at runtime.
 //
 //  Session rules:
-//   - "Press and hold to talk" clips accumulate in the CURRENT open session.
-//   - The green checkmark button archives that session and opens a new one.
+//   - Two hold-to-talk buttons, each bound to its own language, so two people
+//     speaking different languages can share ONE open session.
+//   - A small checkbox next to the hold-to-talk controls archives that session
+//     and opens a new one.
 //   - A session detail lists ALL hold-to-talk clips of that same session.
 //
-//  Every transcription records its model, wall-clock cost and source/target
-//  language. The exclamation-mark note shows those facts, and any item can be
-//  retranscribed with a different mode + target language (each model exposes
-//  its own language catalog).
+//  Whisper language semantics: picking a language tells the model to decode
+//  the audio AS that language and output text in that same language. It is not
+//  a translation. Picking wrong only affects the transcript, which the user can
+//  fix from the exclamation-mark note by retranscribing with another language.
+//
+//  Every transcription records its model, wall-clock cost, the language the
+//  model detected and the language the user asked for. Any item can be
+//  retranscribed with a different mode + language (each model exposes its own
+//  language catalog).
 //
 //  --auto-run drives a scripted UI demo used by CI:
-//    standard mode: 3 hold-to-talk clips in one session, checkmark archive, tap record
-//    precise mode:  tap record, 2 hold-to-talk clips in a new session, checkmark, tap record
-//    open an item note, show both language catalogs, run two real retranscriptions,
+//    standard mode: 3 hold-to-talk clips in one session, checkbox archive, tap record
+//    precise mode:  tap record, 2 hold-to-talk clips in a new session, checkbox, tap record
+//    open an item note, show both language catalogs, run two real retranscriptions
+//    (one deliberately wrong language, then the corrected pick),
 //    scroll the archived list screen by screen, open every session/result detail,
 //    and finally return to the home screen.
 
@@ -37,6 +45,10 @@ struct ContentView: View {
     @State private var currentItemName = "—"
     @State private var isRecording = false
     @State private var activeSource: RecordingSource?
+    @State private var activeHoldSlot: Int?
+    @State private var activeHoldLanguage: String?
+    /// The two hold-to-talk buttons are bound to two (user-selectable) languages.
+    @State private var holdLanguages: [String] = ["zh", "en"]
     @State private var recorder: AVAudioRecorder?
     @State private var recordingURL: URL?
     @State private var recordingStartedAt: Date?
@@ -205,9 +217,9 @@ struct ContentView: View {
             Divider()
 
             HStack {
-                Text("目标语言").font(.caption.bold())
+                Text("识别语言").font(.caption.bold())
                 Spacer()
-                Picker("目标语言", selection: $selectedTarget) {
+                Picker("识别语言", selection: $selectedTarget) {
                     ForEach(LanguageCatalog.targets(for: selectedMode)) { option in
                         Text(option.title).tag(option)
                     }
@@ -217,7 +229,13 @@ struct ContentView: View {
             Text(LanguageCatalog.countLabel(for: selectedMode))
                 .font(.caption2)
                 .foregroundColor(.blue)
-            Text(selectedTarget.detail + " · 点条目感叹号可重选模型与语言")
+            Text("选什么语言，就把录音当作什么语言转写，输出同语种文本；不是翻译。")
+                .font(.caption2)
+                .foregroundColor(.secondary)
+            Text("选错不会影响原音频：点条目感叹号 → 重新转写 → 重选语言即可。")
+                .font(.caption2)
+                .foregroundColor(.orange)
+            Text(selectedTarget.detail)
                 .font(.caption2)
                 .foregroundColor(.secondary)
         }
@@ -225,24 +243,29 @@ struct ContentView: View {
         .background(RoundedRectangle(cornerRadius: 14).fill(Color(.secondarySystemGroupedBackground)))
     }
 
-    // MARK: - Recording controls (two round red buttons + green checkmark)
+    // MARK: - Recording controls
+    // RED IS A LIVE STATE: a round button turns red only while its own
+    // microphone is actually recording. Idle buttons use distinct standby
+    // colors (blue / purple / teal) so the recording state is unmistakable.
 
     private var controlsCard: some View {
-        VStack(spacing: 14) {
-            HStack(alignment: .top, spacing: 6) {
-                holdToTalkButton
-                Spacer(minLength: 4)
+        VStack(spacing: 12) {
+            recordingStateBanner
+
+            HStack(alignment: .top, spacing: 2) {
+                holdToTalkButton(slot: 0)
+                Spacer(minLength: 0)
+                holdToTalkButton(slot: 1)
+                Spacer(minLength: 0)
                 tapRecordButton
-                Spacer(minLength: 4)
-                checkmarkButton
             }
             .padding(.horizontal, 2)
 
-            Text("多次「按住说话」会累积在同一会话；点右侧绿色打勾才归档并新建会话")
-                .font(.caption2)
-                .foregroundColor(.secondary)
-                .multilineTextAlignment(.center)
-                .frame(maxWidth: .infinity)
+            holdLanguagePickers
+
+            // A SMALL checkbox, deliberately placed with the hold-to-talk
+            // controls: it archives the hold-to-talk session, not a recording.
+            newSessionCheckbox
 
             Button {
                 showingImporter = true
@@ -255,67 +278,132 @@ struct ContentView: View {
         .background(RoundedRectangle(cornerRadius: 14).fill(Color(.secondarySystemGroupedBackground)))
     }
 
-    private var holdToTalkButton: some View {
-        let active = isRecording && activeSource == .pushToTalk
-        return VStack(spacing: 8) {
+    private var recordingStateBanner: some View {
+        HStack(spacing: 6) {
+            Circle()
+                .fill(isRecording ? Color.red : Color.gray)
+                .frame(width: 8, height: 8)
+            Text(isRecording ? "正在录音 · 对应按钮变红" : "未在录音 · 按钮为待机色")
+                .font(.caption2.bold())
+                .foregroundColor(isRecording ? .red : .secondary)
+            Spacer(minLength: 2)
+            if isRecording {
+                Text(activeSource == .tap ? "点击停止" : "松开结束")
+                    .font(.caption2.bold())
+                    .foregroundColor(.red)
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(Capsule().fill(isRecording ? Color.red.opacity(0.12) : Color.gray.opacity(0.10)))
+    }
+
+    /// The two hold-to-talk buttons belong to two speakers / two languages.
+    /// Both feed the SAME open session; each clip remembers its own language.
+    private func holdToTalkButton(slot: Int) -> some View {
+        let code = holdLanguages[slot]
+        let active = isRecording && activeSource == .pushToTalk && activeHoldSlot == slot
+        let standby: Color = slot == 0 ? .blue : .purple
+        return VStack(spacing: 5) {
             ZStack {
                 Circle()
-                    .fill(active ? Color.red.opacity(0.35) : Color.red.opacity(0.12))
-                    .frame(width: 86, height: 86)
+                    .fill(active ? Color.red.opacity(0.35) : standby.opacity(0.12))
+                    .frame(width: 82, height: 82)
                 Circle()
-                    .fill(Color.red)
-                    .frame(width: 70, height: 70)
-                    .shadow(color: .red.opacity(0.4), radius: 8, y: 4)
+                    .fill(active ? Color.red : standby.opacity(0.75))
+                    .frame(width: 66, height: 66)
+                    .shadow(color: active ? Color.red.opacity(0.45) : standby.opacity(0.25), radius: 8, y: 4)
                 Image(systemName: active ? "waveform.circle.fill" : "mic.fill")
-                    .font(.system(size: 28, weight: .semibold))
+                    .font(.system(size: 26, weight: .semibold))
                     .foregroundColor(.white)
                 if active {
                     Circle()
                         .stroke(Color.red.opacity(0.5), lineWidth: 3)
-                        .frame(width: 86, height: 86)
-                        .scaleEffect(active ? 1.1 : 1.0)
+                        .frame(width: 82, height: 82)
+                        .scaleEffect(1.1)
                         .animation(.easeInOut(duration: 0.7).repeatForever(autoreverses: true), value: active)
                 }
             }
-            .frame(width: 90, height: 90)
+            .frame(width: 86, height: 86)
             .contentShape(Circle())
             .onLongPressGesture(minimumDuration: 0.15, pressing: { pressing in
                 if pressing {
-                    startRecording(source: .pushToTalk)
-                } else if activeSource == .pushToTalk {
+                    startRecording(source: .pushToTalk, holdSlot: slot, holdLanguageCode: code)
+                } else if activeSource == .pushToTalk && activeHoldSlot == slot {
                     stopRecording()
                 }
             }, perform: {})
-            Text(active ? "松开结束" : "按住说话")
+            Text(active ? "● 录音中" : "按住说话")
                 .font(.caption.bold())
                 .foregroundColor(active ? .red : .secondary)
+            Text("\(slot == 0 ? "①" : "②") \(LanguageCatalog.shortName(for: code))")
+                .font(.caption2.bold())
+                .foregroundColor(standby)
         }
         .frame(width: 100)
     }
 
+    private var holdLanguagePickers: some View {
+        HStack(spacing: 10) {
+            holdLanguageMenu(slot: 0)
+            holdLanguageMenu(slot: 1)
+        }
+    }
+
+    private func holdLanguageMenu(slot: Int) -> some View {
+        let tint: Color = slot == 0 ? .blue : .purple
+        return HStack(spacing: 4) {
+            Text(slot == 0 ? "说话人 1" : "说话人 2")
+                .font(.caption2)
+                .foregroundColor(.secondary)
+            Menu {
+                ForEach(LanguageCatalog.targets(for: selectedMode).filter { $0.languageCode != nil }) { option in
+                    Button(option.title) {
+                        var updated = holdLanguages
+                        updated[slot] = option.languageCode ?? "en"
+                        holdLanguages = updated
+                        log("Hold button \(slot + 1) language = \(updated[slot])")
+                    }
+                }
+            } label: {
+                HStack(spacing: 3) {
+                    Text(LanguageCatalog.shortName(for: holdLanguages[slot]))
+                        .font(.caption2.bold())
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 8))
+                }
+                .foregroundColor(tint)
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 5)
+        .background(Capsule().fill(tint.opacity(0.08)))
+    }
+
     private var tapRecordButton: some View {
         let active = isRecording && activeSource == .tap
-        return VStack(spacing: 8) {
+        let standby: Color = .teal
+        return VStack(spacing: 5) {
             ZStack {
                 Circle()
-                    .fill(active ? Color.red.opacity(0.35) : Color.red.opacity(0.12))
-                    .frame(width: 86, height: 86)
+                    .fill(active ? Color.red.opacity(0.35) : standby.opacity(0.12))
+                    .frame(width: 82, height: 82)
                 Circle()
-                    .fill(Color.red)
-                    .frame(width: 70, height: 70)
-                    .shadow(color: .red.opacity(0.4), radius: 8, y: 4)
-                Image(systemName: active ? "stop.fill" : "record.circle.fill")
-                    .font(.system(size: 28, weight: .semibold))
+                    .fill(active ? Color.red : standby.opacity(0.75))
+                    .frame(width: 66, height: 66)
+                    .shadow(color: active ? Color.red.opacity(0.45) : standby.opacity(0.25), radius: 8, y: 4)
+                Image(systemName: active ? "stop.fill" : "record.circle")
+                    .font(.system(size: 26, weight: .semibold))
                     .foregroundColor(.white)
                 if active {
                     Circle()
                         .stroke(Color.red.opacity(0.5), lineWidth: 3)
-                        .frame(width: 86, height: 86)
-                        .scaleEffect(active ? 1.1 : 1.0)
+                        .frame(width: 82, height: 82)
+                        .scaleEffect(1.1)
                         .animation(.easeInOut(duration: 0.7).repeatForever(autoreverses: true), value: active)
                 }
             }
-            .frame(width: 90, height: 90)
+            .frame(width: 86, height: 86)
             .contentShape(Circle())
             .onTapGesture {
                 if isRecording && activeSource == .tap {
@@ -324,49 +412,45 @@ struct ContentView: View {
                     startRecording(source: .tap)
                 }
             }
-            Text(active ? "点击停止" : "点击录音")
+            Text(active ? "● 录音中" : "点击录音")
                 .font(.caption.bold())
                 .foregroundColor(active ? .red : .secondary)
-        }
-        .frame(width: 100)
-    }
-
-    /// The checkmark archives the current session and opens a new one.
-    private var checkmarkButton: some View {
-        let count = currentSessionClipCount
-        let enabled = count > 0
-        return VStack(spacing: 8) {
-            ZStack {
-                Circle()
-                    .fill(checkPulse ? Color.green.opacity(0.45) : (enabled ? Color.green.opacity(0.16) : Color.gray.opacity(0.12)))
-                    .frame(width: 86, height: 86)
-                Circle()
-                    .fill(enabled ? Color.green : Color.gray)
-                    .frame(width: 62, height: 62)
-                    .shadow(color: Color.green.opacity(0.35), radius: 8, y: 4)
-                Image(systemName: checkPulse ? "checkmark.circle.fill" : "checkmark")
-                    .font(.system(size: 27, weight: .bold))
-                    .foregroundColor(.white)
-                if checkPulse {
-                    Circle()
-                        .stroke(Color.green.opacity(0.65), lineWidth: 3)
-                        .frame(width: 86, height: 86)
-                        .scaleEffect(1.12)
-                }
-            }
-            .frame(width: 90, height: 90)
-            .contentShape(Circle())
-            .onTapGesture {
-                archiveAndOpenNewSession()
-            }
-            Text(checkPulse ? "已归档" : "打勾归档")
-                .font(.caption.bold())
-                .foregroundColor(enabled ? .green : .secondary)
-            Text("新建会话")
+            Text(active ? "点击停止" : "单击开始 / 单击结束")
                 .font(.caption2)
                 .foregroundColor(.secondary)
         }
         .frame(width: 100)
+    }
+
+    /// A small checkbox that belongs to the hold-to-talk session. Ticking it
+    /// archives the current session and opens the next one.
+    private var newSessionCheckbox: some View {
+        Button {
+            archiveAndOpenNewSession()
+        } label: {
+            HStack(spacing: 8) {
+                Image(systemName: checkPulse ? "checkmark.square.fill" : "square")
+                    .font(.system(size: 19))
+                    .foregroundColor(checkPulse ? .green : .secondary)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("新开会话 · 仅用于按住说话")
+                        .font(.caption.bold())
+                        .foregroundColor(.primary)
+                    Text("勾选即归档当前会话，之后的 ① / ② 录音进入新会话")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                }
+                Spacer(minLength: 2)
+                Text("\(currentSessionClipCount) 段")
+                    .font(.caption2.monospacedDigit())
+                    .foregroundColor(.orange)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
+            .background(RoundedRectangle(cornerRadius: 8).fill(Color.orange.opacity(0.08)))
+            .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.orange.opacity(0.28), lineWidth: 1))
+        }
+        .buttonStyle(.plain)
     }
 
     private var currentSessionClipCount: Int {
@@ -393,7 +477,7 @@ struct ContentView: View {
                     .font(.caption2.bold())
                     .foregroundColor(.orange)
             }
-            Text("本会话已录 \(clips.count) 段按住说话录音；点绿色打勾后归档，之后的录音进入新会话")
+            Text("① / ② 两个按钮的录音都在本会话；勾选下方「新开会话」才归档，之后进入新会话")
                 .font(.caption2)
                 .foregroundColor(.secondary)
 
@@ -414,8 +498,13 @@ struct ContentView: View {
                         Text(clip.fileName)
                             .font(.caption2)
                             .foregroundColor(.secondary)
+                        if let code = clip.holdLanguageCode {
+                            Text(LanguageCatalog.shortName(for: code))
+                                .font(.caption2.bold())
+                                .foregroundColor(clipColor(for: code))
+                        }
                         Spacer(minLength: 4)
-                        WaveformView(samples: clip.waveform, color: .red, height: 16, barCount: 18)
+                        WaveformView(samples: clip.waveform, color: clipColor(for: clip.holdLanguageCode), height: 16, barCount: 18)
                             .frame(width: 70)
                     }
                 }
@@ -489,7 +578,7 @@ struct ContentView: View {
                 .foregroundColor(.secondary)
 
             if archived.isEmpty {
-                Text("还没有归档会话 · 录音后点绿色打勾")
+                Text("还没有归档会话 · 录音后勾选「新开会话」")
                     .font(.caption)
                     .foregroundColor(.secondary)
                     .frame(maxWidth: .infinity, minHeight: 46, alignment: .leading)
@@ -546,6 +635,7 @@ struct ContentView: View {
             // Every clip carries its own model badge + info / retranscribe actions.
             ForEach(clips.indices, id: \.self) { index in
                 let clip = clips[index]
+                let tint = clipColor(for: clip.holdLanguageCode)
                 VStack(alignment: .trailing, spacing: 4) {
                     HStack {
                         Spacer(minLength: 30)
@@ -556,6 +646,14 @@ struct ContentView: View {
                             Text("\(index + 1). \(clip.name)")
                                 .font(.caption2.bold())
                                 .foregroundColor(.white)
+                            if let code = clip.holdLanguageCode {
+                                Text(LanguageCatalog.shortName(for: code))
+                                    .font(.caption2.bold())
+                                    .foregroundColor(.white)
+                                    .padding(.horizontal, 5)
+                                    .padding(.vertical, 1)
+                                    .background(Capsule().fill(Color.white.opacity(0.28)))
+                            }
                             WaveformView(samples: clip.waveform, color: .white.opacity(0.9), height: 14, barCount: 14)
                                 .frame(width: 54)
                             Text(String(format: "%.1fs", clip.duration))
@@ -564,7 +662,7 @@ struct ContentView: View {
                         }
                         .padding(.horizontal, 10)
                         .padding(.vertical, 6)
-                        .background(Capsule().fill(Color.red.opacity(0.9)))
+                        .background(Capsule().fill(tint.opacity(0.9)))
                     }
                     ItemMetaRow(
                         item: clip,
@@ -702,7 +800,7 @@ struct ContentView: View {
         }
         let after = store.currentSession?.title ?? "新会话"
         checkPulse = true
-        setStage(.done, detail: "✓ 已归档「\(before)」(\(archived.itemIDs.count) 段)，新建「\(after)」", progress: 1)
+        setStage(.done, detail: "✓ 已勾选新开会话 · 归档「\(before)」(\(archived.itemIDs.count) 段)，新建「\(after)」", progress: 1)
         log("Session archived: \(before) clips=\(archived.itemIDs.count), opened \(after)")
         writeText("\(before) archived\n", fileName: "archive_action.log", append: true)
         Task {
@@ -713,7 +811,11 @@ struct ContentView: View {
 
     // MARK: - Real recording actions
 
-    private func startRecording(source: RecordingSource) {
+    private func startRecording(
+        source: RecordingSource,
+        holdSlot: Int? = nil,
+        holdLanguageCode: String? = nil
+    ) {
         guard !isRecording else { return }
         let session = AVAudioSession.sharedInstance()
         try? session.setCategory(.playAndRecord, mode: .default, options: [.defaultToSpeaker])
@@ -736,9 +838,12 @@ struct ContentView: View {
             recordingURL = url
             recordingStartedAt = Date()
             activeSource = source
+            activeHoldSlot = holdSlot
+            activeHoldLanguage = holdLanguageCode
             isRecording = true
-            setStage(.recording, detail: "\(source.sectionTitle)录音中…", progress: 0.08)
-            log("Recording started: \(source.rawValue)")
+            let languageNote = holdLanguageCode.map { " · 按 \(LanguageCatalog.shortName(for: $0)) 转写" } ?? ""
+            setStage(.recording, detail: "\(source.sectionTitle)录音中…\(languageNote)", progress: 0.08)
+            log("Recording started: \(source.rawValue), slot=\(holdSlot.map { String($0) } ?? "-"), lang=\(holdLanguageCode ?? "auto")")
         } catch {
             setStage(.failed, detail: "录音失败：\(error.localizedDescription)", progress: 0)
             log("Recording failed: \(error)")
@@ -751,8 +856,11 @@ struct ContentView: View {
         recorder = nil
         let duration = recordingStartedAt.map { Date().timeIntervalSince($0) } ?? 0
         let url = recordingURL
+        let holdLanguage = activeHoldLanguage
         isRecording = false
         activeSource = nil
+        activeHoldSlot = nil
+        activeHoldLanguage = nil
         recordingStartedAt = nil
         recordingURL = nil
 
@@ -761,15 +869,16 @@ struct ContentView: View {
             return
         }
         let item = store.add(
-            name: name(for: source),
+            name: name(for: source, holdLanguageCode: holdLanguage),
             fileName: url.lastPathComponent,
             source: source,
             duration: duration,
             waveform: WaveformExtractor.samples(from: url),
-            audioData: data
+            audioData: data,
+            holdLanguageCode: holdLanguage
         )
         setStage(.idle, detail: "已保存「\(item.name)」到当前会话，点按条目可转写", progress: 0)
-        log("Recording saved: \(item.fileName), \(duration)s")
+        log("Recording saved: \(item.fileName), \(duration)s, lang=\(holdLanguage ?? "auto")")
     }
 
     private func importAudio(_ result: Result<URL, Error>) {
@@ -798,18 +907,17 @@ struct ContentView: View {
         outcome: TranscriptionOutcome,
         retranscribeCount: Int
     ) -> TranscriptionMeta {
-        let source = outcome.sourceCode.map { LanguageCatalog.displayName(for: $0) } ?? "自动检测"
-        let targetTitle = target.isTranslation
-            ? "英语 (en) · 翻译输出"
-            : LanguageCatalog.displayName(for: target.languageCode)
+        let detected = outcome.sourceCode.map { LanguageCatalog.displayName(for: $0) } ?? "未检出"
+        // What the user asked for, NOT a translation target.
+        let chosen = LanguageCatalog.displayName(for: target.languageCode)
         return TranscriptionMeta(
             modelName: mode.modelTitle,
             modeTitle: mode.title,
             modeRaw: mode.rawValue,
             elapsed: outcome.elapsed,
-            sourceLanguage: source,
-            targetLanguage: targetTitle,
-            taskTitle: target.isTranslation ? "语音翻译" : "同语种转录",
+            sourceLanguage: detected,
+            targetLanguage: chosen,
+            taskTitle: "按所选语言转写 · 同语种输出（非翻译）",
             retranscribeCount: retranscribeCount,
             finishedAt: Date()
         )
@@ -821,11 +929,19 @@ struct ContentView: View {
             return
         }
         let mode = selectedMode
-        let target = LanguageCatalog.validated(selectedTarget, for: mode)
+        // A hold-to-talk clip carries the language of the button that recorded
+        // it. That language wins over the global picker for this one clip.
+        let target: TranscriptionTarget
+        if let code = item.holdLanguageCode,
+           let matched = LanguageCatalog.targets(for: mode).first(where: { $0.languageCode == code }) {
+            target = matched
+        } else {
+            target = LanguageCatalog.validated(selectedTarget, for: mode)
+        }
         currentItemName = item.name
         transcript = ""
         setStage(.loading, detail: "加载内置 \(mode.modelTitle)…", progress: 0.1)
-        log("Transcribe start: \(item.fileName), mode=\(mode.rawValue), target=\(target.id)")
+        log("Transcribe start: \(item.fileName), mode=\(mode.rawValue), language=\(target.id) (from \(item.holdLanguageCode ?? "global picker"))")
 
         do {
             let outcome = try await service.transcribe(audioURL: url, mode: mode, target: target)
@@ -906,29 +1022,31 @@ struct ContentView: View {
     private func runDemo() async {
         log("DEMO started")
 
-        // Capture the top control area: two round red buttons + green checkmark.
-        markScreen("home controls")
+        // Capture the idle controls: standby colors, two language buttons and
+        // the small "new session" checkbox. No button is red yet.
+        markScreen("home controls · 待机色 / 双语言按住按钮 / 新开会话勾选框")
         try? await Task.sleep(nanoseconds: 6_000_000_000)
 
         // ---- Standard mode: three hold-to-talk clips in ONE session ----
+        // The two speakers alternate: ① Chinese, ② English, ① Chinese.
         selectedMode = .standard
         selectedTarget = LanguageCatalog.defaultTarget(for: .standard)
-        await demoRecord(source: .pushToTalk, label: "普通 · 会话1 按住说话 1/3")
-        await demoRecord(source: .pushToTalk, label: "普通 · 会话1 按住说话 2/3")
-        await demoRecord(source: .pushToTalk, label: "普通 · 会话1 按住说话 3/3")
-        await demoCheckmark(label: "普通 · 打勾归档会话1 / 新建会话2")
+        await demoRecord(source: .pushToTalk, holdSlot: 0, label: "普通 · 会话1 ①中文 1/3")
+        await demoRecord(source: .pushToTalk, holdSlot: 1, label: "普通 · 会话1 ②English 2/3")
+        await demoRecord(source: .pushToTalk, holdSlot: 0, label: "普通 · 会话1 ①中文 3/3")
+        await demoCheckmark(label: "普通 · 勾选新开会话 / 归档会话1")
         await demoRecord(source: .tap, label: "普通 · 单击录音")
 
         // ---- Precise mode ----
         selectedMode = .precise
         selectedTarget = LanguageCatalog.defaultTarget(for: .precise)
         await demoRecord(source: .tap, label: "精准 · 单击录音 1/2")
-        await demoRecord(source: .pushToTalk, label: "精准 · 会话2 按住说话 1/2")
-        await demoRecord(source: .pushToTalk, label: "精准 · 会话2 按住说话 2/2")
-        await demoCheckmark(label: "精准 · 打勾归档会话2 / 新建会话3")
+        await demoRecord(source: .pushToTalk, holdSlot: 1, label: "精准 · 会话2 ②English 1/2")
+        await demoRecord(source: .pushToTalk, holdSlot: 0, label: "精准 · 会话2 ①中文 2/2")
+        await demoCheckmark(label: "精准 · 勾选新开会话 / 归档会话2")
         await demoRecord(source: .tap, label: "精准 · 单击录音 2/2")
 
-        // ---- Item notes + retranscription, all captured by CI stills ----
+        // ---- Item notes + "wrong language -> pick again" retranscriptions ----
         await demoModelInfoFlow()
 
         // ---- Scroll down the archived list screen by screen ----
@@ -954,17 +1072,27 @@ struct ContentView: View {
         log("DEMO screen \(shotStep): \(label)")
     }
 
-    private func demoRecord(source: RecordingSource, label: String) async {
+    private func demoRecord(source: RecordingSource, holdSlot: Int? = nil, label: String) async {
         setStage(.idle, detail: "准备 \(label)…", progress: 0.02)
         try? await Task.sleep(nanoseconds: 600_000_000)
 
+        // Drive the SAME state the real button uses, so the button really turns
+        // red in the CI recording instead of just logging a fake step.
+        let holdLanguage = holdSlot.map { holdLanguages[$0] }
         activeSource = source
+        activeHoldSlot = holdSlot
+        activeHoldLanguage = holdLanguage
         isRecording = true
-        setStage(.recording, detail: "\(label) · 录音中…", progress: 0.06)
-        log("DEMO recording started: \(label)")
-        try? await Task.sleep(nanoseconds: 1_300_000_000)
+        setStage(.recording, detail: "\(label) · 录音中（按钮变红）…", progress: 0.06)
+        log("DEMO recording started: \(label), lang=\(holdLanguage ?? "global picker")")
+        markScreen("\(label) · 录音中 · 红色状态")
+        // Keep the live state up long enough for the CI watcher (2s poll +
+        // 2s settle) to capture a red-button frame, not just the video.
+        try? await Task.sleep(nanoseconds: 5_000_000_000)
         isRecording = false
         activeSource = nil
+        activeHoldSlot = nil
+        activeHoldLanguage = nil
 
         guard let sampleURL = Bundle.main.url(forResource: "recording", withExtension: "wav"),
               let data = try? Data(contentsOf: sampleURL) else {
@@ -976,14 +1104,15 @@ struct ContentView: View {
         let number = store.items.count + 1
         let fileName = "\(source.rawValue)_\(number).wav"
         let item = store.add(
-            name: name(for: source),
+            name: name(for: source, holdLanguageCode: holdLanguage),
             fileName: fileName,
             source: source,
             duration: duration(of: sampleURL),
             waveform: WaveformExtractor.samples(from: sampleURL),
-            audioData: data
+            audioData: data,
+            holdLanguageCode: holdLanguage
         )
-        log("DEMO recording saved: \(item.fileName) in \(store.currentSession?.title ?? "session")")
+        log("DEMO recording saved: \(item.fileName) in \(store.currentSession?.title ?? "session"), lang=\(holdLanguage ?? "global")")
 
         try? await Task.sleep(nanoseconds: 400_000_000)
         currentItemName = item.name
@@ -997,30 +1126,30 @@ struct ContentView: View {
         checkPulse = true
         let before = store.currentSession?.title ?? "会话"
         guard let archived = store.archiveCurrentSession() else {
-            log("DEMO checkmark: nothing to archive")
+            log("DEMO checkbox: nothing to archive")
             checkPulse = false
             return
         }
         let after = store.currentSession?.title ?? "新会话"
-        setStage(.done, detail: "✓ 已归档「\(before)」(\(archived.itemIDs.count) 段)，新建「\(after)」", progress: 1)
-        log("DEMO checkmark: archived \(before) clips=\(archived.itemIDs.count), opened \(after)")
+        setStage(.done, detail: "✓ 已勾选新开会话 · 归档「\(before)」(\(archived.itemIDs.count) 段)，新建「\(after)」", progress: 1)
+        log("DEMO checkbox: archived \(before) clips=\(archived.itemIDs.count), opened \(after)")
         writeText("\(before) archived with \(archived.itemIDs.count) clips\n", fileName: "archive_action.log", append: true)
-        markScreen("checkmark archived \(before) -> \(after)")
+        markScreen("勾选新开会话 · \(before) -> \(after) · 勾选框已打勾")
         try? await Task.sleep(nanoseconds: 4_500_000_000)
         checkPulse = false
         try? await Task.sleep(nanoseconds: 400_000_000)
     }
 
-    /// Show the exclamation-mark note, both per-model language catalogs and
-    /// two real retranscriptions in the CI recording.
+    /// Show the note, both per-model language catalogs, and a REAL
+    /// "picked the wrong language -> retranscribe -> pick again" recovery.
     private func demoModelInfoFlow() async {
         let taps = store.items(for: .tap)
         guard let newestTap = taps.first, let oldestTap = taps.last else { return }
         demoReplaying = true
 
-        // 1) Note of a precise-mode item: model, elapsed, language direction.
+        // 1) Note: model, elapsed, detected language vs the language asked for.
         reviewTarget = .info(newestTap)
-        await settleThenMark("item info · Whisper Turbo / 用时 / 语言方向", seconds: 6)
+        await settleThenMark("备注 · 模型 / 用时 / 检测语言 · 指定语言", seconds: 6)
 
         // 2) STANDARD mode sheet: Whisper Base offers 99 languages, because
         //    the original Whisper tokenizer has no Cantonese `yue`.
@@ -1029,45 +1158,47 @@ struct ContentView: View {
         retranscribeMode = .standard
         let baseEnglish = LanguageCatalog.baseTargets.first { $0.id == "en" }
             ?? LanguageCatalog.defaultTarget(for: .standard)
+        let baseFrench = LanguageCatalog.baseTargets.first { $0.id == "fr" }
+            ?? baseEnglish
         retranscribeTarget = baseEnglish
         reviewTarget = .retranscribe(newestTap)
-        await settleThenMark("重新转写 · 普通模式 Whisper Base · 99 种语言（不含粤语）", seconds: 6)
+        await settleThenMark("重新转写 · 普通模式 Whisper Base · 99 种识别语言（不含粤语）", seconds: 6)
 
         // 3) PRECISE mode sheet: large-v3-turbo adds Cantonese -> 100 codes.
-        //    Selecting `yue` here makes the per-model difference visible.
         retranscribeMode = .precise
         let cantonese = LanguageCatalog.turboTargets.first { $0.id == "yue" }
             ?? LanguageCatalog.defaultTarget(for: .precise)
-        retranscribeTarget = cantonese
-        await settleThenMark("重新转写 · 精准模式 Whisper Turbo · 100 种语言含粤语", seconds: 6)
-
-        // 4) Still precise mode: the X -> English translate task.
-        let translate = LanguageCatalog.turboTargets.first { $0.id == "translate-en" }
+        let turboEnglish = LanguageCatalog.turboTargets.first { $0.id == "en" }
             ?? LanguageCatalog.defaultTarget(for: .precise)
-        retranscribeTarget = translate
-        await settleThenMark("重新转写 · 精准模式 · 翻译为英文", seconds: 5)
+        retranscribeTarget = cantonese
+        await settleThenMark("重新转写 · 精准模式 Whisper Turbo · 100 种识别语言含粤语", seconds: 6)
 
-        // 5) Actually re-run with Whisper Base + English.
+        // 4) Deliberately pick the WRONG language for the English JFK sample.
+        //    Whisper will decode English audio AS French; it is not a translation.
         retranscribeMode = .standard
-        retranscribeTarget = baseEnglish
-        await settleThenMark("开始重新转写 · Whisper Base · 英语", seconds: 2)
-        await performRetranscribe(item: newestTap, mode: .standard, target: baseEnglish)
-        await settleThenMark("重新转写完成 · 结果与新模型", seconds: 6)
+        retranscribeTarget = baseFrench
+        await settleThenMark("演示选错语言 · 把英语录音当作法语转写（非翻译）", seconds: 5)
+        await performRetranscribe(item: newestTap, mode: .standard, target: baseFrench)
+        await settleThenMark("重新转写完成 · 选错语言的结果", seconds: 5)
 
-        // 6) The note now shows the new model / timing / language direction.
-        let refreshed = store.item(with: newestTap.id) ?? newestTap
-        reviewTarget = .info(refreshed)
-        await settleThenMark("备注已更新 · Whisper Base / 新用时 / 语言方向", seconds: 6)
+        // 5) The note flags the mismatch and tells the user to pick again.
+        let wrong = store.item(with: newestTap.id) ?? newestTap
+        reviewTarget = .info(wrong)
+        await settleThenMark("备注 · 检测英语 / 指定法语 不一致 · 提示可重转重选", seconds: 6)
 
-        // 7) Second real re-run: Whisper Turbo with the translate task.
+        // 6) Re-pick the correct language on another item and really re-run.
         retranscribeNote = ""
         retranscribeResult = nil
         retranscribeMode = .precise
-        retranscribeTarget = translate
+        retranscribeTarget = turboEnglish
         reviewTarget = .retranscribe(oldestTap)
-        await settleThenMark("重新转写 · 另一条录音 · 精准模式翻译为英文", seconds: 5)
-        await performRetranscribe(item: oldestTap, mode: .precise, target: translate)
-        await settleThenMark("重新转写完成 · Whisper Turbo 翻译结果", seconds: 6)
+        await settleThenMark("重新转写 · 重选正确语言 英语(en) · 精准模式", seconds: 5)
+        await performRetranscribe(item: oldestTap, mode: .precise, target: turboEnglish)
+        await settleThenMark("重新转写完成 · 重选语言后的结果", seconds: 6)
+
+        let corrected = store.item(with: oldestTap.id) ?? oldestTap
+        reviewTarget = .info(corrected)
+        await settleThenMark("备注已更新 · 指定语言与检测语言一致", seconds: 6)
 
         reviewTarget = nil
         demoReplaying = false
@@ -1163,16 +1294,21 @@ struct ContentView: View {
         }
     }
 
-    private func name(for source: RecordingSource) -> String {
+    private func name(for source: RecordingSource, holdLanguageCode: String? = nil) -> String {
         let count = store.items(for: source).count + 1
         switch source {
         case .long: return "长录音 \(count)"
         case .pushToTalk:
             let sessionTitle = store.currentSession?.title ?? "会话"
             let clipCount = currentSessionClipCount + 1
-            return "\(sessionTitle) · 说话 \(clipCount)"
+            let language = holdLanguageCode.map { " · \(LanguageCatalog.shortName(for: $0))" } ?? ""
+            return "\(sessionTitle) · 说话 \(clipCount)\(language)"
         case .tap: return "单击录音 \(count)"
         }
+    }
+
+    private func clipColor(for code: String?) -> Color {
+        LanguageCatalog.tint(for: code)
     }
 
     private func durationText(_ seconds: TimeInterval) -> String {
@@ -1279,7 +1415,7 @@ struct ArchiveSnapshotView: View {
                 Text("共 \(sections.count) 个已归档会话 · \(totalCount) 条录音 · 全部保存在本地")
                     .font(.caption)
                     .foregroundColor(.secondary)
-                Text("每条录音下方标注：使用模型 · 转写用时 · 源语言 → 目标语言")
+                Text("每条录音下方标注：使用模型 · 转写用时 · 检测语言 / 指定语言")
                     .font(.caption2)
                     .foregroundColor(.blue)
             }
@@ -1289,7 +1425,7 @@ struct ArchiveSnapshotView: View {
             }
 
             snapshotSection(title: "长录音", rows: longItems, color: .blue)
-            snapshotSection(title: "单击录音", rows: tapItems, color: .red)
+            snapshotSection(title: "单击录音", rows: tapItems, color: .teal)
 
             HStack {
                 Image(systemName: "checkmark.seal.fill").foregroundColor(.green)
@@ -1558,10 +1694,15 @@ struct ItemInfoView: View {
             infoRow("识别模式", meta.modeTitle)
             infoRow("转写用时", meta.elapsedTitle)
             Divider()
-            infoRow("源语言（检测）", meta.sourceLanguage)
-            infoRow("目标语言", meta.targetLanguage)
-            infoRow("语言方向", meta.direction)
+            infoRow("模型检测语言", meta.sourceLanguage)
+            infoRow("本次指定语言", meta.targetLanguage)
+            infoRow("语言核对", meta.languageAgreement)
+            infoRow("识别依据", meta.direction)
             infoRow("任务类型", meta.taskTitle)
+            Divider()
+            Text("选错语言只会让转写文本变差，不会改动原音频；重新转写时重选语言再跑一次即可。")
+                .font(.caption2)
+                .foregroundColor(.orange)
             Divider()
             infoRow("重新转写次数", "\(meta.retranscribeCount) 次")
             infoRow("完成时间", Self.timeString(meta.finishedAt))
@@ -1641,9 +1782,12 @@ struct RetranscribeView: View {
             Text("\(item.name) · \(item.fileName)")
                 .font(.caption.monospacedDigit())
                 .foregroundColor(.secondary)
-            Text("切换模式会整体替换可选目标语言，因为两个模型支持的语言不同。")
+            Text("切换模式会整体替换可选识别语言，因为两个模型支持的语言不同。")
                 .font(.caption2)
                 .foregroundColor(.secondary)
+            Text("上次选错语言？在这里重选一次再重新转写即可，原音频不变。")
+                .font(.caption2)
+                .foregroundColor(.orange)
         }
     }
 
@@ -1688,8 +1832,8 @@ struct RetranscribeView: View {
 
     private var languageSection: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("2 · 选择目标语言").font(.subheadline.bold())
-            Picker("目标语言", selection: Binding(
+            Text("2 · 选择识别语言").font(.subheadline.bold())
+            Picker("识别语言", selection: Binding(
                 get: { effectiveTarget },
                 set: { newTarget in target = newTarget }
             )) {
@@ -1704,9 +1848,12 @@ struct RetranscribeView: View {
             Text("当前：\(effectiveTarget.title) · \(effectiveTarget.detail)")
                 .font(.caption)
                 .foregroundColor(.secondary)
-            Text("注意：转录按原语种输出；只有「翻译为英文」会跨语言输出，两个 Whisper 模型都支持。")
+            Text("Whisper 会把这段录音当作所选语言来转写，输出同语种文本；不是翻译。")
                 .font(.caption2)
                 .foregroundColor(.secondary)
+            Text("选错语言结果会变差：重新选一次再点「开始重新转写」即可，原音频不变。")
+                .font(.caption2)
+                .foregroundColor(.orange)
             Text("语言种类按模型区分：普通 Whisper Base 99 种（不含粤语），精准 Turbo 100 种（含粤语）。")
                 .font(.caption2)
                 .foregroundColor(.secondary)
@@ -1715,7 +1862,7 @@ struct RetranscribeView: View {
 
     private var previewSection: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("该模型可选目标语言 · 共 \(options.count) 项").font(.subheadline.bold())
+            Text("该模型可选识别语言 · 共 \(options.count) 项").font(.subheadline.bold())
             let shown = Array(options.prefix(12))
             LazyVGrid(columns: [GridItem(.adaptive(minimum: 92), spacing: 8)], spacing: 8) {
                 ForEach(shown) { option in
@@ -1957,6 +2104,11 @@ struct SessionDetailView: View {
                                 Text("第 \(index + 1) 段 · \(clip.name)")
                                     .font(.caption.bold())
                                     .foregroundColor(.secondary)
+                                if let code = clip.holdLanguageCode {
+                                    Text(LanguageCatalog.shortName(for: code))
+                                        .font(.caption2.bold())
+                                        .foregroundColor(LanguageCatalog.tint(for: code))
+                                }
                                 Spacer()
                             }
                             HStack {
@@ -1974,7 +2126,7 @@ struct SessionDetailView: View {
                                     }
                                     .padding(.horizontal, 12)
                                     .padding(.vertical, 9)
-                                    .background(RoundedRectangle(cornerRadius: 16).fill(Color.red.opacity(0.92)))
+                                    .background(RoundedRectangle(cornerRadius: 16).fill(LanguageCatalog.tint(for: clip.holdLanguageCode).opacity(0.92)))
                                     Text("文件：\(fresh.fileName)")
                                         .font(.caption2.monospacedDigit())
                                         .foregroundColor(.secondary)
@@ -1993,7 +2145,7 @@ struct SessionDetailView: View {
                             .frame(maxWidth: .infinity)
                         }
                         .padding(10)
-                        .background(RoundedRectangle(cornerRadius: 12).stroke(Color.red.opacity(0.25), lineWidth: 1))
+                        .background(RoundedRectangle(cornerRadius: 12).stroke(LanguageCatalog.tint(for: clip.holdLanguageCode).opacity(0.35), lineWidth: 1))
                     }
 
                     // Combined transcript

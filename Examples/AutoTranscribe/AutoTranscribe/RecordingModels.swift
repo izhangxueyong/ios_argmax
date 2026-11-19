@@ -21,20 +21,25 @@ import SwiftUI
 //     Cantonese `yue` was introduced only in large-v3, so base cannot emit it.
 //   * openai_whisper-large-v3-v20240930_turbo (precise): 100 language codes
 //     (99 + yue) from WhisperKit Constants.languages.
-// Both are multilingual, so both expose the .translate task (always English)
-// in addition to transcribing in the source language.
+//
+// IMPORTANT (Whisper semantics): picking a language does NOT translate the
+// audio. It tells Whisper "treat this recording as spoken in language X" and
+// the transcript is emitted in that same language. Picking the wrong language
+// produces a bad transcript; the fix is to retranscribe the item and pick a
+// different language. That is exactly what the per-item retranscribe sheet is
+// for. There is deliberately no "translate to English" option in this app.
 // A retranscription picker must swap the whole list when the mode changes.
 
 struct TranscriptionTarget: Codable, Equatable, Hashable, Identifiable, Sendable {
     var id: String
     var title: String
+    /// nil = let WhisperKit detect the spoken language; otherwise this code is
+    /// passed to DecodingOptions(language:) as the language to decode in.
     var languageCode: String?
-    var isTranslation: Bool
 
     var detail: String {
-        if isTranslation { return "语音翻译任务 · 输出英文" }
-        if languageCode == nil { return "自动检测源语言 · 按原语种输出" }
-        return "指定识别语言 · 按该语种输出"
+        if languageCode == nil { return "不指定 · 由模型自动检测音频语言" }
+        return "把这段录音当作该语言转写 · 输出同语种文本（非翻译）"
     }
 }
 
@@ -43,13 +48,25 @@ struct TranscriptionMeta: Codable, Equatable, Sendable {
     var modeTitle: String
     var modeRaw: String
     var elapsed: TimeInterval
+    /// Language WhisperKit detected from the audio (factual measurement).
     var sourceLanguage: String
+    /// Language the user asked the decoder to use (or "自动检测").
     var targetLanguage: String
     var taskTitle: String
     var retranscribeCount: Int
     var finishedAt: Date
 
-    var direction: String { "\(sourceLanguage) → \(targetLanguage)" }
+    /// There is no "source -> target" translation: both fields describe ONE
+    /// transcription. Show them side by side so a wrong pick is obvious.
+    var direction: String { "检测 \(sourceLanguage) · 指定 \(targetLanguage)" }
+    var languageAgreement: String {
+        if targetLanguage == "自动检测" {
+            return "未指定 · 由模型自动判定（实测 \(sourceLanguage)）"
+        }
+        return sourceLanguage == targetLanguage
+            ? "一致 · 按该语言解码，输出同语种文本"
+            : "不一致 · 可能选错语言，可重新转写重选后重跑"
+    }
     var elapsedTitle: String { String(format: "%.1f 秒", elapsed) }
 }
 
@@ -103,6 +120,20 @@ enum LanguageCatalog {
         return "\(name) (\(code))"
     }
 
+    /// Compact label used on the two hold-to-talk buttons.
+    static func shortName(for code: String) -> String {
+        chineseNames[code] ?? code.uppercased()
+    }
+
+    /// A saved clip is never "recording", so it must never be red. The tint
+    /// also distinguishes the two hold-to-talk speakers in the archive.
+    static func tint(for code: String?) -> Color {
+        guard let code else { return .blue }
+        if code == "zh" || code == "yue" { return .blue }
+        if code == "en" { return .purple }
+        return .teal
+    }
+
     /// Whisper Base uses the original 99-language tokenizer: Cantonese `yue`
     /// was only added by large-v3, so it must not be offered for base.
     static let baseCodes: [String] = whisperCodes.filter { $0 != "yue" }
@@ -112,30 +143,22 @@ enum LanguageCatalog {
 
     static func makeTargets(codes: [String]) -> [TranscriptionTarget] {
         var list: [TranscriptionTarget] = [
-            TranscriptionTarget(id: "auto", title: "自动检测", languageCode: nil, isTranslation: false)
+            TranscriptionTarget(id: "auto", title: "自动检测", languageCode: nil)
         ]
         for code in codes {
             list.append(TranscriptionTarget(
                 id: code,
                 title: displayName(for: code),
-                languageCode: code,
-                isTranslation: false
+                languageCode: code
             ))
         }
-        // Whisper's .translate task is the only true cross-language option.
-        list.append(TranscriptionTarget(
-            id: "translate-en",
-            title: "翻译为英文 (en)",
-            languageCode: "en",
-            isTranslation: true
-        ))
         return list
     }
 
-    /// Ordinary mode: 99 languages (no yue) + auto + translate = 101 options.
+    /// Ordinary mode: 99 languages (no yue) + auto = 100 options.
     static let baseTargets: [TranscriptionTarget] = makeTargets(codes: baseCodes)
 
-    /// Precise mode: 100 languages (incl. yue) + auto + translate = 102 options.
+    /// Precise mode: 100 languages (incl. yue) + auto = 101 options.
     static let turboTargets: [TranscriptionTarget] = makeTargets(codes: turboCodes)
 
     static func targets(for mode: TranscriptionMode) -> [TranscriptionTarget] {
@@ -148,9 +171,9 @@ enum LanguageCatalog {
     static func countLabel(for mode: TranscriptionMode) -> String {
         switch mode {
         case .standard:
-            return "Whisper Base · \(baseCodes.count) 种语言（不含粤语）+ 翻译为英文"
+            return "Whisper Base · \(baseCodes.count) 种可选识别语言（不含粤语）"
         case .precise:
-            return "Whisper Turbo · \(turboCodes.count) 种语言（含粤语）+ 翻译为英文"
+            return "Whisper Turbo · \(turboCodes.count) 种可选识别语言（含粤语）"
         }
     }
 
@@ -198,7 +221,12 @@ struct RecordingItem: Codable, Identifiable, Sendable {
     var usesBundledSample: Bool
     var storedFileName: String?
     var transcript: String?
-    /// Model, elapsed time and language direction of the LAST transcription.
+    /// For a hold-to-talk clip: which of the two language buttons produced it.
+    /// The stored code is used as DecodingOptions(language:) when transcribing,
+    /// so two people speaking different languages share one session correctly.
+    /// Optional so recordings.json written by older builds still decodes.
+    var holdLanguageCode: String?
+    /// Model, elapsed time and language facts of the LAST transcription.
     /// Optional so recordings.json written by older builds still decodes.
     var transcription: TranscriptionMeta?
 
@@ -212,6 +240,7 @@ struct RecordingItem: Codable, Identifiable, Sendable {
         usesBundledSample: Bool = false,
         storedFileName: String? = nil,
         transcript: String? = nil,
+        holdLanguageCode: String? = nil,
         transcription: TranscriptionMeta? = nil
     ) {
         self.id = id
@@ -224,6 +253,7 @@ struct RecordingItem: Codable, Identifiable, Sendable {
         self.usesBundledSample = usesBundledSample
         self.storedFileName = storedFileName
         self.transcript = transcript
+        self.holdLanguageCode = holdLanguageCode
         self.transcription = transcription
     }
 
@@ -441,7 +471,8 @@ final class RecordingStore: ObservableObject {
         duration: TimeInterval,
         waveform: [Double],
         audioData: Data? = nil,
-        usesBundledSample: Bool = false
+        usesBundledSample: Bool = false,
+        holdLanguageCode: String? = nil
     ) -> RecordingItem {
         var storedName: String?
         if let audioData {
@@ -455,7 +486,8 @@ final class RecordingStore: ObservableObject {
             duration: duration,
             waveform: waveform,
             usesBundledSample: usesBundledSample,
-            storedFileName: storedName
+            storedFileName: storedName,
+            holdLanguageCode: holdLanguageCode
         )
         items.insert(item, at: 0)
 

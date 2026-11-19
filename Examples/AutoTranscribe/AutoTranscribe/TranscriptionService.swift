@@ -7,11 +7,14 @@
 //   * precise  -> openai_whisper-large-v3-v20240930_turbo (Models/whisper-turbo)
 //
 //  Language handling:
-//   * Both are multilingual Whisper checkpoints, so both accept
-//     DecodingOptions(language:, task:) and both support X->en translation.
+//   * Whisper's `language` option is a SOURCE-language hint: "decode this
+//     audio as if it were spoken in X". The transcript is emitted in X, not
+//     translated into it. There is no X->en translation task in this app.
 //   * `base` uses the original 99-language tokenizer (no Cantonese `yue`);
 //     large-v3-turbo added `yue`, hence 100 codes. LanguageCatalog therefore
-//     keeps two separate target lists instead of sharing one.
+//     keeps two separate language lists instead of sharing one.
+//   * If the user picked the wrong language the only fix is to retranscribe
+//     with another code; that is handled by the per-item retranscribe sheet.
 //  Detect-and-recover: the small base checkpoint running on a CPU-only iOS
 //  Simulator used to decode a whole 30s window into timestamp/special tokens
 //  (rendered as ">> >> >>") or into nothing at all. For that model only we
@@ -112,20 +115,15 @@ final class TranscriptionService: ObservableObject {
             detectedCode = detection.language
         }
 
-        // .translate always emits English; otherwise `language` is a hint about
-        // the spoken language and the transcript stays in that language. When
-        // the user picked "自动检测", resolve it to the code we just detected
-        // so the decoder always receives an explicit language token.
-        let task: DecodingTask = target.isTranslation ? .translate : .transcribe
-        let language: String? = target.isTranslation
-            ? detectedCode
-            : (target.languageCode ?? detectedCode)
+        // Whisper always transcribes INTO the language it is told the audio is
+        // spoken in. When "自动检测" was picked, resolve it to the code we just
+        // detected so the decoder always receives an explicit language token.
+        let language: String? = target.languageCode ?? detectedCode
 
         // DecodingOptions requires arguments in declaration order:
         // verbose, task, language, ..., usePrefillPrompt, detectLanguage,
         // skipSpecialTokens, withoutTimestamps.
         let options = Self.makeOptions(
-            task: task,
             language: language,
             mode: mode,
             fallback: false
@@ -139,7 +137,6 @@ final class TranscriptionService: ObservableObject {
         // pass produced real words.
         if !Self.isMeaningful(text) {
             let fallbackOptions = Self.makeOptions(
-                task: task,
                 language: detectedCode ?? language,
                 mode: mode,
                 fallback: true
@@ -160,7 +157,6 @@ final class TranscriptionService: ObservableObject {
     }
 
     private static func makeOptions(
-        task: DecodingTask,
         language: String?,
         mode: TranscriptionMode,
         fallback: Bool
@@ -171,7 +167,7 @@ final class TranscriptionService: ObservableObject {
         // timestamp prompt entirely (see TranscribeTask.swift).
         var options = DecodingOptions(
             verbose: true,
-            task: task,
+            task: .transcribe,
             language: language,
             temperature: fallback ? 0.2 : 0.0,
             temperatureFallbackCount: fallback ? 3 : 5,
