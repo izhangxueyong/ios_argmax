@@ -63,6 +63,8 @@ struct TranscriptionOutcome: Sendable {
     let elapsed: TimeInterval
     /// ISO-639 style code reported by the model, nil when it could not detect one.
     let sourceCode: String?
+    /// Raw decoder output when the transcript ended up empty, for CI triage.
+    var diagnostic: String? = nil
 }
 
 enum TranscriptionServiceError: LocalizedError {
@@ -125,29 +127,56 @@ final class TranscriptionService: ObservableObject {
             detectLanguage: language == nil,
             skipSpecialTokens: true
         )
+        if mode == .standard {
+            // Whisper Base on a CPU-only simulator yields much lower log-probs
+            // than large-v3-turbo. With WhisperKit's default quality thresholds
+            // `SegmentSeeker` classifies the whole 30s window as silence and
+            // drops every segment, returning an empty transcript even though
+            // inference ran for 60-90s. Disable those filters for base only.
+            Self.relaxQualityThresholds(&options)
+        }
         var results = try await kit.transcribe(audioPath: audioURL.path, decodeOptions: options)
         var text = Self.joinedText(from: results)
+        var diagnostic: String? = nil
+        if text.isEmpty { diagnostic = Self.describe(results) }
 
-        // Small checkpoints can emit nothing but special tokens on a CPU-only
-        // simulator. Retry once with an explicit English greedy pass before
-        // giving up; this still uses the SAME bundled model and language task.
+        // If still empty, try a different decoding strategy with the SAME
+        // bundled model: skip the KV-cache prefill prompt and timestamps, and
+        // force an explicit English language token.
         if text.isEmpty && !target.isTranslation {
             options = DecodingOptions(
                 verbose: true,
                 task: .transcribe,
                 language: "en",
+                usePrefillPrompt: false,
                 detectLanguage: false,
-                skipSpecialTokens: true
+                skipSpecialTokens: true,
+                withoutTimestamps: true
             )
+            if mode == .standard { Self.relaxQualityThresholds(&options) }
             results = try await kit.transcribe(audioPath: audioURL.path, decodeOptions: options)
             text = Self.joinedText(from: results)
+            diagnostic = (diagnostic ?? "") + " | retry2 " + Self.describe(results)
         }
 
         return TranscriptionOutcome(
             text: text,
             elapsed: Date().timeIntervalSince(start),
-            sourceCode: detectedCode
+            sourceCode: detectedCode,
+            diagnostic: text.isEmpty ? diagnostic : nil
         )
+    }
+
+    private static func relaxQualityThresholds(_ options: inout DecodingOptions) {
+        options.noSpeechThreshold = nil
+        options.logProbThreshold = nil
+        options.firstTokenLogProbThreshold = nil
+        options.compressionRatioThreshold = nil
+    }
+
+    private static func describe(_ results: [TranscriptionResult]) -> String {
+        let raw = results.first?.text ?? "(no result)"
+        return "segments=\(results.first?.segments.count ?? 0), raw=\(String(raw.prefix(160)))"
     }
 
     private static func joinedText(from results: [TranscriptionResult]) -> String {
