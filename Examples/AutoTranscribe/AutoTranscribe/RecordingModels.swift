@@ -15,13 +15,14 @@ import SwiftUI
 
 // MARK: - Per-model language catalogs
 //
-// The two bundled ASR models do NOT support the same set of target languages:
-//   * SenseVoice-small (FluidAudio): auto + zh / en / yue / ja / ko, 6 options.
-//     Its `language` argument is the FunASR lid_dict embed index
-//     (auto=0, zh=1, en=2, yue=3, ja=4, ko=5).
-//   * Whisper large-v3-turbo (WhisperKit): every code in
-//     WhisperKit Constants.languages (100 codes, incl. yue) plus the
-//     built-in .translate task, which always emits English.
+// Both bundled models are WhisperKit checkpoints, but they do NOT share the
+// same tokenizer / language set:
+//   * openai_whisper-base (ordinary): the original 99 Whisper languages.
+//     Cantonese `yue` was introduced only in large-v3, so base cannot emit it.
+//   * openai_whisper-large-v3-v20240930_turbo (precise): 100 language codes
+//     (99 + yue) from WhisperKit Constants.languages.
+// Both are multilingual, so both expose the .translate task (always English)
+// in addition to transcribing in the source language.
 // A retranscription picker must swap the whole list when the mode changes.
 
 struct TranscriptionTarget: Codable, Equatable, Hashable, Identifiable, Sendable {
@@ -29,7 +30,6 @@ struct TranscriptionTarget: Codable, Equatable, Hashable, Identifiable, Sendable
     var title: String
     var languageCode: String?
     var isTranslation: Bool
-    var senseVoiceIndex: Int32?
 
     var detail: String {
         if isTranslation { return "语音翻译任务 · 输出英文" }
@@ -103,28 +103,23 @@ enum LanguageCatalog {
         return "\(name) (\(code))"
     }
 
-    /// SenseVoice's language list is deliberately short: the model only has
-    /// five explicit language query embeddings besides auto detection.
-    static let senseVoiceTargets: [TranscriptionTarget] = [
-        TranscriptionTarget(id: "auto", title: "自动检测", languageCode: nil, isTranslation: false, senseVoiceIndex: 0),
-        TranscriptionTarget(id: "zh", title: "中文 (zh)", languageCode: "zh", isTranslation: false, senseVoiceIndex: 1),
-        TranscriptionTarget(id: "en", title: "英语 (en)", languageCode: "en", isTranslation: false, senseVoiceIndex: 2),
-        TranscriptionTarget(id: "yue", title: "粤语 (yue)", languageCode: "yue", isTranslation: false, senseVoiceIndex: 3),
-        TranscriptionTarget(id: "ja", title: "日语 (ja)", languageCode: "ja", isTranslation: false, senseVoiceIndex: 4),
-        TranscriptionTarget(id: "ko", title: "韩语 (ko)", languageCode: "ko", isTranslation: false, senseVoiceIndex: 5)
-    ]
+    /// Whisper Base uses the original 99-language tokenizer: Cantonese `yue`
+    /// was only added by large-v3, so it must not be offered for base.
+    static let baseCodes: [String] = whisperCodes.filter { $0 != "yue" }
 
-    static let whisperTargets: [TranscriptionTarget] = {
+    /// large-v3-turbo ships every code in WhisperKit Constants.languages.
+    static let turboCodes: [String] = whisperCodes
+
+    static func makeTargets(codes: [String]) -> [TranscriptionTarget] {
         var list: [TranscriptionTarget] = [
-            TranscriptionTarget(id: "auto", title: "自动检测", languageCode: nil, isTranslation: false, senseVoiceIndex: nil)
+            TranscriptionTarget(id: "auto", title: "自动检测", languageCode: nil, isTranslation: false)
         ]
-        for code in whisperCodes {
+        for code in codes {
             list.append(TranscriptionTarget(
                 id: code,
                 title: displayName(for: code),
                 languageCode: code,
-                isTranslation: false,
-                senseVoiceIndex: nil
+                isTranslation: false
             ))
         }
         // Whisper's .translate task is the only true cross-language option.
@@ -132,25 +127,30 @@ enum LanguageCatalog {
             id: "translate-en",
             title: "翻译为英文 (en)",
             languageCode: "en",
-            isTranslation: true,
-            senseVoiceIndex: nil
+            isTranslation: true
         ))
         return list
-    }()
+    }
+
+    /// Ordinary mode: 99 languages (no yue) + auto + translate = 101 options.
+    static let baseTargets: [TranscriptionTarget] = makeTargets(codes: baseCodes)
+
+    /// Precise mode: 100 languages (incl. yue) + auto + translate = 102 options.
+    static let turboTargets: [TranscriptionTarget] = makeTargets(codes: turboCodes)
 
     static func targets(for mode: TranscriptionMode) -> [TranscriptionTarget] {
         switch mode {
-        case .standard: return senseVoiceTargets
-        case .precise: return whisperTargets
+        case .standard: return baseTargets
+        case .precise: return turboTargets
         }
     }
 
     static func countLabel(for mode: TranscriptionMode) -> String {
         switch mode {
         case .standard:
-            return "SenseVoice-small · 支持 \(senseVoiceTargets.count) 种语言（含自动检测）"
+            return "Whisper Base · \(baseCodes.count) 种语言（不含粤语）+ 翻译为英文"
         case .precise:
-            return "Whisper Turbo · 支持 \(whisperCodes.count) 种语言 + 翻译为英文"
+            return "Whisper Turbo · \(turboCodes.count) 种语言（含粤语）+ 翻译为英文"
         }
     }
 
@@ -158,8 +158,8 @@ enum LanguageCatalog {
         targets(for: mode)[0]
     }
 
-    /// Fall back to a legal target whenever the mode changes, because the two
-    /// catalogs do not share the same option ids.
+    /// Fall back to a legal target whenever the mode changes: base has no
+    /// `yue` option, so a precise-mode Cantonese selection must be replaced.
     static func validated(_ target: TranscriptionTarget, for mode: TranscriptionMode) -> TranscriptionTarget {
         targets(for: mode).first { $0.id == target.id } ?? defaultTarget(for: mode)
     }

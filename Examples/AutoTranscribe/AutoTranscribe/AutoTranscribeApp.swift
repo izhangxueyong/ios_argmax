@@ -1,5 +1,7 @@
 //  AutoTranscribe - on-device speech recognition demo
-//  Two bundled ASR modes + recording list; no model is downloaded at runtime.
+//  Two bundled WhisperKit models (whisper-base / large-v3-turbo),
+//  recording list, session archive and per-item model notes.
+//  No model is downloaded at runtime.
 
 import SwiftUI
 

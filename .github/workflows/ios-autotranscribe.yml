@@ -1,4 +1,4 @@
-name: "AutoTranscribe (per-item model notes + retranscribe with per-model languages)"
+name: "AutoTranscribe (ordinary Whisper Base + per-item notes and retranscribe)"
 
 on:
   push:
@@ -56,45 +56,53 @@ jobs:
           source "$RUNNER_TEMP/hf-venv/bin/activate"
           python -m pip install -q --upgrade huggingface_hub
           export MODELS_DIR="$GITHUB_WORKSPACE/Examples/AutoTranscribe/AutoTranscribe/Models"
-          mkdir -p "$MODELS_DIR/sensevoice-small" "$MODELS_DIR/whisper-turbo"
+          mkdir -p "$MODELS_DIR/whisper-base" "$MODELS_DIR/whisper-turbo"
           python - <<'PY'
           import os
-          from huggingface_hub import snapshot_download
+          import pathlib
+          import shutil
+          from huggingface_hub import HfApi, snapshot_download
 
           models = os.environ["MODELS_DIR"]
+          REPO = "argmaxinc/whisperkit-coreml"
 
-          # Ordinary mode: SenseVoiceSmall fp32 encoder works on both
-          # CPU-only simulators and Neural Engine devices.
-          snapshot_download(
-              repo_id="FluidInference/sensevoice-small-coreml",
-              local_dir=f"{models}/sensevoice-small",
-              allow_patterns=[
-                  "SenseVoicePreprocessor.mlmodelc/*",
-                  "SenseVoiceSmall_fp32.mlmodelc/*",
-                  "vocab.json",
-              ],
-          )
+          def fetch_flatten(folder, repo_subdir):
+              # Lift the model files to the folder root, which is the layout
+              # WhisperKitConfig(modelFolder:) expects.
+              dst = pathlib.Path(models) / folder
+              dst.mkdir(parents=True, exist_ok=True)
+              snapshot_download(
+                  repo_id=REPO,
+                  local_dir=str(dst),
+                  allow_patterns=[f"{repo_subdir}/*"],
+              )
+              src = dst / repo_subdir
+              if not src.is_dir():
+                  candidates = sorted({
+                      f.split("/")[0] for f in HfApi().list_repo_files(REPO)
+                      if "base" in f.lower() or "turbo" in f.lower()
+                  })
+                  raise RuntimeError(
+                      f"model folder {repo_subdir!r} missing in {REPO}; "
+                      f"available folders: {candidates}"
+                  )
+              for child in src.iterdir():
+                  target = dst / child.name
+                  if target.exists():
+                      shutil.rmtree(target) if target.is_dir() else target.unlink()
+                  shutil.move(str(child), str(target))
+              src.rmdir()
+              print(f"{folder}: {sorted(p.name for p in dst.iterdir())}")
 
-          # Precise mode: 632MB Large v3 Turbo, copied to the folder root
-          # that WhisperKitConfig(modelFolder:) expects.
-          turbo_dir = f"{models}/whisper-turbo/openai_whisper-large-v3-v20240930_turbo"
-          snapshot_download(
-              repo_id="argmaxinc/whisperkit-coreml",
-              local_dir=f"{models}/whisper-turbo",
-              allow_patterns=["openai_whisper-large-v3-v20240930_turbo/*"],
-          )
-          import pathlib, shutil
-          src = pathlib.Path(turbo_dir)
-          dst = pathlib.Path(f"{models}/whisper-turbo")
-          for child in src.iterdir():
-              target = dst / child.name
-              if target.exists():
-                  shutil.rmtree(target) if target.is_dir() else target.unlink()
-              shutil.move(str(child), str(target))
-          src.rmdir()
+          # Ordinary mode: 99-language original Whisper tokenizer (no yue).
+          fetch_flatten("whisper-base", "openai_whisper-base")
+          # Precise mode: 632MB large-v3-turbo, 100 languages incl. Cantonese.
+          fetch_flatten("whisper-turbo", "openai_whisper-large-v3-v20240930_turbo")
           PY
           echo "Bundled model sizes:"
-          du -sh "$MODELS_DIR/sensevoice-small" "$MODELS_DIR/whisper-turbo"
+          du -sh "$MODELS_DIR/whisper-base" "$MODELS_DIR/whisper-turbo"
+          echo "Whisper Base files:"
+          ls -1 "$MODELS_DIR/whisper-base"
 
       - name: Boot iOS Simulator
         run: |

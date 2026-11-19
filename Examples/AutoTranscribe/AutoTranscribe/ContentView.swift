@@ -1016,42 +1016,50 @@ struct ContentView: View {
         reviewTarget = .info(newestTap)
         await settleThenMark("item info · Whisper Turbo / 用时 / 语言方向", seconds: 6)
 
-        // 2) Retranscribe sheet in STANDARD mode: 6 SenseVoice languages.
+        // 2) STANDARD mode sheet: Whisper Base offers 99 languages, because
+        //    the original Whisper tokenizer has no Cantonese `yue`.
         retranscribeNote = ""
         retranscribeResult = nil
         retranscribeMode = .standard
-        let senseEnglish = LanguageCatalog.senseVoiceTargets.first { $0.id == "en" }
+        let baseEnglish = LanguageCatalog.baseTargets.first { $0.id == "en" }
             ?? LanguageCatalog.defaultTarget(for: .standard)
-        retranscribeTarget = senseEnglish
+        retranscribeTarget = baseEnglish
         reviewTarget = .retranscribe(newestTap)
-        await settleThenMark("重新转写 · 普通模式 · 6 种目标语言", seconds: 6)
+        await settleThenMark("重新转写 · 普通模式 Whisper Base · 99 种语言（不含粤语）", seconds: 6)
 
-        // 3) Switch to PRECISE mode: 100 Whisper languages + translate task.
+        // 3) PRECISE mode sheet: large-v3-turbo adds Cantonese -> 100 codes.
+        //    Selecting `yue` here makes the per-model difference visible.
         retranscribeMode = .precise
-        let translate = LanguageCatalog.whisperTargets.first { $0.id == "translate-en" }
+        let cantonese = LanguageCatalog.turboTargets.first { $0.id == "yue" }
+            ?? LanguageCatalog.defaultTarget(for: .precise)
+        retranscribeTarget = cantonese
+        await settleThenMark("重新转写 · 精准模式 Whisper Turbo · 100 种语言含粤语", seconds: 6)
+
+        // 4) Still precise mode: the X -> English translate task.
+        let translate = LanguageCatalog.turboTargets.first { $0.id == "translate-en" }
             ?? LanguageCatalog.defaultTarget(for: .precise)
         retranscribeTarget = translate
-        await settleThenMark("重新转写 · 精准模式 · 100 种语言 + 翻译为英文", seconds: 6)
+        await settleThenMark("重新转写 · 精准模式 · 翻译为英文", seconds: 5)
 
-        // 4) Actually re-run with SenseVoice + English.
+        // 5) Actually re-run with Whisper Base + English.
         retranscribeMode = .standard
-        retranscribeTarget = senseEnglish
-        await settleThenMark("开始重新转写 · SenseVoice-small · 英语", seconds: 2)
-        await performRetranscribe(item: newestTap, mode: .standard, target: senseEnglish)
+        retranscribeTarget = baseEnglish
+        await settleThenMark("开始重新转写 · Whisper Base · 英语", seconds: 2)
+        await performRetranscribe(item: newestTap, mode: .standard, target: baseEnglish)
         await settleThenMark("重新转写完成 · 结果与新模型", seconds: 6)
 
-        // 5) The note now shows the new model / timing / language direction.
+        // 6) The note now shows the new model / timing / language direction.
         let refreshed = store.item(with: newestTap.id) ?? newestTap
         reviewTarget = .info(refreshed)
-        await settleThenMark("备注已更新 · SenseVoice-small / 新用时 / 语言方向", seconds: 6)
+        await settleThenMark("备注已更新 · Whisper Base / 新用时 / 语言方向", seconds: 6)
 
-        // 6) Second real re-run: Whisper Turbo with the translate task.
+        // 7) Second real re-run: Whisper Turbo with the translate task.
         retranscribeNote = ""
         retranscribeResult = nil
         retranscribeMode = .precise
         retranscribeTarget = translate
         reviewTarget = .retranscribe(oldestTap)
-        await settleThenMark("重新转写 · 精准模式 · 翻译为英文", seconds: 5)
+        await settleThenMark("重新转写 · 另一条录音 · 精准模式翻译为英文", seconds: 5)
         await performRetranscribe(item: oldestTap, mode: .precise, target: translate)
         await settleThenMark("重新转写完成 · Whisper Turbo 翻译结果", seconds: 6)
 
@@ -1690,7 +1698,10 @@ struct RetranscribeView: View {
             Text("当前：\(effectiveTarget.title) · \(effectiveTarget.detail)")
                 .font(.caption)
                 .foregroundColor(.secondary)
-            Text("注意：转录按原语种输出；只有「翻译为英文」会跨语言输出，且仅精准模式支持。")
+            Text("注意：转录按原语种输出；只有「翻译为英文」会跨语言输出，两个 Whisper 模型都支持。")
+                .font(.caption2)
+                .foregroundColor(.secondary)
+            Text("语言种类按模型区分：普通 Whisper Base 99 种（不含粤语），精准 Turbo 100 种（含粤语）。")
                 .font(.caption2)
                 .foregroundColor(.secondary)
         }
