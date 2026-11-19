@@ -1,4 +1,4 @@
-name: "AutoTranscribe (session archive + full archived list, full run recording)"
+name: "AutoTranscribe (per-item model notes + retranscribe with per-model languages)"
 
 on:
   push:
@@ -142,7 +142,8 @@ jobs:
           rm -f "$DOCS/transcription_done.txt" "$DOCS/demo_done.txt" "$DOCS/progress.log" \
                 "$DOCS/recordings.json" "$DOCS/sessions.json" "$DOCS/archive_action.log" \
                 "$DOCS/archive_scroll_started.txt" "$DOCS/archive_scroll_step.txt" \
-                "$DOCS/archive_scroll_done.txt" "$DOCS/archive_list_full.png" 2>/dev/null || true
+                "$DOCS/archive_scroll_done.txt" "$DOCS/archive_list_full.png" \
+                "$DOCS/retranscribe_action.log" 2>/dev/null || true
 
           # Start recording BEFORE launch so the launch animation is captured.
           echo "Starting screen recording..."
@@ -239,8 +240,23 @@ jobs:
           python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print("sessions:", len(d)); [print(" -", s.get("title", "session#" + str(s.get("index"))), "archived=", s.get("isArchived"), "clips=", len(s.get("itemIDs", []))) for s in d]' "$DOCS/sessions.json" 2>/dev/null || echo "(sessions.json missing)"
           echo "=== checkmark archive actions ==="
           cat "$DOCS/archive_action.log" 2>/dev/null || echo "(missing)"
-          echo "=== saved recordings ==="
-          python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print("recordings:", len(d)); [print(" -", x.get("source"), x.get("name"), x.get("fileName"), "transcript=" + str(bool(x.get("transcript")))) for x in d]' "$DOCS/recordings.json" 2>/dev/null || echo "(recordings.json missing)"
+          echo "=== saved recordings (model / elapsed / language direction) ==="
+          python3 - "$DOCS/recordings.json" <<'PY' || echo "(recordings.json missing)"
+          import json, sys
+          data = json.load(open(sys.argv[1]))
+          print("recordings:", len(data))
+          for x in data:
+              m = x.get("transcription") or {}
+              print(" -", x.get("source"), x.get("name"), x.get("fileName"),
+                    "| model=", m.get("modelName"),
+                    "| elapsed=", m.get("elapsed"),
+                    "| direction=", m.get("sourceLanguage"), "->", m.get("targetLanguage"),
+                    "| task=", m.get("taskTitle"),
+                    "| retranscribed=", m.get("retranscribeCount"),
+                    "| transcript=", bool(x.get("transcript")))
+          PY
+          echo "=== retranscribe actions ==="
+          cat "$DOCS/retranscribe_action.log" 2>/dev/null || echo "(missing)"
           echo "=== progress.log ==="
           cat "$DOCS/progress.log" 2>/dev/null || echo "(missing)"
 

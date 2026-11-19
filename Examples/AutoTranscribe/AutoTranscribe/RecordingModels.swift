@@ -13,6 +13,158 @@ import AVFoundation
 import Foundation
 import SwiftUI
 
+// MARK: - Per-model language catalogs
+//
+// The two bundled ASR models do NOT support the same set of target languages:
+//   * SenseVoice-small (FluidAudio): auto + zh / en / yue / ja / ko, 6 options.
+//     Its `language` argument is the FunASR lid_dict embed index
+//     (auto=0, zh=1, en=2, yue=3, ja=4, ko=5).
+//   * Whisper large-v3-turbo (WhisperKit): every code in
+//     WhisperKit Constants.languages (100 codes, incl. yue) plus the
+//     built-in .translate task, which always emits English.
+// A retranscription picker must swap the whole list when the mode changes.
+
+struct TranscriptionTarget: Codable, Equatable, Hashable, Identifiable, Sendable {
+    var id: String
+    var title: String
+    var languageCode: String?
+    var isTranslation: Bool
+    var senseVoiceIndex: Int32?
+
+    var detail: String {
+        if isTranslation { return "语音翻译任务 · 输出英文" }
+        if languageCode == nil { return "自动检测源语言 · 按原语种输出" }
+        return "指定识别语言 · 按该语种输出"
+    }
+}
+
+struct TranscriptionMeta: Codable, Equatable, Sendable {
+    var modelName: String
+    var modeTitle: String
+    var modeRaw: String
+    var elapsed: TimeInterval
+    var sourceLanguage: String
+    var targetLanguage: String
+    var taskTitle: String
+    var retranscribeCount: Int
+    var finishedAt: Date
+
+    var direction: String { "\(sourceLanguage) → \(targetLanguage)" }
+    var elapsedTitle: String { String(format: "%.1f 秒", elapsed) }
+}
+
+enum LanguageCatalog {
+    /// Unique language codes from WhisperKit `Constants.languages`
+    /// (Sources/WhisperKit/Core/Models.swift). large-v3 added Cantonese `yue`.
+    static let whisperCodes: [String] = [
+        "af", "am", "ar", "as", "az", "ba", "be", "bg", "bn", "bo",
+        "br", "bs", "ca", "cs", "cy", "da", "de", "el", "en", "es",
+        "et", "eu", "fa", "fi", "fo", "fr", "gl", "gu", "ha", "haw",
+        "he", "hi", "hr", "ht", "hu", "hy", "id", "is", "it", "ja",
+        "jw", "ka", "kk", "km", "kn", "ko", "la", "lb", "ln", "lo",
+        "lt", "lv", "mg", "mi", "mk", "ml", "mn", "mr", "ms", "mt",
+        "my", "ne", "nl", "nn", "no", "oc", "pa", "pl", "ps", "pt",
+        "ro", "ru", "sa", "sd", "si", "sk", "sl", "sn", "so", "sq",
+        "sr", "su", "sv", "sw", "ta", "te", "tg", "th", "tk", "tl",
+        "tr", "tt", "uk", "ur", "uz", "vi", "yi", "yo", "yue", "zh"
+    ]
+
+    static let chineseNames: [String: String] = [
+        "af": "南非荷兰语", "am": "阿姆哈拉语", "ar": "阿拉伯语", "as": "阿萨姆语",
+        "az": "阿塞拜疆语", "ba": "巴什基尔语", "be": "白俄罗斯语", "bg": "保加利亚语",
+        "bn": "孟加拉语", "bo": "藏语", "br": "布列塔尼语", "bs": "波斯尼亚语",
+        "ca": "加泰罗尼亚语", "cs": "捷克语", "cy": "威尔士语", "da": "丹麦语",
+        "de": "德语", "el": "希腊语", "en": "英语", "es": "西班牙语",
+        "et": "爱沙尼亚语", "eu": "巴斯克语", "fa": "波斯语", "fi": "芬兰语",
+        "fo": "法罗语", "fr": "法语", "gl": "加利西亚语", "gu": "古吉拉特语",
+        "ha": "豪萨语", "haw": "夏威夷语", "he": "希伯来语", "hi": "印地语",
+        "hr": "克罗地亚语", "ht": "海地克里奥尔语", "hu": "匈牙利语", "hy": "亚美尼亚语",
+        "id": "印尼语", "is": "冰岛语", "it": "意大利语", "ja": "日语",
+        "jw": "爪哇语", "ka": "格鲁吉亚语", "kk": "哈萨克语", "km": "高棉语",
+        "kn": "卡纳达语", "ko": "韩语", "la": "拉丁语", "lb": "卢森堡语",
+        "ln": "林加拉语", "lo": "老挝语", "lt": "立陶宛语", "lv": "拉脱维亚语",
+        "mg": "马达加斯加语", "mi": "毛利语", "mk": "马其顿语", "ml": "马拉雅拉姆语",
+        "mn": "蒙古语", "mr": "马拉地语", "ms": "马来语", "mt": "马耳他语",
+        "my": "缅甸语", "ne": "尼泊尔语", "nl": "荷兰语", "nn": "新挪威语",
+        "no": "挪威语", "oc": "奥克语", "pa": "旁遮普语", "pl": "波兰语",
+        "ps": "普什图语", "pt": "葡萄牙语", "ro": "罗马尼亚语", "ru": "俄语",
+        "sa": "梵语", "sd": "信德语", "si": "僧伽罗语", "sk": "斯洛伐克语",
+        "sl": "斯洛文尼亚语", "sn": "绍纳语", "so": "索马里语", "sq": "阿尔巴尼亚语",
+        "sr": "塞尔维亚语", "su": "巽他语", "sv": "瑞典语", "sw": "斯瓦希里语",
+        "ta": "泰米尔语", "te": "泰卢固语", "tg": "塔吉克语", "th": "泰语",
+        "tk": "土库曼语", "tl": "他加禄语", "tr": "土耳其语", "tt": "鞑靼语",
+        "uk": "乌克兰语", "ur": "乌尔都语", "uz": "乌兹别克语", "vi": "越南语",
+        "yi": "意第绪语", "yo": "约鲁巴语", "yue": "粤语", "zh": "中文"
+    ]
+
+    static func displayName(for code: String?) -> String {
+        guard let code else { return "自动检测" }
+        let name = chineseNames[code] ?? code.uppercased()
+        return "\(name) (\(code))"
+    }
+
+    /// SenseVoice's language list is deliberately short: the model only has
+    /// five explicit language query embeddings besides auto detection.
+    static let senseVoiceTargets: [TranscriptionTarget] = [
+        TranscriptionTarget(id: "auto", title: "自动检测", languageCode: nil, isTranslation: false, senseVoiceIndex: 0),
+        TranscriptionTarget(id: "zh", title: "中文 (zh)", languageCode: "zh", isTranslation: false, senseVoiceIndex: 1),
+        TranscriptionTarget(id: "en", title: "英语 (en)", languageCode: "en", isTranslation: false, senseVoiceIndex: 2),
+        TranscriptionTarget(id: "yue", title: "粤语 (yue)", languageCode: "yue", isTranslation: false, senseVoiceIndex: 3),
+        TranscriptionTarget(id: "ja", title: "日语 (ja)", languageCode: "ja", isTranslation: false, senseVoiceIndex: 4),
+        TranscriptionTarget(id: "ko", title: "韩语 (ko)", languageCode: "ko", isTranslation: false, senseVoiceIndex: 5)
+    ]
+
+    static let whisperTargets: [TranscriptionTarget] = {
+        var list: [TranscriptionTarget] = [
+            TranscriptionTarget(id: "auto", title: "自动检测", languageCode: nil, isTranslation: false, senseVoiceIndex: nil)
+        ]
+        for code in whisperCodes {
+            list.append(TranscriptionTarget(
+                id: code,
+                title: displayName(for: code),
+                languageCode: code,
+                isTranslation: false,
+                senseVoiceIndex: nil
+            ))
+        }
+        // Whisper's .translate task is the only true cross-language option.
+        list.append(TranscriptionTarget(
+            id: "translate-en",
+            title: "翻译为英文 (en)",
+            languageCode: "en",
+            isTranslation: true,
+            senseVoiceIndex: nil
+        ))
+        return list
+    }()
+
+    static func targets(for mode: TranscriptionMode) -> [TranscriptionTarget] {
+        switch mode {
+        case .standard: return senseVoiceTargets
+        case .precise: return whisperTargets
+        }
+    }
+
+    static func countLabel(for mode: TranscriptionMode) -> String {
+        switch mode {
+        case .standard:
+            return "SenseVoice-small · 支持 \(senseVoiceTargets.count) 种语言（含自动检测）"
+        case .precise:
+            return "Whisper Turbo · 支持 \(whisperCodes.count) 种语言 + 翻译为英文"
+        }
+    }
+
+    static func defaultTarget(for mode: TranscriptionMode) -> TranscriptionTarget {
+        targets(for: mode)[0]
+    }
+
+    /// Fall back to a legal target whenever the mode changes, because the two
+    /// catalogs do not share the same option ids.
+    static func validated(_ target: TranscriptionTarget, for mode: TranscriptionMode) -> TranscriptionTarget {
+        targets(for: mode).first { $0.id == target.id } ?? defaultTarget(for: mode)
+    }
+}
+
 enum RecordingSource: String, Codable, CaseIterable, Sendable {
     case long
     case pushToTalk
@@ -46,6 +198,9 @@ struct RecordingItem: Codable, Identifiable, Sendable {
     var usesBundledSample: Bool
     var storedFileName: String?
     var transcript: String?
+    /// Model, elapsed time and language direction of the LAST transcription.
+    /// Optional so recordings.json written by older builds still decodes.
+    var transcription: TranscriptionMeta?
 
     init(
         id: UUID = UUID(),
@@ -56,7 +211,8 @@ struct RecordingItem: Codable, Identifiable, Sendable {
         waveform: [Double],
         usesBundledSample: Bool = false,
         storedFileName: String? = nil,
-        transcript: String? = nil
+        transcript: String? = nil,
+        transcription: TranscriptionMeta? = nil
     ) {
         self.id = id
         self.name = name
@@ -68,6 +224,13 @@ struct RecordingItem: Codable, Identifiable, Sendable {
         self.usesBundledSample = usesBundledSample
         self.storedFileName = storedFileName
         self.transcript = transcript
+        self.transcription = transcription
+    }
+
+    /// Short model badge shown on every archived row.
+    var modelBadge: String {
+        guard let meta = transcription else { return "未转写" }
+        return meta.modelName
     }
 }
 
@@ -311,6 +474,18 @@ final class RecordingStore: ObservableObject {
         guard let index = items.firstIndex(where: { $0.id == id }) else { return }
         items[index].transcript = text
         save()
+    }
+
+    /// Persist the transcript together with its model / timing / language metadata.
+    func updateTranscription(for id: UUID, text: String, meta: TranscriptionMeta) {
+        guard let index = items.firstIndex(where: { $0.id == id }) else { return }
+        items[index].transcript = text
+        items[index].transcription = meta
+        save()
+    }
+
+    func item(with id: UUID) -> RecordingItem? {
+        items.first { $0.id == id }
     }
 
     func bundledSample() -> RecordingItem? {

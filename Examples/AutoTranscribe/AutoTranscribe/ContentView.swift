@@ -7,10 +7,16 @@
 //   - The green checkmark button archives that session and opens a new one.
 //   - A session detail lists ALL hold-to-talk clips of that same session.
 //
+//  Every transcription records its model, wall-clock cost and source/target
+//  language. The exclamation-mark note shows those facts, and any item can be
+//  retranscribed with a different mode + target language (each model exposes
+//  its own language catalog).
+//
 //  --auto-run drives a scripted UI demo used by CI:
 //    standard mode: 3 hold-to-talk clips in one session, checkmark archive, tap record
 //    precise mode:  tap record, 2 hold-to-talk clips in a new session, checkmark, tap record
-//    then scroll the archived list screen by screen, open every session/result detail,
+//    open an item note, show both language catalogs, run two real retranscriptions,
+//    scroll the archived list screen by screen, open every session/result detail,
 //    and finally return to the home screen.
 
 import AVFoundation
@@ -23,6 +29,7 @@ struct ContentView: View {
     @StateObject private var service = TranscriptionService()
 
     @State private var selectedMode: TranscriptionMode = .standard
+    @State private var selectedTarget: TranscriptionTarget = LanguageCatalog.defaultTarget(for: .standard)
     @State private var stage: Stage = .idle
     @State private var detail = "等待选择录音"
     @State private var progress: Double = 0
@@ -37,9 +44,16 @@ struct ContentView: View {
     @State private var started = false
     @State private var checkPulse = false
 
-    // One sheet is used for both single-result and whole-session review.
+    // One sheet is used for result / session detail, item info and retranscribe.
     @State private var reviewTarget: ReviewTarget?
     @State private var demoReplaying = false
+
+    // Retranscription settings live here so the scripted CI demo can drive them.
+    @State private var retranscribeMode: TranscriptionMode = .standard
+    @State private var retranscribeTarget: TranscriptionTarget = LanguageCatalog.defaultTarget(for: .standard)
+    @State private var retranscribeBusy = false
+    @State private var retranscribeNote = ""
+    @State private var retranscribeResult: TranscriptionMeta?
 
     // ScrollViewReader anchor used by the scripted demo to reveal the full list.
     @State private var scrollAnchor = ""
@@ -58,11 +72,15 @@ struct ContentView: View {
     enum ReviewTarget: Identifiable {
         case item(RecordingItem)
         case session(RecordingSession)
+        case info(RecordingItem)
+        case retranscribe(RecordingItem)
 
         var id: String {
             switch self {
             case .item(let item): return "item-\(item.id.uuidString)"
             case .session(let session): return "session-\(session.id.uuidString)"
+            case .info(let item): return "info-\(item.id.uuidString)"
+            case .retranscribe(let item): return "retranscribe-\(item.id.uuidString)"
             }
         }
     }
@@ -109,7 +127,22 @@ struct ContentView: View {
                 ReviewSheet(
                     target: target,
                     sessionItems: sessionItems(for: target),
-                    isDemo: demoReplaying
+                    isDemo: demoReplaying,
+                    store: store,
+                    retranscribeMode: $retranscribeMode,
+                    retranscribeTarget: $retranscribeTarget,
+                    retranscribeBusy: retranscribeBusy,
+                    retranscribeNote: retranscribeNote,
+                    retranscribeResult: retranscribeResult,
+                    onInfo: { item in reviewTarget = .info(item) },
+                    onRetranscribe: { item in
+                        retranscribeNote = ""
+                        retranscribeResult = nil
+                        reviewTarget = .retranscribe(item)
+                    },
+                    onStartRetranscribe: { item, mode, chosen in
+                        Task { await performRetranscribe(item: item, mode: mode, target: chosen) }
+                    }
                 )
             }
             .task {
@@ -142,7 +175,14 @@ struct ContentView: View {
     private var modeCard: some View {
         VStack(alignment: .leading, spacing: 10) {
             Text("识别模式").font(.subheadline.bold())
-            Picker("识别模式", selection: $selectedMode) {
+            Picker("识别模式", selection: Binding(
+                get: { selectedMode },
+                set: { newMode in
+                    selectedMode = newMode
+                    // The two catalogs are different: never carry an illegal target over.
+                    selectedTarget = LanguageCatalog.defaultTarget(for: newMode)
+                }
+            )) {
                 ForEach(TranscriptionMode.allCases) { mode in
                     Text(mode.title).tag(mode)
                 }
@@ -161,6 +201,25 @@ struct ContentView: View {
                 }
                 Spacer()
             }
+
+            Divider()
+
+            HStack {
+                Text("目标语言").font(.caption.bold())
+                Spacer()
+                Picker("目标语言", selection: $selectedTarget) {
+                    ForEach(LanguageCatalog.targets(for: selectedMode)) { option in
+                        Text(option.title).tag(option)
+                    }
+                }
+                .pickerStyle(.menu)
+            }
+            Text(LanguageCatalog.countLabel(for: selectedMode))
+                .font(.caption2)
+                .foregroundColor(.blue)
+            Text(selectedTarget.detail + " · 点条目感叹号可重选模型与语言")
+                .font(.caption2)
+                .foregroundColor(.secondary)
         }
         .padding(14)
         .background(RoundedRectangle(cornerRadius: 14).fill(Color(.secondarySystemGroupedBackground)))
@@ -451,40 +510,43 @@ struct ContentView: View {
             total += clip.duration
         }
         let wave = WaveformExtractor.merged(clips, bars: 48)
-        return Button {
-            openSession(session)
-        } label: {
-            VStack(alignment: .leading, spacing: 9) {
-                HStack {
-                    Image(systemName: "checkmark.seal.fill")
-                        .foregroundColor(.green)
-                    Text(session.title)
-                        .font(.subheadline.bold())
-                    Spacer()
-                    Text("已归档")
-                        .font(.caption2.bold())
-                        .foregroundColor(.green)
-                }
-                HStack(spacing: 6) {
-                    Text("\(clips.count) 段按住说话")
-                        .font(.caption2)
-                        .foregroundColor(.secondary)
-                    Text("·").font(.caption2).foregroundColor(.secondary)
-                    Text(String(format: "总时长 %.1fs", total))
-                        .font(.caption2.monospacedDigit())
-                        .foregroundColor(.secondary)
-                    Spacer()
+        return VStack(alignment: .leading, spacing: 9) {
+            HStack {
+                Image(systemName: "checkmark.seal.fill")
+                    .foregroundColor(.green)
+                Text(session.title)
+                    .font(.subheadline.bold())
+                Spacer()
+                Text("已归档")
+                    .font(.caption2.bold())
+                    .foregroundColor(.green)
+            }
+            HStack(spacing: 6) {
+                Text("\(clips.count) 段按住说话")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+                Text("·").font(.caption2).foregroundColor(.secondary)
+                Text(String(format: "总时长 %.1fs", total))
+                    .font(.caption2.monospacedDigit())
+                    .foregroundColor(.secondary)
+                Spacer()
+                Button {
+                    openSession(session)
+                } label: {
                     Text("查看全部 →")
                         .font(.caption2.bold())
                         .foregroundColor(.blue)
                 }
+                .buttonStyle(.borderless)
+            }
 
-                WaveformView(samples: wave, color: .blue, height: 26, barCount: 40)
-                    .frame(maxWidth: .infinity)
+            WaveformView(samples: wave, color: .blue, height: 26, barCount: 40)
+                .frame(maxWidth: .infinity)
 
-                // Bubble thumbnails of every clip in this session.
-                ForEach(clips.indices, id: \.self) { index in
-                    let clip = clips[index]
+            // Every clip carries its own model badge + info / retranscribe actions.
+            ForEach(clips.indices, id: \.self) { index in
+                let clip = clips[index]
+                VStack(alignment: .trailing, spacing: 4) {
                     HStack {
                         Spacer(minLength: 30)
                         HStack(spacing: 6) {
@@ -504,12 +566,17 @@ struct ContentView: View {
                         .padding(.vertical, 6)
                         .background(Capsule().fill(Color.red.opacity(0.9)))
                     }
+                    ItemMetaRow(
+                        item: clip,
+                        onInfo: { openInfo(clip) },
+                        onRetranscribe: { openRetranscribe(clip) }
+                    )
+                    .frame(maxWidth: .infinity)
                 }
             }
-            .padding(12)
-            .background(RoundedRectangle(cornerRadius: 12).fill(Color(.secondarySystemGroupedBackground)))
         }
-        .buttonStyle(.plain)
+        .padding(12)
+        .background(RoundedRectangle(cornerRadius: 12).fill(Color(.secondarySystemGroupedBackground)))
     }
 
     // MARK: - Long / tap sections
@@ -519,23 +586,30 @@ struct ContentView: View {
         return VStack(alignment: .leading, spacing: 10) {
             Text("长录音").font(.subheadline.bold())
             ForEach(rows) { item in
-                Button { openResult(item) } label: {
-                    HStack(spacing: 10) {
-                        Image(systemName: "waveform.rectangle")
-                            .foregroundColor(.blue)
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(item.name).font(.subheadline.bold())
-                            Text(item.fileName).font(.caption2).foregroundColor(.secondary)
+                VStack(alignment: .leading, spacing: 8) {
+                    Button { openResult(item) } label: {
+                        HStack(spacing: 10) {
+                            Image(systemName: "waveform.rectangle")
+                                .foregroundColor(.blue)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(item.name).font(.subheadline.bold())
+                                Text(item.fileName).font(.caption2).foregroundColor(.secondary)
+                            }
+                            Spacer(minLength: 4)
+                            WaveformView(samples: item.waveform, color: .blue, height: 24, barCount: 20)
+                                .frame(width: 86)
+                            Text(durationText(item.duration)).font(.caption2).foregroundColor(.secondary)
                         }
-                        Spacer(minLength: 4)
-                        WaveformView(samples: item.waveform, color: .blue, height: 24, barCount: 20)
-                            .frame(width: 86)
-                        Text(durationText(item.duration)).font(.caption2).foregroundColor(.secondary)
                     }
-                    .padding(12)
-                    .background(RoundedRectangle(cornerRadius: 12).fill(Color(.secondarySystemGroupedBackground)))
+                    .buttonStyle(.plain)
+                    ItemMetaRow(
+                        item: item,
+                        onInfo: { openInfo(item) },
+                        onRetranscribe: { openRetranscribe(item) }
+                    )
                 }
-                .buttonStyle(.plain)
+                .padding(12)
+                .background(RoundedRectangle(cornerRadius: 12).fill(Color(.secondarySystemGroupedBackground)))
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -546,24 +620,31 @@ struct ContentView: View {
         return VStack(alignment: .leading, spacing: 10) {
             Text("单击录音").font(.subheadline.bold())
             ForEach(rows) { item in
-                Button { openResult(item) } label: {
-                    VStack(alignment: .leading, spacing: 6) {
-                        HStack {
-                            Image(systemName: "record.circle").foregroundColor(.red)
-                            Text(item.name).font(.subheadline.bold())
-                            Spacer()
-                            Text(durationText(item.duration)).font(.caption2).foregroundColor(.secondary)
-                        }
-                        Text(item.fileName).font(.caption2).foregroundColor(.secondary)
-                        WaveformView(samples: item.waveform, color: .red, height: 18, barCount: 40)
-                        if let text = item.transcript, !text.isEmpty {
-                            Text(text).font(.caption2).foregroundColor(.secondary).lineLimit(1)
+                VStack(alignment: .leading, spacing: 8) {
+                    Button { openResult(item) } label: {
+                        VStack(alignment: .leading, spacing: 6) {
+                            HStack {
+                                Image(systemName: "record.circle").foregroundColor(.red)
+                                Text(item.name).font(.subheadline.bold())
+                                Spacer()
+                                Text(durationText(item.duration)).font(.caption2).foregroundColor(.secondary)
+                            }
+                            Text(item.fileName).font(.caption2).foregroundColor(.secondary)
+                            WaveformView(samples: item.waveform, color: .red, height: 18, barCount: 40)
+                            if let text = item.transcript, !text.isEmpty {
+                                Text(text).font(.caption2).foregroundColor(.secondary).lineLimit(1)
+                            }
                         }
                     }
-                    .padding(12)
-                    .background(RoundedRectangle(cornerRadius: 12).fill(Color(.secondarySystemGroupedBackground)))
+                    .buttonStyle(.plain)
+                    ItemMetaRow(
+                        item: item,
+                        onInfo: { openInfo(item) },
+                        onRetranscribe: { openRetranscribe(item) }
+                    )
                 }
-                .buttonStyle(.plain)
+                .padding(12)
+                .background(RoundedRectangle(cornerRadius: 12).fill(Color(.secondarySystemGroupedBackground)))
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -583,9 +664,30 @@ struct ContentView: View {
         reviewTarget = .session(session)
     }
 
+    private func openInfo(_ item: RecordingItem) {
+        demoReplaying = false
+        reviewTarget = .info(item)
+    }
+
+    private func openRetranscribe(_ item: RecordingItem) {
+        demoReplaying = false
+        let initialMode: TranscriptionMode
+        if let raw = item.transcription?.modeRaw,
+           let parsed = TranscriptionMode(rawValue: raw) {
+            initialMode = parsed
+        } else {
+            initialMode = selectedMode
+        }
+        retranscribeMode = initialMode
+        retranscribeTarget = LanguageCatalog.defaultTarget(for: initialMode)
+        retranscribeNote = ""
+        retranscribeResult = nil
+        reviewTarget = .retranscribe(item)
+    }
+
     private func sessionItems(for target: ReviewTarget) -> [RecordingItem] {
         switch target {
-        case .item:
+        case .item, .info, .retranscribe:
             return []
         case .session(let session):
             return store.items(in: session)
@@ -689,30 +791,107 @@ struct ContentView: View {
         log("Imported: \(item.fileName)")
     }
 
+    /// Build the factual metadata shown in the item's exclamation-mark sheet.
+    private func makeMeta(
+        mode: TranscriptionMode,
+        target: TranscriptionTarget,
+        outcome: TranscriptionOutcome,
+        retranscribeCount: Int
+    ) -> TranscriptionMeta {
+        let source = outcome.sourceCode.map { LanguageCatalog.displayName(for: $0) } ?? "自动检测"
+        let targetTitle = target.isTranslation
+            ? "英语 (en) · 翻译输出"
+            : LanguageCatalog.displayName(for: target.languageCode)
+        return TranscriptionMeta(
+            modelName: mode.modelTitle,
+            modeTitle: mode.title,
+            modeRaw: mode.rawValue,
+            elapsed: outcome.elapsed,
+            sourceLanguage: source,
+            targetLanguage: targetTitle,
+            taskTitle: target.isTranslation ? "语音翻译" : "同语种转录",
+            retranscribeCount: retranscribeCount,
+            finishedAt: Date()
+        )
+    }
+
     private func transcribe(_ item: RecordingItem) async {
         guard let url = store.audioURL(for: item) else {
             setStage(.failed, detail: "找不到录音文件", progress: 0)
             return
         }
-        let start = Date()
+        let mode = selectedMode
+        let target = LanguageCatalog.validated(selectedTarget, for: mode)
         currentItemName = item.name
         transcript = ""
-        setStage(.loading, detail: "加载内置 \(selectedMode.modelTitle)…", progress: 0.1)
-        log("Transcribe start: \(item.fileName), mode=\(selectedMode.rawValue)")
+        setStage(.loading, detail: "加载内置 \(mode.modelTitle)…", progress: 0.1)
+        log("Transcribe start: \(item.fileName), mode=\(mode.rawValue), target=\(target.id)")
 
         do {
-            let text = try await service.transcribe(audioURL: url, mode: selectedMode)
-            transcript = text
-            store.updateTranscript(for: item.id, text: text)
-            let seconds = Date().timeIntervalSince(start)
-            setStage(.done, detail: "\(selectedMode.title) 完成，共 \(String(format: "%.1f", seconds)) 秒", progress: 1)
-            log("Transcribe finished: \(text)")
-            writeSentinel(status: "DONE", text: text, seconds: seconds)
+            let outcome = try await service.transcribe(audioURL: url, mode: mode, target: target)
+            transcript = outcome.text
+            let meta = makeMeta(
+                mode: mode,
+                target: target,
+                outcome: outcome,
+                retranscribeCount: item.transcription?.retranscribeCount ?? 0
+            )
+            store.updateTranscription(for: item.id, text: outcome.text, meta: meta)
+            setStage(.done, detail: "\(mode.title) · \(target.title) 完成，共 \(String(format: "%.1f", outcome.elapsed)) 秒", progress: 1)
+            log("Transcribe finished: model=\(meta.modelName), elapsed=\(meta.elapsed), \(meta.direction), text=\(outcome.text)")
+            writeSentinel(status: "DONE", text: outcome.text, seconds: outcome.elapsed)
         } catch {
             let msg = error.localizedDescription
             setStage(.failed, detail: msg, progress: 0)
             log("Transcribe failed: \(msg)")
-            writeSentinel(status: "FAILED", text: msg, seconds: Date().timeIntervalSince(start))
+            writeSentinel(status: "FAILED", text: msg, seconds: 0)
+        }
+    }
+
+    /// Re-run one archived item with a user-selected model + target language.
+    private func performRetranscribe(
+        item: RecordingItem,
+        mode: TranscriptionMode,
+        target: TranscriptionTarget
+    ) async {
+        guard let url = store.audioURL(for: item) else {
+            retranscribeNote = "找不到录音文件"
+            return
+        }
+        let validated = LanguageCatalog.validated(target, for: mode)
+        retranscribeBusy = true
+        retranscribeResult = nil
+        retranscribeNote = "正在用 \(mode.modelTitle) · \(validated.title) 重新转写…"
+        setStage(.loading, detail: retranscribeNote, progress: 0.15)
+        log("RETRANSCRIBE start: \(item.fileName), mode=\(mode.rawValue), target=\(validated.id)")
+
+        do {
+            let outcome = try await service.transcribe(audioURL: url, mode: mode, target: validated)
+            let meta = makeMeta(
+                mode: mode,
+                target: validated,
+                outcome: outcome,
+                retranscribeCount: (item.transcription?.retranscribeCount ?? 0) + 1
+            )
+            store.updateTranscription(for: item.id, text: outcome.text, meta: meta)
+            transcript = outcome.text
+            currentItemName = item.name
+            retranscribeResult = meta
+            retranscribeBusy = false
+            retranscribeNote = "✓ 重新转写完成 · \(meta.modelName) · \(meta.elapsedTitle)"
+            setStage(.done, detail: retranscribeNote, progress: 1)
+            log("RETRANSCRIBE done: \(item.fileName), model=\(meta.modelName), elapsed=\(meta.elapsed), \(meta.direction), text=\(outcome.text)")
+            writeText(
+                "\(item.fileName) retranscribed model=\(meta.modelName) target=\(validated.id) seconds=\(String(format: "%.1f", meta.elapsed))\n",
+                fileName: "retranscribe_action.log",
+                append: true
+            )
+        } catch {
+            let msg = error.localizedDescription
+            retranscribeBusy = false
+            retranscribeNote = "重新转写失败：\(msg)"
+            setStage(.failed, detail: retranscribeNote, progress: 0)
+            log("RETRANSCRIBE failed: \(msg)")
         }
     }
 
@@ -727,6 +906,7 @@ struct ContentView: View {
 
         // ---- Standard mode: three hold-to-talk clips in ONE session ----
         selectedMode = .standard
+        selectedTarget = LanguageCatalog.defaultTarget(for: .standard)
         await demoRecord(source: .pushToTalk, label: "普通 · 会话1 按住说话 1/3")
         await demoRecord(source: .pushToTalk, label: "普通 · 会话1 按住说话 2/3")
         await demoRecord(source: .pushToTalk, label: "普通 · 会话1 按住说话 3/3")
@@ -735,11 +915,15 @@ struct ContentView: View {
 
         // ---- Precise mode ----
         selectedMode = .precise
+        selectedTarget = LanguageCatalog.defaultTarget(for: .precise)
         await demoRecord(source: .tap, label: "精准 · 单击录音 1/2")
         await demoRecord(source: .pushToTalk, label: "精准 · 会话2 按住说话 1/2")
         await demoRecord(source: .pushToTalk, label: "精准 · 会话2 按住说话 2/2")
         await demoCheckmark(label: "精准 · 打勾归档会话2 / 新建会话3")
         await demoRecord(source: .tap, label: "精准 · 单击录音 2/2")
+
+        // ---- Item notes + retranscription, all captured by CI stills ----
+        await demoModelInfoFlow()
 
         // ---- Scroll down the archived list screen by screen ----
         await demoScrollArchivedList()
@@ -819,6 +1003,69 @@ struct ContentView: View {
         try? await Task.sleep(nanoseconds: 4_500_000_000)
         checkPulse = false
         try? await Task.sleep(nanoseconds: 400_000_000)
+    }
+
+    /// Show the exclamation-mark note, both per-model language catalogs and
+    /// two real retranscriptions in the CI recording.
+    private func demoModelInfoFlow() async {
+        let taps = store.items(for: .tap)
+        guard let newestTap = taps.first, let oldestTap = taps.last else { return }
+        demoReplaying = true
+
+        // 1) Note of a precise-mode item: model, elapsed, language direction.
+        reviewTarget = .info(newestTap)
+        await settleThenMark("item info · Whisper Turbo / 用时 / 语言方向", seconds: 6)
+
+        // 2) Retranscribe sheet in STANDARD mode: 6 SenseVoice languages.
+        retranscribeNote = ""
+        retranscribeResult = nil
+        retranscribeMode = .standard
+        let senseEnglish = LanguageCatalog.senseVoiceTargets.first { $0.id == "en" }
+            ?? LanguageCatalog.defaultTarget(for: .standard)
+        retranscribeTarget = senseEnglish
+        reviewTarget = .retranscribe(newestTap)
+        await settleThenMark("重新转写 · 普通模式 · 6 种目标语言", seconds: 6)
+
+        // 3) Switch to PRECISE mode: 100 Whisper languages + translate task.
+        retranscribeMode = .precise
+        let translate = LanguageCatalog.whisperTargets.first { $0.id == "translate-en" }
+            ?? LanguageCatalog.defaultTarget(for: .precise)
+        retranscribeTarget = translate
+        await settleThenMark("重新转写 · 精准模式 · 100 种语言 + 翻译为英文", seconds: 6)
+
+        // 4) Actually re-run with SenseVoice + English.
+        retranscribeMode = .standard
+        retranscribeTarget = senseEnglish
+        await settleThenMark("开始重新转写 · SenseVoice-small · 英语", seconds: 2)
+        await performRetranscribe(item: newestTap, mode: .standard, target: senseEnglish)
+        await settleThenMark("重新转写完成 · 结果与新模型", seconds: 6)
+
+        // 5) The note now shows the new model / timing / language direction.
+        let refreshed = store.item(with: newestTap.id) ?? newestTap
+        reviewTarget = .info(refreshed)
+        await settleThenMark("备注已更新 · SenseVoice-small / 新用时 / 语言方向", seconds: 6)
+
+        // 6) Second real re-run: Whisper Turbo with the translate task.
+        retranscribeNote = ""
+        retranscribeResult = nil
+        retranscribeMode = .precise
+        retranscribeTarget = translate
+        reviewTarget = .retranscribe(oldestTap)
+        await settleThenMark("重新转写 · 精准模式 · 翻译为英文", seconds: 5)
+        await performRetranscribe(item: oldestTap, mode: .precise, target: translate)
+        await settleThenMark("重新转写完成 · Whisper Turbo 翻译结果", seconds: 6)
+
+        reviewTarget = nil
+        demoReplaying = false
+        try? await Task.sleep(nanoseconds: 1_000_000_000)
+    }
+
+    /// Let a sheet finish presenting BEFORE bumping the marker, so the CI
+    /// watcher (which waits 2s) never captures a half-animated transition.
+    private func settleThenMark(_ label: String, seconds: UInt64) async {
+        try? await Task.sleep(nanoseconds: 1_500_000_000)
+        markScreen(label)
+        try? await Task.sleep(nanoseconds: seconds * 1_000_000_000)
     }
 
     /// Scroll the archived recording list one screen at a time so the whole
@@ -1005,6 +1252,11 @@ struct ArchiveSnapshotView: View {
     let tapItems: [RecordingItem]
     let totalCount: Int
 
+    private func metaLine(_ item: RecordingItem) -> String {
+        guard let meta = item.transcription else { return "未转写" }
+        return "\(meta.modelName) · \(meta.elapsedTitle) · \(meta.direction)"
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             VStack(alignment: .leading, spacing: 4) {
@@ -1013,6 +1265,9 @@ struct ArchiveSnapshotView: View {
                 Text("共 \(sections.count) 个已归档会话 · \(totalCount) 条录音 · 全部保存在本地")
                     .font(.caption)
                     .foregroundColor(.secondary)
+                Text("每条录音下方标注：使用模型 · 转写用时 · 源语言 → 目标语言")
+                    .font(.caption2)
+                    .foregroundColor(.blue)
             }
 
             ForEach(sections) { section in
@@ -1060,6 +1315,10 @@ struct ArchiveSnapshotView: View {
                         Text(clip.fileName)
                             .font(.caption2.monospacedDigit())
                             .foregroundColor(.secondary)
+                        Text(metaLine(clip))
+                            .font(.caption2)
+                            .foregroundColor(.blue)
+                            .lineLimit(1)
                     }
                     Spacer(minLength: 6)
                     WaveformView(samples: clip.waveform, color: .red, height: 18, barCount: 20)
@@ -1085,6 +1344,10 @@ struct ArchiveSnapshotView: View {
                         Text(item.fileName)
                             .font(.caption2.monospacedDigit())
                             .foregroundColor(.secondary)
+                        Text(metaLine(item))
+                            .font(.caption2)
+                            .foregroundColor(.blue)
+                            .lineLimit(1)
                     }
                     Spacer(minLength: 6)
                     WaveformView(samples: item.waveform, color: color, height: 18, barCount: 20)
@@ -1101,19 +1364,403 @@ struct ArchiveSnapshotView: View {
     }
 }
 
+// MARK: - Per-item model badge + info / retranscribe actions
+
+struct ItemMetaRow: View {
+    let item: RecordingItem
+    let onInfo: () -> Void
+    let onRetranscribe: () -> Void
+
+    var body: some View {
+        HStack(spacing: 6) {
+            HStack(spacing: 4) {
+                Image(systemName: "cpu")
+                    .font(.caption2)
+                Text(item.modelBadge)
+                    .font(.caption2.bold())
+                    .lineLimit(1)
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .background(Capsule().fill(item.transcription == nil ? Color.gray.opacity(0.18) : Color.blue.opacity(0.14)))
+            .foregroundColor(item.transcription == nil ? Color.secondary : Color.blue)
+
+            if let meta = item.transcription {
+                Text(meta.elapsedTitle)
+                    .font(.caption2.monospacedDigit())
+                    .foregroundColor(.secondary)
+            }
+            Spacer(minLength: 4)
+            Button(action: onInfo) {
+                Image(systemName: "exclamationmark.circle.fill")
+                    .font(.system(size: 19))
+                    .foregroundColor(.orange)
+            }
+            .buttonStyle(.borderless)
+            Button(action: onRetranscribe) {
+                Image(systemName: "arrow.clockwise.circle.fill")
+                    .font(.system(size: 19))
+                    .foregroundColor(.blue)
+            }
+            .buttonStyle(.borderless)
+        }
+    }
+}
+
 // MARK: - Review sheet dispatcher
 
 struct ReviewSheet: View {
     let target: ContentView.ReviewTarget
     let sessionItems: [RecordingItem]
     let isDemo: Bool
+    @ObservedObject var store: RecordingStore
+    @Binding var retranscribeMode: TranscriptionMode
+    @Binding var retranscribeTarget: TranscriptionTarget
+    let retranscribeBusy: Bool
+    let retranscribeNote: String
+    let retranscribeResult: TranscriptionMeta?
+    let onInfo: (RecordingItem) -> Void
+    let onRetranscribe: (RecordingItem) -> Void
+    let onStartRetranscribe: (RecordingItem, TranscriptionMode, TranscriptionTarget) -> Void
 
     var body: some View {
         Group {
-            if case .item(let item) = target {
-                ResultDetailView(item: item, isDemo: isDemo)
-            } else if case .session(let session) = target {
-                SessionDetailView(session: session, items: sessionItems, isDemo: isDemo)
+            switch target {
+            case .item(let item):
+                ResultDetailView(
+                    item: store.item(with: item.id) ?? item,
+                    isDemo: isDemo,
+                    store: store,
+                    onInfo: onInfo,
+                    onRetranscribe: onRetranscribe
+                )
+            case .session(let session):
+                SessionDetailView(
+                    session: session,
+                    items: sessionItems,
+                    isDemo: isDemo,
+                    store: store,
+                    onInfo: onInfo,
+                    onRetranscribe: onRetranscribe
+                )
+            case .info(let item):
+                ItemInfoView(
+                    item: store.item(with: item.id) ?? item,
+                    onRetranscribe: onRetranscribe
+                )
+            case .retranscribe(let item):
+                RetranscribeView(
+                    item: store.item(with: item.id) ?? item,
+                    mode: $retranscribeMode,
+                    target: $retranscribeTarget,
+                    busy: retranscribeBusy,
+                    note: retranscribeNote,
+                    result: retranscribeResult,
+                    onStart: { chosenMode, chosenTarget in
+                        onStartRetranscribe(item, chosenMode, chosenTarget)
+                    }
+                )
+            }
+        }
+    }
+}
+
+// MARK: - Exclamation-mark note: model, elapsed time, language direction
+
+struct ItemInfoView: View {
+    let item: RecordingItem
+    let onRetranscribe: (RecordingItem) -> Void
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    header
+                    if let meta = item.transcription {
+                        infoCard(meta)
+                    } else {
+                        Text("这条录音还没有转写记录，点下方按钮开始。")
+                            .font(.subheadline)
+                            .foregroundColor(.secondary)
+                    }
+                    transcriptCard
+                    Button {
+                        onRetranscribe(item)
+                    } label: {
+                        Label("重新转写（可换模型与语言）", systemImage: "arrow.clockwise.circle.fill")
+                            .font(.subheadline.bold())
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.borderedProminent)
+                }
+                .padding(20)
+            }
+            .background(Color(.systemGroupedBackground))
+            .navigationTitle("备注详情")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("返回") { dismiss() }
+                }
+            }
+        }
+    }
+
+    private var header: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Image(systemName: "exclamationmark.circle.fill")
+                    .foregroundColor(.orange)
+                Text("备注 · 转写信息").font(.title3.bold())
+            }
+            Text(item.name).font(.subheadline.bold())
+            Text("文件：\(item.fileName)")
+                .font(.caption.monospacedDigit())
+                .foregroundColor(.secondary)
+            Text("来源：\(item.source.sectionTitle)　时长：\(String(format: "%.1f", item.duration)) 秒")
+                .font(.caption)
+                .foregroundColor(.secondary)
+        }
+    }
+
+    private var transcriptCard: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Label("当前转写内容", systemImage: "text.bubble.fill")
+                .font(.subheadline.bold())
+            Text(item.transcript ?? "（暂无转写内容）")
+                .font(.body)
+                .frame(maxWidth: .infinity, minHeight: 90, alignment: .topLeading)
+                .padding(12)
+                .background(RoundedRectangle(cornerRadius: 12).fill(Color(.secondarySystemGroupedBackground)))
+        }
+    }
+
+    private func infoCard(_ meta: TranscriptionMeta) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Label("本次转写记录", systemImage: "cpu")
+                .font(.headline)
+            infoRow("使用模型", meta.modelName)
+            infoRow("识别模式", meta.modeTitle)
+            infoRow("转写用时", meta.elapsedTitle)
+            Divider()
+            infoRow("源语言（检测）", meta.sourceLanguage)
+            infoRow("目标语言", meta.targetLanguage)
+            infoRow("语言方向", meta.direction)
+            infoRow("任务类型", meta.taskTitle)
+            Divider()
+            infoRow("重新转写次数", "\(meta.retranscribeCount) 次")
+            infoRow("完成时间", Self.timeString(meta.finishedAt))
+        }
+        .padding(14)
+        .background(RoundedRectangle(cornerRadius: 12).fill(Color(.secondarySystemGroupedBackground)))
+    }
+
+    private func infoRow(_ title: String, _ value: String) -> some View {
+        HStack(alignment: .top, spacing: 8) {
+            Text(title)
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .frame(width: 100, alignment: .leading)
+            Text(value)
+                .font(.caption.bold())
+            Spacer(minLength: 0)
+        }
+    }
+
+    private static func timeString(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HH:mm:ss"
+        return formatter.string(from: date)
+    }
+}
+
+// MARK: - Retranscribe: mode + per-model target language catalog
+
+struct RetranscribeView: View {
+    let item: RecordingItem
+    @Binding var mode: TranscriptionMode
+    @Binding var target: TranscriptionTarget
+    let busy: Bool
+    let note: String
+    let result: TranscriptionMeta?
+    let onStart: (TranscriptionMode, TranscriptionTarget) -> Void
+    @Environment(\.dismiss) private var dismiss
+
+    private var options: [TranscriptionTarget] { LanguageCatalog.targets(for: mode) }
+    private var effectiveTarget: TranscriptionTarget { LanguageCatalog.validated(target, for: mode) }
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    header
+                    currentCard
+                    modeSection
+                    languageSection
+                    previewSection
+                    if let meta = result {
+                        resultCard(meta)
+                    }
+                    actionSection
+                }
+                .padding(20)
+            }
+            .background(Color(.systemGroupedBackground))
+            .navigationTitle("重新转写")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("返回") { dismiss() }
+                }
+            }
+        }
+    }
+
+    private var header: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Image(systemName: "arrow.clockwise.circle.fill")
+                    .foregroundColor(.blue)
+                Text("重新转写").font(.title3.bold())
+            }
+            Text("\(item.name) · \(item.fileName)")
+                .font(.caption.monospacedDigit())
+                .foregroundColor(.secondary)
+            Text("切换模式会整体替换可选目标语言，因为两个模型支持的语言不同。")
+                .font(.caption2)
+                .foregroundColor(.secondary)
+        }
+    }
+
+    private var currentCard: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Label("上一次转写", systemImage: "clock.arrow.circlepath")
+                .font(.subheadline.bold())
+            if let meta = item.transcription {
+                Text("模型：\(meta.modelName)").font(.caption)
+                Text("用时：\(meta.elapsedTitle)").font(.caption)
+                Text("语言：\(meta.direction)").font(.caption)
+                Text("任务：\(meta.taskTitle)").font(.caption)
+            } else {
+                Text("（暂无转写记录）").font(.caption).foregroundColor(.secondary)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(12)
+        .background(RoundedRectangle(cornerRadius: 12).fill(Color(.secondarySystemGroupedBackground)))
+    }
+
+    private var modeSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("1 · 选择识别模式").font(.subheadline.bold())
+            Picker("识别模式", selection: Binding(
+                get: { mode },
+                set: { newMode in
+                    mode = newMode
+                    target = LanguageCatalog.defaultTarget(for: newMode)
+                }
+            )) {
+                ForEach(TranscriptionMode.allCases) { option in
+                    Text(option.title).tag(option)
+                }
+            }
+            .pickerStyle(.segmented)
+            Text("模型：\(mode.modelTitle) · Models/\(mode.folderName)")
+                .font(.caption2)
+                .foregroundColor(.secondary)
+        }
+    }
+
+    private var languageSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("2 · 选择目标语言").font(.subheadline.bold())
+            Picker("目标语言", selection: Binding(
+                get: { effectiveTarget },
+                set: { newTarget in target = newTarget }
+            )) {
+                ForEach(options) { option in
+                    Text(option.title).tag(option)
+                }
+            }
+            .pickerStyle(.menu)
+            Text(LanguageCatalog.countLabel(for: mode))
+                .font(.caption.bold())
+                .foregroundColor(.blue)
+            Text("当前：\(effectiveTarget.title) · \(effectiveTarget.detail)")
+                .font(.caption)
+                .foregroundColor(.secondary)
+            Text("注意：转录按原语种输出；只有「翻译为英文」会跨语言输出，且仅精准模式支持。")
+                .font(.caption2)
+                .foregroundColor(.secondary)
+        }
+    }
+
+    private var previewSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("该模型可选目标语言 · 共 \(options.count) 项").font(.subheadline.bold())
+            let shown = Array(options.prefix(12))
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 92), spacing: 8)], spacing: 8) {
+                ForEach(shown) { option in
+                    Text(option.title)
+                        .font(.caption2)
+                        .lineLimit(1)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 5)
+                        .background(Capsule().fill(
+                            option.id == effectiveTarget.id
+                                ? Color.blue.opacity(0.22)
+                                : Color.gray.opacity(0.13)
+                        ))
+                }
+            }
+            if options.count > shown.count {
+                Text("…另有 \(options.count - shown.count) 种，可在上方选择器滚动查看")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+            }
+        }
+        .padding(12)
+        .background(RoundedRectangle(cornerRadius: 12).fill(Color(.secondarySystemGroupedBackground)))
+    }
+
+    private func resultCard(_ meta: TranscriptionMeta) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Label("重新转写完成", systemImage: "checkmark.circle.fill")
+                .font(.subheadline.bold())
+                .foregroundColor(.green)
+            Text("模型：\(meta.modelName)").font(.caption.bold())
+            Text("用时：\(meta.elapsedTitle)").font(.caption)
+            Text("语言：\(meta.direction)").font(.caption)
+            Text("任务：\(meta.taskTitle)").font(.caption)
+            Text("新结果：\(item.transcript ?? "（空）")")
+                .font(.caption2)
+                .foregroundColor(.secondary)
+                .lineLimit(3)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(12)
+        .background(RoundedRectangle(cornerRadius: 12).fill(Color.green.opacity(0.10)))
+    }
+
+    private var actionSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Button {
+                onStart(mode, effectiveTarget)
+            } label: {
+                HStack(spacing: 8) {
+                    if busy { ProgressView() }
+                    Text(busy ? "正在重新转写…" : "开始重新转写")
+                        .font(.subheadline.bold())
+                }
+                .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(busy)
+            if !note.isEmpty {
+                Text(note)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
             }
         }
     }
@@ -1124,6 +1771,9 @@ struct ReviewSheet: View {
 struct ResultDetailView: View {
     let item: RecordingItem
     var isDemo: Bool = false
+    @ObservedObject var store: RecordingStore
+    let onInfo: (RecordingItem) -> Void
+    let onRetranscribe: (RecordingItem) -> Void
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
@@ -1142,6 +1792,35 @@ struct ResultDetailView: View {
                         Text("来源：\(item.source.sectionTitle)　时长：\(String(format: "%.1f", item.duration)) 秒")
                             .font(.caption)
                             .foregroundColor(.secondary)
+                    }
+
+                    if let meta = item.transcription {
+                        VStack(alignment: .leading, spacing: 6) {
+                            Label("转写记录", systemImage: "cpu")
+                                .font(.subheadline.bold())
+                            Text("模型：\(meta.modelName)").font(.caption.bold())
+                            Text("用时：\(meta.elapsedTitle)").font(.caption)
+                            Text("语言：\(meta.direction)").font(.caption)
+                            Text("任务：\(meta.taskTitle) · 已重转 \(meta.retranscribeCount) 次")
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(12)
+                        .background(RoundedRectangle(cornerRadius: 12).fill(Color.blue.opacity(0.08)))
+                    }
+
+                    HStack(spacing: 12) {
+                        Button { onInfo(item) } label: {
+                            Label("备注详情", systemImage: "exclamationmark.circle.fill")
+                                .font(.caption.bold())
+                        }
+                        .buttonStyle(.bordered)
+                        Button { onRetranscribe(item) } label: {
+                            Label("重新转写", systemImage: "arrow.clockwise.circle.fill")
+                                .font(.caption.bold())
+                        }
+                        .buttonStyle(.borderedProminent)
                     }
 
                     VStack(alignment: .leading, spacing: 8) {
@@ -1193,6 +1872,9 @@ struct SessionDetailView: View {
     let session: RecordingSession
     let items: [RecordingItem]
     var isDemo: Bool = false
+    @ObservedObject var store: RecordingStore
+    let onInfo: (RecordingItem) -> Void
+    let onRetranscribe: (RecordingItem) -> Void
     @Environment(\.dismiss) private var dismiss
 
     private var totalDuration: Double {
@@ -1252,6 +1934,7 @@ struct SessionDetailView: View {
                     Text("本会话全部说话录音").font(.subheadline.bold())
                     ForEach(items.indices, id: \.self) { index in
                         let clip = items[index]
+                        let fresh = store.item(with: clip.id) ?? clip
                         VStack(alignment: .trailing, spacing: 6) {
                             HStack {
                                 Text("第 \(index + 1) 段 · \(clip.name)")
@@ -1275,16 +1958,22 @@ struct SessionDetailView: View {
                                     .padding(.horizontal, 12)
                                     .padding(.vertical, 9)
                                     .background(RoundedRectangle(cornerRadius: 16).fill(Color.red.opacity(0.92)))
-                                    Text("文件：\(clip.fileName)")
+                                    Text("文件：\(fresh.fileName)")
                                         .font(.caption2.monospacedDigit())
                                         .foregroundColor(.secondary)
                                 }
                             }
-                            Text(clip.transcript ?? "（暂无转写）")
+                            Text(fresh.transcript ?? "（暂无转写）")
                                 .font(.caption)
                                 .frame(maxWidth: .infinity, alignment: .leading)
                                 .padding(10)
                                 .background(RoundedRectangle(cornerRadius: 10).fill(Color(.secondarySystemGroupedBackground)))
+                            ItemMetaRow(
+                                item: fresh,
+                                onInfo: { onInfo(fresh) },
+                                onRetranscribe: { onRetranscribe(fresh) }
+                            )
+                            .frame(maxWidth: .infinity)
                         }
                         .padding(10)
                         .background(RoundedRectangle(cornerRadius: 12).stroke(Color.red.opacity(0.25), lineWidth: 1))
