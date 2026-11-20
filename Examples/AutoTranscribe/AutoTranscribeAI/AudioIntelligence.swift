@@ -21,6 +21,16 @@ public struct VoiceSegment: Codable, Equatable, Sendable {
     public var end: Double
     public var isMe: Bool
     public var similarity: Double
+
+    // Swift's synthesized memberwise init is `internal`, so the app target
+    // cannot see it across the module boundary (it would only find the
+    // Decodable `init(from:)`). Declare the ones we expose explicitly.
+    public init(start: Double, end: Double, isMe: Bool, similarity: Double) {
+        self.start = start
+        self.end = end
+        self.isMe = isMe
+        self.similarity = similarity
+    }
 }
 
 public struct AudioAnalysis: Codable, Equatable, Sendable {
@@ -28,6 +38,13 @@ public struct AudioAnalysis: Codable, Equatable, Sendable {
     public var segments: [VoiceSegment]
     public var speakerDimension: Int
     public var engineNote: String
+
+    public init(duration: Double, segments: [VoiceSegment], speakerDimension: Int, engineNote: String) {
+        self.duration = duration
+        self.segments = segments
+        self.speakerDimension = speakerDimension
+        self.engineNote = engineNote
+    }
 }
 
 public struct SearchHit: Codable, Equatable, Sendable, Identifiable {
@@ -35,6 +52,13 @@ public struct SearchHit: Codable, Equatable, Sendable, Identifiable {
     public var title: String
     public var snippet: String
     public var score: Double
+
+    public init(id: String, title: String, snippet: String, score: Double) {
+        self.id = id
+        self.title = title
+        self.snippet = snippet
+        self.score = score
+    }
 }
 
 public struct IndexedDocument: Codable, Equatable, Sendable {
@@ -42,6 +66,13 @@ public struct IndexedDocument: Codable, Equatable, Sendable {
     public var title: String
     public var text: String
     public var vector: [Float]
+
+    public init(id: String, title: String, text: String, vector: [Float]) {
+        self.id = id
+        self.title = title
+        self.text = text
+        self.vector = vector
+    }
 }
 
 public final class AudioIntelligence: @unchecked Sendable {
