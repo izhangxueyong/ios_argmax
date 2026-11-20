@@ -10,6 +10,7 @@
 //     session detail shows ALL of its hold-to-talk clips in one view.
 
 import AVFoundation
+import AutoTranscribeAI
 import Foundation
 import SwiftUI
 
@@ -229,6 +230,13 @@ struct RecordingItem: Codable, Identifiable, Sendable {
     /// Model, elapsed time and language facts of the LAST transcription.
     /// Optional so recordings.json written by older builds still decodes.
     var transcription: TranscriptionMeta?
+    /// Silero VAD speech ranges + CAMPPlus "is it me?" verdict per range.
+    var voiceTimeline: AudioAnalysis?
+    /// SenseVoiceSmall int8 on-device recognition of the same clip.
+    var senseVoiceText: String?
+    var senseVoiceLanguage: String?
+    /// EmbeddingGemma sentence vector used by the archive semantic search.
+    var searchVector: [Float]?
 
     init(
         id: UUID = UUID(),
@@ -241,7 +249,11 @@ struct RecordingItem: Codable, Identifiable, Sendable {
         storedFileName: String? = nil,
         transcript: String? = nil,
         holdLanguageCode: String? = nil,
-        transcription: TranscriptionMeta? = nil
+        transcription: TranscriptionMeta? = nil,
+        voiceTimeline: AudioAnalysis? = nil,
+        senseVoiceText: String? = nil,
+        senseVoiceLanguage: String? = nil,
+        searchVector: [Float]? = nil
     ) {
         self.id = id
         self.name = name
@@ -255,6 +267,10 @@ struct RecordingItem: Codable, Identifiable, Sendable {
         self.transcript = transcript
         self.holdLanguageCode = holdLanguageCode
         self.transcription = transcription
+        self.voiceTimeline = voiceTimeline
+        self.senseVoiceText = senseVoiceText
+        self.senseVoiceLanguage = senseVoiceLanguage
+        self.searchVector = searchVector
     }
 
     /// Short model badge shown on every archived row.
@@ -513,6 +529,26 @@ final class RecordingStore: ObservableObject {
         guard let index = items.firstIndex(where: { $0.id == id }) else { return }
         items[index].transcript = text
         items[index].transcription = meta
+        save()
+    }
+
+    /// Persist the VAD timeline and CAMPPlus speaker verdict for an item.
+    func updateAnalysis(for id: UUID, analysis: AudioAnalysis) {
+        guard let index = items.firstIndex(where: { $0.id == id }) else { return }
+        items[index].voiceTimeline = analysis
+        save()
+    }
+
+    func updateSenseVoice(for id: UUID, text: String, language: String) {
+        guard let index = items.firstIndex(where: { $0.id == id }) else { return }
+        items[index].senseVoiceText = text
+        items[index].senseVoiceLanguage = language
+        save()
+    }
+
+    func updateSearchVector(for id: UUID, vector: [Float]) {
+        guard let index = items.firstIndex(where: { $0.id == id }) else { return }
+        items[index].searchVector = vector
         save()
     }
 

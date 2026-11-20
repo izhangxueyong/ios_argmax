@@ -19,6 +19,14 @@
 //  retranscribed with a different mode + language (each model exposes its own
 //  language catalog).
 //
+//  Four extra bundled checkpoints drive the timeline and archive search:
+//   - Silero VAD int8 marks speech ranges on a thin per-item progress bar.
+//   - CAMPPlus compares each range to a mock enrolled "my voice" print and
+//     colors it green (me) or orange (someone else).
+//   - SenseVoiceSmall int8 gives an on-device second transcript.
+//   - EmbeddingGemma Q8_0 GGUF provides 768-d sentence vectors so the archive
+//     can be searched by meaning rather than by keyword.
+//
 //  --auto-run drives a scripted UI demo used by CI:
 //    standard mode: 3 hold-to-talk clips in one session, checkbox archive, tap record
 //    precise mode:  tap record, 2 hold-to-talk clips in a new session, checkbox, tap record
@@ -28,6 +36,7 @@
 //    and finally return to the home screen.
 
 import AVFoundation
+import AutoTranscribeAI
 import SwiftUI
 import UIKit
 import UniformTypeIdentifiers
@@ -72,6 +81,18 @@ struct ContentView: View {
     // Monotonic screen marker: CI screenshots every new value.
     @State private var shotStep = 0
 
+    // Four extra on-device checkpoints: VAD timeline, CAMPPlus speaker tags,
+    // SenseVoice recognition and EmbeddingGemma archive search.
+    @State private var aiStatusLines: [String] = []
+    @State private var aiModelLoaded = false
+    @State private var enrolledVoiceDimension = 0
+    @State private var senseVoicePreview = ""
+    @State private var senseVoiceLanguage = ""
+    @State private var searchQuery = ""
+    @State private var searchHits: [SearchHit] = []
+    @State private var indexedDocumentCount = 0
+    @State private var searchEngineNote = "尚未建立索引"
+
     enum Stage: String {
         case idle = "准备就绪"
         case recording = "录音中"
@@ -108,7 +129,9 @@ struct ContentView: View {
                         sessionCard.id("session-card")
                         statusCard.id("status")
                         resultCard.id("result")
+                        aiModelsCard.id("ai-models")
                         recordingList.id("archive-list")
+                        semanticSearchCard.id("semantic-search")
                         longSection.id("section-long")
                         tapSection.id("section-tap")
                         Color.clear.frame(height: 40).id("list-bottom")
@@ -557,6 +580,111 @@ struct ContentView: View {
             }
         }
         .padding(14)
+        .background(RoundedRectangle(cornerRadius: 14).fill(Color(.secondarySystemGroupedBackground)))
+    }
+
+    // MARK: - Four bundled on-device models
+
+    private var aiModelsCard: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Label("端侧四模型状态", systemImage: "square.stack.3d.up.fill")
+                    .font(.headline)
+                Spacer()
+                Text(aiModelLoaded ? "全部就绪" : "待加载")
+                    .font(.caption2.bold())
+                    .foregroundColor(aiModelLoaded ? .green : .secondary)
+            }
+            Text("SenseVoiceSmall int8 · Silero VAD int8 · CAMPPlus 声纹 · EmbeddingGemma Q8_0")
+                .font(.caption2)
+                .foregroundColor(.secondary)
+            ForEach(aiStatusLines, id: \.self) { line in
+                Text(line)
+                    .font(.caption2.monospacedDigit())
+                    .foregroundColor(line.hasPrefix("MISSING") || line.contains("FAILED") ? .orange : .secondary)
+                    .lineLimit(1)
+            }
+            Divider()
+            HStack(spacing: 6) {
+                Image(systemName: "person.badge.key.fill").foregroundColor(.purple)
+                Text(enrolledVoiceDimension > 0
+                     ? "已模拟注册「我的声纹」· CAMPPlus \(enrolledVoiceDimension) 维参考向量"
+                     : "尚未注册声纹")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+            }
+            Text("进度条：灰色=静音，绿色=有语音且是我，橙色=有语音且是他人")
+                .font(.caption2)
+                .foregroundColor(.blue)
+            if !senseVoicePreview.isEmpty {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("SenseVoice 端侧识别 · 语言 \(senseVoiceLanguage.isEmpty ? "auto" : senseVoiceLanguage)")
+                        .font(.caption2.bold())
+                        .foregroundColor(.teal)
+                    Text(senseVoicePreview)
+                        .font(.caption)
+                        .lineLimit(3)
+                }
+            }
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 14).fill(Color(.secondarySystemGroupedBackground)))
+    }
+
+    private var semanticSearchCard: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Label("归档语义搜索", systemImage: "magnifyingglass.circle.fill")
+                    .font(.headline)
+                Spacer()
+                Text("EmbeddingGemma 768 维")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+            }
+            HStack {
+                Image(systemName: "magnifyingglass").foregroundColor(.secondary)
+                TextField("输入自然语言查询，例如 what can I do for my country", text: $searchQuery)
+                    .font(.caption)
+                    .textFieldStyle(.plain)
+                    .onSubmit { Task { await runSemanticSearch(searchQuery) } }
+                Button("搜索") { Task { await runSemanticSearch(searchQuery) } }
+                    .font(.caption.bold())
+                    .buttonStyle(.borderless)
+            }
+            .padding(9)
+            .background(RoundedRectangle(cornerRadius: 9).fill(Color(.tertiarySystemGroupedBackground)))
+            Text("\(searchEngineNote) · 已索引 \(indexedDocumentCount) 条归档 · 按向量余弦相似度排序")
+                .font(.caption2)
+                .foregroundColor(.blue)
+            if searchHits.isEmpty {
+                Text("输入查询后可看到最相关的归档录音")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+            } else {
+                ForEach(searchHits.indices, id: \.self) { index in
+                    let hit = searchHits[index]
+                    HStack(alignment: .top, spacing: 8) {
+                        Text("\(index + 1)")
+                            .font(.caption2.bold().monospacedDigit())
+                            .foregroundColor(.white)
+                            .frame(width: 20, height: 20)
+                            .background(Circle().fill(index == 0 ? Color.orange : Color.gray))
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(hit.title).font(.caption.bold())
+                            Text(hit.snippet).font(.caption2).foregroundColor(.secondary).lineLimit(2)
+                        }
+                        Spacer(minLength: 4)
+                        Text(String(format: "%.3f", hit.score))
+                            .font(.caption2.monospacedDigit())
+                            .foregroundColor(.orange)
+                    }
+                    .padding(.vertical, 3)
+                }
+            }
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .background(RoundedRectangle(cornerRadius: 14).fill(Color(.secondarySystemGroupedBackground)))
     }
 
@@ -1027,6 +1155,10 @@ struct ContentView: View {
         markScreen("home controls · 待机色 / 双语言按住按钮 / 新开会话勾选框")
         try? await Task.sleep(nanoseconds: 6_000_000_000)
 
+        // Load all four bundled checkpoints, enroll a mock "my voice" print
+        // and probe SenseVoice before any clip is recorded.
+        await prepareAIModels()
+
         // ---- Standard mode: three hold-to-talk clips in ONE session ----
         // The two speakers alternate: ① Chinese, ② English, ① Chinese.
         selectedMode = .standard
@@ -1048,6 +1180,9 @@ struct ContentView: View {
 
         // ---- Item notes + "wrong language -> pick again" retranscriptions ----
         await demoModelInfoFlow()
+
+        // ---- EmbeddingGemma index + real semantic queries ----
+        await demoSemanticSearch()
 
         // ---- Scroll down the archived list screen by screen ----
         await demoScrollArchivedList()
@@ -1117,6 +1252,8 @@ struct ContentView: View {
         try? await Task.sleep(nanoseconds: 400_000_000)
         currentItemName = item.name
         await transcribe(item)
+        // Silero VAD timeline + CAMPPlus speaker verdict + SenseVoice text.
+        await analyzeRecording(item, audioURL: sampleURL)
         try? await Task.sleep(nanoseconds: 800_000_000)
     }
 
@@ -1221,7 +1358,7 @@ struct ContentView: View {
         log("DEMO archive scroll started")
         exportArchiveSnapshot()
 
-        var anchors: [String] = ["session-card", "archive-list"]
+        var anchors: [String] = ["session-card", "ai-models", "archive-list", "semantic-search"]
         for session in store.archivedSessions {
             anchors.append("archive-session-\(session.index)")
         }
@@ -1272,6 +1409,114 @@ struct ContentView: View {
             try? await Task.sleep(nanoseconds: 600_000_000)
         }
         demoReplaying = false
+    }
+
+    // MARK: - On-device AI helpers (SenseVoice / VAD / CAMPPlus / EmbeddingGemma)
+
+    private func prepareAIModels() async {
+        let ai = AudioIntelligence.shared
+        ai.configure()
+        ai.enrollMockVoice()
+        aiStatusLines = ai.statusLines
+        aiModelLoaded = ai.statusLines.filter { $0.hasPrefix("OK") }.count >= 5
+        enrolledVoiceDimension = ai.registeredVoiceDimension
+        for line in ai.statusLines { log("AI model: \(line)") }
+        log("AI encoder: \(ai.encoderInfo)")
+
+        if let sample = Bundle.main.url(forResource: "recording", withExtension: "wav") {
+            let probe = ai.senseVoiceTranscribe(audioURL: sample)
+            if !probe.text.isEmpty {
+                senseVoicePreview = probe.text
+                senseVoiceLanguage = probe.language
+            }
+            log("SenseVoice probe: lang=\(probe.language) text=\(probe.text) note=\(probe.note)")
+        }
+        markScreen("端侧四模型加载 · 声纹模拟注册 · SenseVoice 试跑")
+        try? await Task.sleep(nanoseconds: 5_000_000_000)
+    }
+
+    private func analyzeRecording(_ item: RecordingItem, audioURL: URL) async {
+        let ai = AudioIntelligence.shared
+        let analysis = ai.analyze(audioURL: audioURL)
+        store.updateAnalysis(for: item.id, analysis: analysis)
+        let mine = analysis.segments.filter(\.isMe).count
+        log("VAD/CAMPPlus \(item.fileName): segments=\(analysis.segments.count) me=\(mine) note=\(analysis.engineNote)")
+        for segment in analysis.segments.prefix(4) {
+            log(String(format: "  VAD segment %.2f-%.2fs score=%.3f me=%@",
+                       segment.start, segment.end, segment.similarity,
+                       segment.isMe ? "YES" : "NO"))
+        }
+        let sense = ai.senseVoiceTranscribe(audioURL: audioURL)
+        if !sense.text.isEmpty {
+            store.updateSenseVoice(for: item.id, text: sense.text, language: sense.language)
+            senseVoicePreview = sense.text
+            senseVoiceLanguage = sense.language
+            log("SenseVoice \(item.fileName): lang=\(sense.language) text=\(sense.text)")
+        } else {
+            log("SenseVoice \(item.fileName): empty, \(sense.note)")
+        }
+    }
+
+    private func rebuildSearchIndex() async {
+        let documents = store.items.map { item -> (id: String, title: String, text: String) in
+            let parts = [item.transcript, item.senseVoiceText]
+                .compactMap { $0 }
+                .filter { !$0.isEmpty }
+            return (
+                id: item.id.uuidString,
+                title: item.name,
+                text: parts.isEmpty ? item.name : parts.joined(separator: " ")
+            )
+        }
+        let indexed = AudioIntelligence.shared.buildIndex(from: documents)
+        for document in indexed {
+            if let uuid = UUID(uuidString: document.id) {
+                store.updateSearchVector(for: uuid, vector: document.vector)
+            }
+        }
+        indexedDocumentCount = indexed.count
+        searchEngineNote = indexed.isEmpty
+            ? "EmbeddingGemma 不可用"
+            : "EmbeddingGemma Q8_0 · 768 维词向量池化"
+        log("Search index built: \(indexed.count) docs, dim=\(indexed.first?.vector.count ?? 0), \(searchEngineNote)")
+    }
+
+    private func runSemanticSearch(_ query: String) async {
+        guard !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        searchQuery = query
+        let documents: [IndexedDocument] = store.items.compactMap { item in
+            guard let vector = item.searchVector else { return nil }
+            let parts = [item.transcript, item.senseVoiceText].compactMap { $0 }
+            return IndexedDocument(
+                id: item.id.uuidString,
+                title: item.name,
+                text: parts.joined(separator: " "),
+                vector: vector
+            )
+        }
+        let hits = AudioIntelligence.shared.search(query: query, in: documents)
+        searchHits = hits
+        log("Semantic search [\(query)]: \(hits.count) hits")
+        for hit in hits.prefix(5) {
+            log(String(format: "  hit score=%.4f %@ | %@", hit.score, hit.title, hit.snippet))
+        }
+    }
+
+    private func demoSemanticSearch() async {
+        scrollAnchor = "semantic-search"
+        setStage(.loading, detail: "用 EmbeddingGemma 为全部归档生成 768 维向量…", progress: 0.9)
+        markScreen("EmbeddingGemma · 为归档建立向量索引")
+        try? await Task.sleep(nanoseconds: 3_000_000_000)
+        await rebuildSearchIndex()
+        await runSemanticSearch("what can I do for my country")
+        markScreen("语义搜索 · what can I do for my country · 余弦相似度排序")
+        try? await Task.sleep(nanoseconds: 6_000_000_000)
+        await runSemanticSearch("国家 演讲 责任")
+        markScreen("语义搜索 · 中文查询 国家 演讲 责任")
+        try? await Task.sleep(nanoseconds: 6_000_000_000)
+        await runSemanticSearch("my fellow Americans")
+        markScreen("语义搜索 · my fellow Americans")
+        try? await Task.sleep(nanoseconds: 5_000_000_000)
     }
 
     // MARK: - Helpers
@@ -1418,6 +1663,9 @@ struct ArchiveSnapshotView: View {
                 Text("每条录音下方标注：使用模型 · 转写用时 · 检测语言 / 指定语言")
                     .font(.caption2)
                     .foregroundColor(.blue)
+                Text("细进度条 = Silero VAD 语音区间 · 绿色「我」/ 橙色「他人」= CAMPPlus 声纹判定")
+                    .font(.caption2)
+                    .foregroundColor(.green)
             }
 
             ForEach(sections) { section in
@@ -1456,26 +1704,31 @@ struct ArchiveSnapshotView: View {
             }
             ForEach(clips.indices, id: \.self) { index in
                 let clip = clips[index]
-                HStack(spacing: 8) {
-                    Text("\(index + 1).")
-                        .font(.caption2.monospacedDigit())
-                        .foregroundColor(.secondary)
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(clip.name).font(.caption.bold())
-                        Text(clip.fileName)
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack(spacing: 8) {
+                        Text("\(index + 1).")
                             .font(.caption2.monospacedDigit())
                             .foregroundColor(.secondary)
-                        Text(metaLine(clip))
-                            .font(.caption2)
-                            .foregroundColor(.blue)
-                            .lineLimit(1)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(clip.name).font(.caption.bold())
+                            Text(clip.fileName)
+                                .font(.caption2.monospacedDigit())
+                                .foregroundColor(.secondary)
+                            Text(metaLine(clip))
+                                .font(.caption2)
+                                .foregroundColor(.blue)
+                                .lineLimit(1)
+                        }
+                        Spacer(minLength: 6)
+                        WaveformView(samples: clip.waveform, color: .red, height: 18, barCount: 20)
+                            .frame(width: 90)
+                        Text(String(format: "%.1fs", clip.duration))
+                            .font(.caption2.monospacedDigit())
+                            .foregroundColor(.secondary)
                     }
-                    Spacer(minLength: 6)
-                    WaveformView(samples: clip.waveform, color: .red, height: 18, barCount: 20)
-                        .frame(width: 90)
-                    Text(String(format: "%.1fs", clip.duration))
-                        .font(.caption2.monospacedDigit())
-                        .foregroundColor(.secondary)
+                    if let analysis = clip.voiceTimeline {
+                        VoiceTimelineView(analysis: analysis, duration: clip.duration)
+                    }
                 }
                 .padding(.vertical, 4)
             }
@@ -1488,23 +1741,28 @@ struct ArchiveSnapshotView: View {
         VStack(alignment: .leading, spacing: 8) {
             Text(title).font(.headline)
             ForEach(rows) { item in
-                HStack(spacing: 8) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(item.name).font(.caption.bold())
-                        Text(item.fileName)
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack(spacing: 8) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(item.name).font(.caption.bold())
+                            Text(item.fileName)
+                                .font(.caption2.monospacedDigit())
+                                .foregroundColor(.secondary)
+                            Text(metaLine(item))
+                                .font(.caption2)
+                                .foregroundColor(.blue)
+                                .lineLimit(1)
+                        }
+                        Spacer(minLength: 6)
+                        WaveformView(samples: item.waveform, color: color, height: 18, barCount: 20)
+                            .frame(width: 90)
+                        Text(String(format: "%.1fs", item.duration))
                             .font(.caption2.monospacedDigit())
                             .foregroundColor(.secondary)
-                        Text(metaLine(item))
-                            .font(.caption2)
-                            .foregroundColor(.blue)
-                            .lineLimit(1)
                     }
-                    Spacer(minLength: 6)
-                    WaveformView(samples: item.waveform, color: color, height: 18, barCount: 20)
-                        .frame(width: 90)
-                    Text(String(format: "%.1fs", item.duration))
-                        .font(.caption2.monospacedDigit())
-                        .foregroundColor(.secondary)
+                    if let analysis = item.voiceTimeline {
+                        VoiceTimelineView(analysis: analysis, duration: item.duration)
+                    }
                 }
                 .padding(.vertical, 4)
             }
@@ -1522,37 +1780,100 @@ struct ItemMetaRow: View {
     let onRetranscribe: () -> Void
 
     var body: some View {
-        HStack(spacing: 6) {
-            HStack(spacing: 4) {
-                Image(systemName: "cpu")
-                    .font(.caption2)
-                Text(item.modelBadge)
-                    .font(.caption2.bold())
-                    .lineLimit(1)
-            }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 4)
-            .background(Capsule().fill(item.transcription == nil ? Color.gray.opacity(0.18) : Color.blue.opacity(0.14)))
-            .foregroundColor(item.transcription == nil ? Color.secondary : Color.blue)
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(spacing: 6) {
+                HStack(spacing: 4) {
+                    Image(systemName: "cpu")
+                        .font(.caption2)
+                    Text(item.modelBadge)
+                        .font(.caption2.bold())
+                        .lineLimit(1)
+                }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .background(Capsule().fill(item.transcription == nil ? Color.gray.opacity(0.18) : Color.blue.opacity(0.14)))
+                .foregroundColor(item.transcription == nil ? Color.secondary : Color.blue)
 
-            if let meta = item.transcription {
-                Text(meta.elapsedTitle)
+                if let meta = item.transcription {
+                    Text(meta.elapsedTitle)
+                        .font(.caption2.monospacedDigit())
+                        .foregroundColor(.secondary)
+                }
+                Spacer(minLength: 4)
+                Button(action: onInfo) {
+                    Image(systemName: "exclamationmark.circle.fill")
+                        .font(.system(size: 19))
+                        .foregroundColor(.orange)
+                }
+                .buttonStyle(.borderless)
+                Button(action: onRetranscribe) {
+                    Image(systemName: "arrow.clockwise.circle.fill")
+                        .font(.system(size: 19))
+                        .foregroundColor(.blue)
+                }
+                .buttonStyle(.borderless)
+            }
+            if let analysis = item.voiceTimeline {
+                VoiceTimelineView(analysis: analysis, duration: item.duration)
+            }
+        }
+    }
+}
+
+// MARK: - Fine VAD timeline with CAMPPlus "is it me?" tags
+
+struct VoiceTimelineView: View {
+    let analysis: AudioAnalysis
+    let duration: TimeInterval
+
+    private var total: Double { max(analysis.duration, duration, 0.01) }
+    private var mineCount: Int { analysis.segments.filter(\.isMe).count }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            GeometryReader { geometry in
+                ZStack(alignment: .leading) {
+                    Capsule()
+                        .fill(Color.gray.opacity(0.22))
+                        .frame(height: 9)
+                    ForEach(analysis.segments.indices, id: \.self) { index in
+                        let segment = analysis.segments[index]
+                        let startX = CGFloat(segment.start / total) * geometry.size.width
+                        let width = max(CGFloat((segment.end - segment.start) / total) * geometry.size.width, 3)
+                        Capsule()
+                            .fill(segment.isMe ? Color.green : Color.orange)
+                            .frame(width: width, height: 9)
+                            .offset(x: startX)
+                    }
+                }
+            }
+            .frame(height: 9)
+            HStack(spacing: 7) {
+                Text("VAD \(analysis.segments.count) 段")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+                Circle().fill(Color.green).frame(width: 6, height: 6)
+                Text("我 \(mineCount)").font(.caption2).foregroundColor(.secondary)
+                Circle().fill(Color.orange).frame(width: 6, height: 6)
+                Text("他人 \(analysis.segments.count - mineCount)")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+                Spacer()
+                Text(String(format: "%.1fs", total))
                     .font(.caption2.monospacedDigit())
                     .foregroundColor(.secondary)
             }
-            Spacer(minLength: 4)
-            Button(action: onInfo) {
-                Image(systemName: "exclamationmark.circle.fill")
-                    .font(.system(size: 19))
-                    .foregroundColor(.orange)
-            }
-            .buttonStyle(.borderless)
-            Button(action: onRetranscribe) {
-                Image(systemName: "arrow.clockwise.circle.fill")
-                    .font(.system(size: 19))
+            if let first = analysis.segments.first {
+                Text(String(format: "首段 %.2f–%.2fs · 声纹相似度 %.2f · %@",
+                            first.start, first.end, first.similarity,
+                            first.isMe ? "判定为我" : "判定为他人"))
+                    .font(.caption2)
                     .foregroundColor(.blue)
             }
-            .buttonStyle(.borderless)
+            Text(analysis.engineNote)
+                .font(.caption2)
+                .foregroundColor(.secondary)
+                .lineLimit(1)
         }
     }
 }
@@ -1635,6 +1956,7 @@ struct ItemInfoView: View {
                             .foregroundColor(.secondary)
                     }
                     transcriptCard
+                    aiCard
                     Button {
                         onRetranscribe(item)
                     } label: {
@@ -1684,6 +2006,31 @@ struct ItemInfoView: View {
                 .padding(12)
                 .background(RoundedRectangle(cornerRadius: 12).fill(Color(.secondarySystemGroupedBackground)))
         }
+    }
+
+    private var aiCard: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Label("端侧模型分析", systemImage: "waveform.path.ecg")
+                .font(.headline)
+            if let analysis = item.voiceTimeline {
+                VoiceTimelineView(analysis: analysis, duration: item.duration)
+                Divider()
+                infoRow("语音段", "\(analysis.segments.count) 段（Silero VAD）")
+                infoRow("判定为我", "\(analysis.segments.filter(\.isMe).count) 段（CAMPPlus）")
+                infoRow("声纹维度", "\(analysis.speakerDimension) 维")
+            } else {
+                Text("尚无 VAD / 声纹分析")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+            Divider()
+            infoRow("SenseVoice", (item.senseVoiceText?.isEmpty == false) ? (item.senseVoiceText ?? "") : "未识别")
+            infoRow("识别语言", item.senseVoiceLanguage ?? "—")
+            Divider()
+            infoRow("文本向量", item.searchVector == nil ? "未生成" : "EmbeddingGemma \(item.searchVector?.count ?? 0) 维")
+        }
+        .padding(14)
+        .background(RoundedRectangle(cornerRadius: 12).fill(Color(.secondarySystemGroupedBackground)))
     }
 
     private func infoCard(_ meta: TranscriptionMeta) -> some View {

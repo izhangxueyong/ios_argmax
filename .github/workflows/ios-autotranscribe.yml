@@ -1,4 +1,4 @@
-name: "AutoTranscribe (ordinary Whisper Base + per-item notes and retranscribe)"
+name: "AutoTranscribe (Whisper + VAD timeline / speaker tags / SenseVoice / EmbeddingGemma search)"
 
 on:
   push:
@@ -103,6 +103,76 @@ jobs:
           du -sh "$MODELS_DIR/whisper-base" "$MODELS_DIR/whisper-turbo"
           echo "Whisper Base files:"
           ls -1 "$MODELS_DIR/whisper-base"
+
+      - name: Bundle on-device AI models (SenseVoice / VAD / CAMPPlus / EmbeddingGemma)
+        timeout-minutes: 50
+        run: |
+          set -e
+          AI_DIR="$GITHUB_WORKSPACE/Examples/AutoTranscribe/AutoTranscribe/Models/ai-models"
+          mkdir -p "$AI_DIR/sense-voice" "$AI_DIR/campplus"
+          fetch() {
+            local out="$1"; shift
+            for url in "$@"; do
+              echo "trying $url"
+              if curl -fL --retry 2 --retry-all-errors --connect-timeout 20 --max-time 900 \
+                   -o "$out" "$url" && [ -s "$out" ]; then
+                echo "OK $out ($(stat -f%z "$out") bytes)"
+                return 0
+              fi
+            done
+            echo "FAILED to download $out" >&2
+            return 1
+          }
+          SV="csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/resolve/main"
+          SP="csukuangfj/speaker-embedding-models/resolve/main"
+          EG="ggml-org/embeddinggemma-300M-GGUF/resolve/main"
+
+          # 228 MB SenseVoiceSmall int8 (zh/en/ja/ko/yue)
+          fetch "$AI_DIR/sense-voice/model.int8.onnx" \
+            "https://huggingface.co/$SV/model.int8.onnx" \
+            "https://hf-mirror.com/$SV/model.int8.onnx"
+          fetch "$AI_DIR/sense-voice/tokens.txt" \
+            "https://huggingface.co/$SV/tokens.txt" \
+            "https://hf-mirror.com/$SV/tokens.txt"
+
+          # 208 KB Silero VAD int8
+          fetch "$AI_DIR/silero_vad.int8.onnx" \
+            "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.int8.onnx" \
+            "https://ghproxy.net/https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.int8.onnx" \
+            "https://hf-mirror.com/csukuangfj/vad/resolve/main/silero_vad.onnx"
+
+          # 28 MB CAMPPlus speaker embedding (advanced zh/en 16k)
+          fetch "$AI_DIR/campplus/3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx" \
+            "https://huggingface.co/$SP/3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx" \
+            "https://hf-mirror.com/$SP/3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx"
+
+          # 334 MB EmbeddingGemma 300M Q8_0 GGUF
+          fetch "$AI_DIR/embeddinggemma-300M-Q8_0.gguf" \
+            "https://huggingface.co/$EG/embeddinggemma-300M-Q8_0.gguf" \
+            "https://hf-mirror.com/$EG/embeddinggemma-300M-Q8_0.gguf"
+
+          echo "=== AI model sizes ==="
+          du -sh "$AI_DIR" "$AI_DIR"/* "$AI_DIR"/sense-voice/* "$AI_DIR"/campplus/* 2>/dev/null || true
+          python3 - <<'PY'
+          import os, pathlib
+          root = pathlib.Path(os.environ["GITHUB_WORKSPACE"]) / "Examples/AutoTranscribe/AutoTranscribe/Models/ai-models"
+          expected = {
+              "sense-voice/model.int8.onnx": 200_000_000,
+              "sense-voice/tokens.txt": 100_000,
+              "silero_vad.int8.onnx": 100_000,
+              "campplus/3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx": 20_000_000,
+              "embeddinggemma-300M-Q8_0.gguf": 300_000_000,
+          }
+          for name, minimum in expected.items():
+              p = root / name
+              size = p.stat().st_size if p.exists() else 0
+              print(f"{name}: {size} bytes")
+              if size < minimum:
+                  raise SystemExit(f"model too small: {name}")
+          with open(root / "embeddinggemma-300M-Q8_0.gguf", "rb") as f:
+              assert f.read(4) == b"GGUF", "bad GGUF magic"
+          print("all AI models present and GGUF magic verified")
+          PY
 
       - name: Boot iOS Simulator
         run: |
@@ -265,6 +335,23 @@ jobs:
           PY
           echo "=== retranscribe actions ==="
           cat "$DOCS/retranscribe_action.log" 2>/dev/null || echo "(missing)"
+          echo "=== AI analysis summary (VAD / CAMPPlus / SenseVoice / EmbeddingGemma) ==="
+          python3 - "$DOCS/recordings.json" <<'PY' || echo "(recordings.json missing)"
+          import json, sys
+          data = json.load(open(sys.argv[1]))
+          print("items:", len(data))
+          for x in data:
+              timeline = x.get("voiceTimeline") or {}
+              segments = timeline.get("segments") or []
+              print(" -", x.get("fileName"),
+                    "| vad_segments=", len(segments),
+                    "| me=", sum(1 for s in segments if s.get("isMe")),
+                    "| sensevoice=", bool(x.get("senseVoiceText")),
+                    "| lang=", x.get("senseVoiceLanguage"),
+                    "| vector_dim=", len(x.get("searchVector") or []))
+          PY
+          echo "=== AI model + semantic search lines ==="
+          grep -E "AI model:|AI encoder:|SenseVoice probe|Search index|Semantic search|hit score" "$DOCS/progress.log" || true
           echo "=== progress.log ==="
           cat "$DOCS/progress.log" 2>/dev/null || echo "(missing)"
 

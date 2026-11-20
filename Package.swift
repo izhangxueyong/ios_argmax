@@ -29,6 +29,12 @@ let package = Package(
             name: "SpeakerKit",
             targets: ["SpeakerKit"]
         ),
+        // On-device VAD / speaker verification / SenseVoice / text embedding
+        // used by the AutoTranscribe example app.
+        .library(
+            name: "AutoTranscribeAI",
+            targets: ["AutoTranscribeAI"]
+        ),
         .executable(
             name: "argmax-cli",
             targets: ["ArgmaxCLI"]
@@ -40,6 +46,9 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.3.0"),
+        // sherpa-onnx XCFrameworks (iOS + simulator): SenseVoice, Silero VAD
+        // and CAMPPlus speaker embedding all share this one ONNX runtime.
+        .package(url: "https://github.com/willwade/sherpa-onnx-spm.git", exact: "1.13.16"),
     ] + (isServerEnabled() ? [
         .package(url: "https://github.com/vapor/vapor.git", from: "4.115.1"),
         .package(url: "https://github.com/apple/swift-openapi-generator", from: "1.10.2"),
@@ -83,6 +92,13 @@ let package = Package(
                 "WhisperKit",
             ],
             swiftSettings: swiftSettings()
+        ),
+        .target(
+            name: "AutoTranscribeAI",
+            dependencies: [
+                .product(name: "SherpaOnnx", package: "sherpa-onnx-spm"),
+            ],
+            path: "Examples/AutoTranscribe/AutoTranscribeAI"
         ),
         .testTarget(
             name: "ArgmaxCoreTests",
