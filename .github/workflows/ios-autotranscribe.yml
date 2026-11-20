@@ -193,12 +193,56 @@ jobs:
 
       - name: Build AutoTranscribe app
         run: |
-          set -o pipefail
+          set -euo pipefail
+          ART="$DERIVED_DATA/SourcePackages/artifacts/sherpa-onnx-spm"
+          ORT="$ART/onnxruntime/onnxruntime.xcframework"
+
+          # The upstream willwade/sherpa-onnx-spm package ships TWO
+          # XCFrameworks (sherpa-onnx + onnxruntime) and BOTH contain
+          # Headers/module.modulemap. Xcode's ProcessXCFramework copies them
+          # into the same Build/Products/.../include/module.modulemap and fails
+          # with "Multiple commands produce".
+          #
+          # Stage 1 lets xcodebuild resolve the package graph and unpack the
+          # binary artifacts. That first pass is expected to stop right at the
+          # collision, so its exit status is intentionally ignored.
+          if [ ! -d "$ORT" ]; then
+            echo "=== Stage 1: resolve packages / unpack XCFrameworks ==="
+            xcodebuild build \
+              -project "$PROJECT" \
+              -scheme "$SCHEME" \
+              -destination "$DESTINATION" \
+              -derivedDataPath "$DERIVED_DATA" \
+              CODE_SIGNING_ALLOWED=NO \
+              | xcbeautify --renderer github-actions \
+              || echo "Stage 1 ended at the known modulemap collision (expected)."
+          fi
+
+          if [ ! -d "$ORT" ]; then
+            echo "ERROR: onnxruntime XCFramework was not materialised"
+            find "$DERIVED_DATA/SourcePackages" -maxdepth 5 -type d 2>/dev/null | head -60
+            exit 1
+          fi
+
+          # Our Swift code only imports the `sherpa_onnx` C module through the
+          # upstream SherpaOnnx product; nothing imports `onnxruntime`.
+          # Deleting that unused module map leaves libonnxruntime.a linked but
+          # removes the duplicate include/module.modulemap output.
+          echo "=== Stage 2: drop duplicate onnxruntime module map ==="
+          find "$ORT" -name module.modulemap -print -delete
+          echo "remaining module maps:"
+          find "$ART" -name module.modulemap -print
+          test "$(find "$ART" -name module.modulemap | wc -l | tr -d ' ')" -eq 3
+
+          # Stage 3 is the real build. Disable automatic package resolution so
+          # xcodebuild does not re-unpack the frameworks and undo the patch.
+          echo "=== Stage 3: build app ==="
           xcodebuild build \
             -project "$PROJECT" \
             -scheme "$SCHEME" \
             -destination "$DESTINATION" \
             -derivedDataPath "$DERIVED_DATA" \
+            -disableAutomaticPackageResolution \
             CODE_SIGNING_ALLOWED=NO \
             | xcbeautify --renderer github-actions
 
