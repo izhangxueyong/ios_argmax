@@ -1484,15 +1484,19 @@ struct ContentView: View {
     private func runSemanticSearch(_ query: String) async {
         guard !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
         searchQuery = query
-        let documents: [IndexedDocument] = store.items.compactMap { item in
-            guard let vector = item.searchVector else { return nil }
+        // Build the document list explicitly. Xcode 16.4's Swift compiler
+        // mis-infers compactMap's closure result as non-optional here, which
+        // makes `return nil` a hard error; a plain loop is unambiguous.
+        var documents: [IndexedDocument] = []
+        for item in store.items {
+            guard let vector = item.searchVector else { continue }
             let parts = [item.transcript, item.senseVoiceText].compactMap { $0 }
-            return IndexedDocument(
+            documents.append(IndexedDocument(
                 id: item.id.uuidString,
                 title: item.name,
                 text: parts.joined(separator: " "),
                 vector: vector
-            )
+            ))
         }
         let hits = AudioIntelligence.shared.search(query: query, in: documents)
         searchHits = hits
