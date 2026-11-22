@@ -184,6 +184,7 @@ struct ContentView: View {
                     sessionItems: sessionItems(for: target),
                     isDemo: demoReplaying,
                     store: store,
+                    profileStore: profileStore,
                     retranscribeMode: $retranscribeMode,
                     retranscribeTarget: $retranscribeTarget,
                     retranscribeBusy: retranscribeBusy,
@@ -263,9 +264,10 @@ struct ContentView: View {
                 Image(systemName: selectedMode == .standard ? "bolt.fill" : "sparkles")
                     .foregroundColor(selectedMode == .standard ? .orange : .purple)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(selectedMode.modelTitle)
+                    Text(profileStore.primaryModelID(for: selectedMode) == "whisper-turbo"
+                         ? "Whisper Turbo · 632MB" : "Whisper Base")
                         .font(.caption.bold())
-                    Text("Models/\(selectedMode.folderName) · 已打包进 App")
+                    Text("Models/\(profileStore.folder(for: selectedMode)) · \(profileStore.chain(for: selectedMode).name) · \(profileStore.config(for: selectedMode).name)")
                         .font(.caption2)
                         .foregroundColor(.secondary)
                 }
@@ -2278,6 +2280,7 @@ struct ReviewSheet: View {
     let sessionItems: [RecordingItem]
     let isDemo: Bool
     @ObservedObject var store: RecordingStore
+    @ObservedObject var profileStore: ModeProfileStore
     @Binding var retranscribeMode: TranscriptionMode
     @Binding var retranscribeTarget: TranscriptionTarget
     let retranscribeBusy: Bool
