@@ -449,7 +449,7 @@ enum TuningCatalog {
         TuningSpec(key: .vadMinSilence, kind: .slider(min: 0, max: 1, step: 0.05), defaultValueText: "0.20"),
         TuningSpec(key: .vadMinSpeech, kind: .slider(min: 0, max: 1, step: 0.05), defaultValueText: "0.15"),
         TuningSpec(key: .vadWindowSize, kind: .picker(["512", "1024", "1536", "2048"]), defaultValueText: "512"),
-        TuningSpec(key: .vadMaxSpeech, kind: .slider(min: 1, max: 20, step: 1), defaultValueText: "8"),
+        TuningSpec(key: .vadMaxSpeech, kind: .slider(min: 1, max: 20, step: 1), defaultValueText: "8.00"),
         TuningSpec(key: .speakerThreshold, kind: .slider(min: 0, max: 1, step: 0.02), defaultValueText: "0.62"),
         TuningSpec(key: .senseVoiceLanguage, kind: .picker(["auto", "zh", "en", "ja", "ko", "yue"]), defaultValueText: "auto"),
         TuningSpec(key: .senseVoiceITN, kind: .toggle, defaultValueText: "开"),
@@ -492,9 +492,36 @@ final class ModelTuningStore: ObservableObject {
     var changedKeys: [TuningKey] {
         var result: [TuningKey] = []
         for key in TuningKey.allCases {
-            if valueText(for: key) != defaultValueText(for: key) { result.append(key) }
+            if !isAtDefault(key) { result.append(key) }
         }
         return result
+    }
+
+    /// Compare the ACTUAL typed value, never the formatted display string.
+    /// String comparison used to report a permanent phantom deviation because
+    /// `vadMaxSpeech` rendered as "8.00" while its default label was "8".
+    func isAtDefault(_ key: TuningKey) -> Bool {
+        let d = ModelTuning.defaults
+        let t = tuning
+        switch key {
+        case .temperature: return t.temperature == d.temperature
+        case .fallbackTemperature: return t.fallbackTemperature == d.fallbackTemperature
+        case .temperatureFallbackCount: return t.temperatureFallbackCount == d.temperatureFallbackCount
+        case .fallbackCount: return t.fallbackCount == d.fallbackCount
+        case .baseWithoutTimestamps: return t.baseWithoutTimestamps == d.baseWithoutTimestamps
+        case .baseRelaxQualityThresholds: return t.baseRelaxQualityThresholds == d.baseRelaxQualityThresholds
+        case .skipSpecialTokens: return t.skipSpecialTokens == d.skipSpecialTokens
+        case .vadThreshold: return t.vadThreshold == d.vadThreshold
+        case .vadMinSilence: return t.vadMinSilence == d.vadMinSilence
+        case .vadMinSpeech: return t.vadMinSpeech == d.vadMinSpeech
+        case .vadWindowSize: return t.vadWindowSize == d.vadWindowSize
+        case .vadMaxSpeech: return t.vadMaxSpeech == d.vadMaxSpeech
+        case .speakerThreshold: return t.speakerThreshold == d.speakerThreshold
+        case .senseVoiceLanguage: return t.senseVoiceLanguage == d.senseVoiceLanguage
+        case .senseVoiceITN: return t.senseVoiceITN == d.senseVoiceITN
+        case .senseVoiceThreads: return t.senseVoiceThreads == d.senseVoiceThreads
+        case .searchLimit: return t.searchLimit == d.searchLimit
+        }
     }
 
     func reset() {
@@ -1228,7 +1255,7 @@ struct ParamEditorRow: View {
     @ObservedObject var store: ModelTuningStore
 
     private var isChanged: Bool {
-        store.valueText(for: spec.key) != spec.defaultValueText
+        !store.isAtDefault(spec.key)
     }
 
     var body: some View {
