@@ -265,7 +265,8 @@ jobs:
                 "$DOCS/recordings.json" "$DOCS/sessions.json" "$DOCS/archive_action.log" \
                 "$DOCS/archive_scroll_started.txt" "$DOCS/archive_scroll_step.txt" \
                 "$DOCS/archive_scroll_done.txt" "$DOCS/archive_list_full.png" \
-                "$DOCS/retranscribe_action.log" 2>/dev/null || true
+                "$DOCS/retranscribe_action.log" "$DOCS/model_config.json" \
+                "$DOCS/model_calls.json" "$DOCS/model_management_export.json" 2>/dev/null || true
 
           # Start recording BEFORE launch so the launch animation is captured.
           echo "Starting screen recording..."
@@ -396,6 +397,43 @@ jobs:
           PY
           echo "=== AI model + semantic search lines ==="
           grep -E "AI model:|AI encoder:|SenseVoice probe|Search index|Semantic search|hit score" "$DOCS/progress.log" || true
+
+          echo "=== '模式和模型' management screen lines ==="
+          grep -E "MODEL MGMT|DEMO model management|tuning applied|call logged|load calls logged|deviations" "$DOCS/progress.log" || true
+
+          echo "=== model config (model_config.json) ==="
+          cat "$DOCS/model_config.json" 2>/dev/null || echo "(missing)"
+
+          echo "=== model call log summary (model_calls.json) ==="
+          python3 - "$DOCS/model_calls.json" <<'PY' || echo "(model_calls.json missing)"
+          import json, sys, collections
+          calls = json.load(open(sys.argv[1]))
+          print("total calls:", len(calls))
+          by_model = collections.Counter(c.get("modelID") for c in calls)
+          by_op = collections.Counter(c.get("operation") for c in calls)
+          by_status = collections.Counter(c.get("status") for c in calls)
+          print("by model:", dict(by_model))
+          print("by operation:", dict(by_op))
+          print("by status:", dict(by_status))
+          print("avg elapsed(s):", round(sum(c.get("elapsed", 0) for c in calls) / max(1, len(calls)), 3))
+          for c in calls[:4] + calls[-4:]:
+              print(" -", c.get("modelID"), "|", c.get("operation"),
+                    "|", c.get("modeRaw"), "|", c.get("status"),
+                    "| elapsed=", round(c.get("elapsed", 0), 3),
+                    "| params=", len(c.get("parameters") or {}),
+                    "|", (c.get("result") or "")[:90])
+          PY
+
+          echo "=== exported config + call log artifact ==="
+          if [ -f "$DOCS/model_management_export.json" ]; then
+            cp "$DOCS/model_management_export.json" "$MEDIA_DIR/AutoTranscribe-model-management-export.json"
+            cp "$DOCS/model_config.json" "$MEDIA_DIR/AutoTranscribe-model-config.json" 2>/dev/null || true
+            cp "$DOCS/model_calls.json" "$MEDIA_DIR/AutoTranscribe-model-calls.json" 2>/dev/null || true
+            ls -lh "$MEDIA_DIR/"*.json
+          else
+            echo "WARNING: model_management_export.json missing"
+          fi
+
           echo "=== progress.log ==="
           cat "$DOCS/progress.log" 2>/dev/null || echo "(missing)"
 
@@ -409,5 +447,6 @@ jobs:
           path: |
             ${{ env.MEDIA_DIR }}/*.mp4
             ${{ env.MEDIA_DIR }}/*.png
+            ${{ env.MEDIA_DIR }}/*.json
           if-no-files-found: warn
           retention-days: 7

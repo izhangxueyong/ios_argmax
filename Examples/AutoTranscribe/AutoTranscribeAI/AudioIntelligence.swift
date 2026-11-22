@@ -96,6 +96,30 @@ public final class AudioIntelligence: @unchecked Sendable {
 
     public private(set) var statusLines: [String] = []
 
+    // MARK: - Runtime-configurable inference parameters
+    //
+    // Defaults are byte-for-byte identical to the previously hardcoded values,
+    // so an untouched build behaves exactly as before. The "模式和模型" screen
+    // writes these scalars through ModelTuningStore.applyToAudioIntelligence.
+    // Mutating a SenseVoice parameter invalidates the cached 228 MB graph so
+    // the next call really rebuilds it with the new setting.
+    public var vadThreshold: Float = 0.45
+    public var vadMinSilenceDuration: Float = 0.20
+    public var vadMinSpeechDuration: Float = 0.15
+    public var vadWindowSize: Int = 512
+    public var vadMaxSpeechDuration: Float = 8.0
+    public var speakerSimilarityThreshold: Double = 0.62
+    public var senseVoiceLanguageSetting: String = "auto" {
+        didSet { cachedRecognizer = nil }
+    }
+    public var senseVoiceUseITN: Bool = true {
+        didSet { cachedRecognizer = nil }
+    }
+    public var senseVoiceThreadCount: Int = 2 {
+        didSet { cachedRecognizer = nil }
+    }
+    public var searchResultLimit: Int = 8
+
     private init() {}
 
     public var encoderInfo: String {
@@ -204,7 +228,7 @@ public final class AudioIntelligence: @unchecked Sendable {
             segments.append(VoiceSegment(
                 start: start,
                 end: max(end, start + 0.01),
-                isMe: score >= Self.speakerThreshold,
+                isMe: score >= speakerSimilarityThreshold,
                 similarity: score
             ))
         }
@@ -227,7 +251,8 @@ public final class AudioIntelligence: @unchecked Sendable {
             return ("", "", "SenseVoice 模型或音频不可用")
         }
         let result = recognizer.decode(samples: samples, sampleRate: 16_000)
-        return (result.text, result.lang, "SenseVoiceSmall int8 · zh/en/ja/ko/yue")
+        let setting = "SenseVoiceSmall int8 · lang=\(senseVoiceLanguageSetting) · itn=\(senseVoiceUseITN ? "on" : "off") · threads=\(senseVoiceThreadCount)"
+        return (result.text, result.lang, setting)
     }
 
     private func ensureRecognizer() -> SherpaOnnxOfflineRecognizer? {
@@ -237,12 +262,12 @@ public final class AudioIntelligence: @unchecked Sendable {
               fileManager.fileExists(atPath: senseVoiceTokensPath) else { return nil }
         let sense = sherpaOnnxOfflineSenseVoiceModelConfig(
             model: senseVoicePath,
-            language: "auto",
-            useInverseTextNormalization: true
+            language: senseVoiceLanguageSetting,
+            useInverseTextNormalization: senseVoiceUseITN
         )
         let modelConfig = sherpaOnnxOfflineModelConfig(
             tokens: senseVoiceTokensPath,
-            numThreads: 2,
+            numThreads: senseVoiceThreadCount,
             provider: "cpu",
             debug: 0,
             senseVoice: sense
@@ -272,10 +297,13 @@ public final class AudioIntelligence: @unchecked Sendable {
         }
     }
 
-    public func search(query: String, in documents: [IndexedDocument], limit: Int = 8) -> [SearchHit] {
+    /// `limit == nil` uses the runtime-configurable `searchResultLimit`
+    /// (managed by the "模式和模型" screen); an explicit limit still wins.
+    public func search(query: String, in documents: [IndexedDocument], limit: Int? = nil) -> [SearchHit] {
         configure()
         guard let encoder, !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return [] }
         let queryVector = encoder.encode(query)
+        let effectiveLimit = max(1, limit ?? searchResultLimit)
         return documents
             .map { document in
                 SearchHit(
@@ -286,7 +314,7 @@ public final class AudioIntelligence: @unchecked Sendable {
                 )
             }
             .sorted { $0.score > $1.score }
-            .prefix(limit)
+            .prefix(effectiveLimit)
             .map { $0 }
     }
 
@@ -296,11 +324,11 @@ public final class AudioIntelligence: @unchecked Sendable {
         guard FileManager.default.fileExists(atPath: vadPath) else { return [] }
         let silero = sherpaOnnxSileroVadModelConfig(
             model: vadPath,
-            threshold: 0.45,
-            minSilenceDuration: 0.20,
-            minSpeechDuration: 0.15,
-            windowSize: 512,
-            maxSpeechDuration: 8.0
+            threshold: vadThreshold,
+            minSilenceDuration: vadMinSilenceDuration,
+            minSpeechDuration: vadMinSpeechDuration,
+            windowSize: vadWindowSize,
+            maxSpeechDuration: vadMaxSpeechDuration
         )
         var config = sherpaOnnxVadModelConfig(
             sileroVad: silero,
@@ -313,7 +341,7 @@ public final class AudioIntelligence: @unchecked Sendable {
         withUnsafePointer(to: &config) { pointer in
             let vad = SherpaOnnxVoiceActivityDetectorWrapper(config: pointer, buffer_size_in_seconds: 30)
             var index = 0
-            let window = 512
+            let window = max(32, vadWindowSize)
             while index < samples.count {
                 let count = min(window, samples.count - index)
                 vad.acceptWaveform(samples: Array(samples[index..<(index + count)]))

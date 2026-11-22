@@ -105,7 +105,8 @@ final class TranscriptionService: ObservableObject {
     func transcribe(
         audioURL: URL,
         mode: TranscriptionMode,
-        target: TranscriptionTarget
+        target: TranscriptionTarget,
+        tuning: ModelTuning = .defaults
     ) async throws -> TranscriptionOutcome {
         let start = Date()
         let kit = try await loadKit(for: mode)
@@ -126,7 +127,8 @@ final class TranscriptionService: ObservableObject {
         let options = Self.makeOptions(
             language: language,
             mode: mode,
-            fallback: false
+            fallback: false,
+            tuning: tuning
         )
         let results = try await kit.transcribe(audioPath: audioURL.path, decodeOptions: options)
         var text = Self.cleanedText(from: results)
@@ -139,7 +141,8 @@ final class TranscriptionService: ObservableObject {
             let fallbackOptions = Self.makeOptions(
                 language: detectedCode ?? language,
                 mode: mode,
-                fallback: true
+                fallback: true,
+                tuning: tuning
             )
             let retryResults = try await kit.transcribe(audioPath: audioURL.path, decodeOptions: fallbackOptions)
             diagnostics.append("fallback " + Self.describe(retryResults))
@@ -159,7 +162,8 @@ final class TranscriptionService: ObservableObject {
     private static func makeOptions(
         language: String?,
         mode: TranscriptionMode,
-        fallback: Bool
+        fallback: Bool,
+        tuning: ModelTuning
     ) -> DecodingOptions {
         let isBase = mode == .standard
         // `usePrefillPrompt` MUST stay true: when false WhisperKit feeds the
@@ -169,14 +173,14 @@ final class TranscriptionService: ObservableObject {
             verbose: true,
             task: .transcribe,
             language: language,
-            temperature: fallback ? 0.2 : 0.0,
-            temperatureFallbackCount: fallback ? 3 : 5,
+            temperature: fallback ? Float(tuning.fallbackTemperature) : Float(tuning.temperature),
+            temperatureFallbackCount: fallback ? tuning.fallbackCount : tuning.temperatureFallbackCount,
             usePrefillPrompt: true,
             detectLanguage: language == nil,
-            skipSpecialTokens: true,
-            withoutTimestamps: isBase && !fallback
+            skipSpecialTokens: tuning.skipSpecialTokens,
+            withoutTimestamps: isBase && !fallback && tuning.baseWithoutTimestamps
         )
-        if isBase {
+        if isBase && tuning.baseRelaxQualityThresholds {
             // Whisper Base on a CPU-only simulator yields much lower log-probs
             // than large-v3-turbo. With WhisperKit's default quality thresholds
             // `SegmentSeeker` drops every segment; relax them for base only.

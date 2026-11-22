@@ -44,6 +44,8 @@ import UniformTypeIdentifiers
 struct ContentView: View {
     @StateObject private var store = RecordingStore()
     @StateObject private var service = TranscriptionService()
+    @StateObject private var tuningStore = ModelTuningStore()
+    @StateObject private var callLog = ModelCallLog()
 
     @State private var selectedMode: TranscriptionMode = .standard
     @State private var selectedTarget: TranscriptionTarget = LanguageCatalog.defaultTarget(for: .standard)
@@ -93,6 +95,10 @@ struct ContentView: View {
     @State private var indexedDocumentCount = 0
     @State private var searchEngineNote = "尚未建立索引"
 
+    // "模式和模型" 管理界面
+    @State private var showingModelManager = false
+    @State private var managementSection: ManagementSection = .overview
+
     enum Stage: String {
         case idle = "准备就绪"
         case recording = "录音中"
@@ -125,6 +131,7 @@ struct ContentView: View {
                     VStack(spacing: 16) {
                         header.id("top")
                         modeCard.id("mode")
+                        modelManagerCard.id("model-manager")
                         controlsCard.id("controls")
                         sessionCard.id("session-card")
                         statusCard.id("status")
@@ -149,10 +156,22 @@ struct ContentView: View {
             .navigationTitle("AutoTranscribe")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                Button {
-                    showingImporter = true
-                } label: {
-                    Image(systemName: "folder.badge.plus")
+                ToolbarItem(placement: .topBarLeading) {
+                    Button {
+                        managementSection = .overview
+                        showingModelManager = true
+                        log("MODEL MGMT opened from toolbar")
+                    } label: {
+                        Label("模式和模型", systemImage: "slider.horizontal.3")
+                            .font(.caption.bold())
+                    }
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button {
+                        showingImporter = true
+                    } label: {
+                        Image(systemName: "folder.badge.plus")
+                    }
                 }
             }
             .fileImporter(isPresented: $showingImporter, allowedContentTypes: [.audio]) { result in
@@ -188,6 +207,20 @@ struct ContentView: View {
                     Task { await runDemo() }
                 }
             }
+        }
+        // A separate sheet modifier on the OUTER view avoids the well-known
+        // "two .sheet modifiers on one view" conflict with reviewTarget above.
+        .sheet(isPresented: $showingModelManager) {
+            ModelManagementView(
+                tuningStore: tuningStore,
+                callLog: callLog,
+                selection: $managementSection,
+                onClose: {
+                    showingModelManager = false
+                    log("MODEL MGMT closed")
+                },
+                onLog: { message in log(message) }
+            )
         }
     }
 
@@ -264,6 +297,42 @@ struct ContentView: View {
         }
         .padding(14)
         .background(RoundedRectangle(cornerRadius: 14).fill(Color(.secondarySystemGroupedBackground)))
+    }
+
+    // MARK: - "模式和模型" entry card
+
+    private var modelManagerCard: some View {
+        Button {
+            managementSection = .overview
+            showingModelManager = true
+            log("MODEL MGMT opened from home card")
+        } label: {
+            HStack(spacing: 10) {
+                Image(systemName: "slider.horizontal.3")
+                    .font(.title3)
+                    .foregroundColor(.white)
+                    .frame(width: 36, height: 36)
+                    .background(RoundedRectangle(cornerRadius: 9).fill(Color.indigo))
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("模式和模型管理")
+                        .font(.subheadline.bold())
+                        .foregroundColor(.primary)
+                    Text("6 个模型 · 2 种模式 · \(TuningCatalog.specs.count) 项参数 · 调用日志与参数快照")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                }
+                Spacer()
+                Text("\(callLog.records.count) 次调用")
+                    .font(.caption2.monospacedDigit())
+                    .foregroundColor(.blue)
+                Image(systemName: "chevron.right")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+            .padding(12)
+            .background(RoundedRectangle(cornerRadius: 14).fill(Color(.secondarySystemGroupedBackground)))
+        }
+        .buttonStyle(.plain)
     }
 
     // MARK: - Recording controls
@@ -1071,8 +1140,12 @@ struct ContentView: View {
         setStage(.loading, detail: "加载内置 \(mode.modelTitle)…", progress: 0.1)
         log("Transcribe start: \(item.fileName), mode=\(mode.rawValue), language=\(target.id) (from \(item.holdLanguageCode ?? "global picker"))")
 
+        let params = tuningParams("transcribe")
+        let callStart = Date()
         do {
-            let outcome = try await service.transcribe(audioURL: url, mode: mode, target: target)
+            let outcome = try await service.transcribe(
+                audioURL: url, mode: mode, target: target, tuning: tuningStore.tuning
+            )
             transcript = outcome.text
             let meta = makeMeta(
                 mode: mode,
@@ -1086,11 +1159,32 @@ struct ContentView: View {
             if let diagnostic = outcome.diagnostic {
                 log("INVALID TRANSCRIPT diagnostic: \(diagnostic)")
             }
+            callLog.record(
+                modelID: mode == .standard ? "whisper-base" : "whisper-turbo",
+                operation: "transcribe",
+                modeRaw: mode.rawValue,
+                parameters: params,
+                elapsed: outcome.elapsed,
+                result: outcome.text.isEmpty ? "空文本 / 无效结果" : outcome.text,
+                status: outcome.text.isEmpty ? .empty : .ok,
+                origin: callOrigin
+            )
+            log("MODEL MGMT call logged: transcribe mode=\(mode.rawValue) status=\(outcome.text.isEmpty ? "empty" : "ok")")
             writeSentinel(status: "DONE", text: outcome.text, seconds: outcome.elapsed)
         } catch {
             let msg = error.localizedDescription
             setStage(.failed, detail: msg, progress: 0)
             log("Transcribe failed: \(msg)")
+            callLog.record(
+                modelID: mode == .standard ? "whisper-base" : "whisper-turbo",
+                operation: "transcribe",
+                modeRaw: mode.rawValue,
+                parameters: params,
+                elapsed: Date().timeIntervalSince(callStart),
+                result: msg,
+                status: .failed,
+                origin: callOrigin
+            )
             writeSentinel(status: "FAILED", text: msg, seconds: 0)
         }
     }
@@ -1111,9 +1205,13 @@ struct ContentView: View {
         retranscribeNote = "正在用 \(mode.modelTitle) · \(validated.title) 重新转写…"
         setStage(.loading, detail: retranscribeNote, progress: 0.15)
         log("RETRANSCRIBE start: \(item.fileName), mode=\(mode.rawValue), target=\(validated.id)")
+        let params = tuningParams("retranscribe")
+        let callStart = Date()
 
         do {
-            let outcome = try await service.transcribe(audioURL: url, mode: mode, target: validated)
+            let outcome = try await service.transcribe(
+                audioURL: url, mode: mode, target: validated, tuning: tuningStore.tuning
+            )
             let meta = makeMeta(
                 mode: mode,
                 target: validated,
@@ -1131,6 +1229,17 @@ struct ContentView: View {
             if let diagnostic = outcome.diagnostic {
                 log("INVALID RETRANSCRIPT diagnostic: \(diagnostic)")
             }
+            callLog.record(
+                modelID: mode == .standard ? "whisper-base" : "whisper-turbo",
+                operation: "retranscribe",
+                modeRaw: mode.rawValue,
+                parameters: params,
+                elapsed: outcome.elapsed,
+                result: outcome.text.isEmpty ? "空文本 / 无效结果" : outcome.text,
+                status: outcome.text.isEmpty ? .empty : .ok,
+                origin: callOrigin
+            )
+            log("MODEL MGMT call logged: retranscribe mode=\(mode.rawValue) status=\(outcome.text.isEmpty ? "empty" : "ok")")
             writeText(
                 "\(item.fileName) retranscribed model=\(meta.modelName) target=\(validated.id) seconds=\(String(format: "%.1f", meta.elapsed))\n",
                 fileName: "retranscribe_action.log",
@@ -1142,6 +1251,16 @@ struct ContentView: View {
             retranscribeNote = "重新转写失败：\(msg)"
             setStage(.failed, detail: retranscribeNote, progress: 0)
             log("RETRANSCRIBE failed: \(msg)")
+            callLog.record(
+                modelID: mode == .standard ? "whisper-base" : "whisper-turbo",
+                operation: "retranscribe",
+                modeRaw: mode.rawValue,
+                parameters: params,
+                elapsed: Date().timeIntervalSince(callStart),
+                result: msg,
+                status: .failed,
+                origin: callOrigin
+            )
         }
     }
 
@@ -1183,6 +1302,9 @@ struct ContentView: View {
 
         // ---- EmbeddingGemma index + real semantic queries ----
         await demoSemanticSearch()
+
+        // ---- "模式和模型" management screen, one still per section ----
+        await demoModelManagement()
 
         // ---- Scroll down the archived list screen by screen ----
         await demoScrollArchivedList()
@@ -1358,7 +1480,7 @@ struct ContentView: View {
         log("DEMO archive scroll started")
         exportArchiveSnapshot()
 
-        var anchors: [String] = ["session-card", "ai-models", "archive-list", "semantic-search"]
+        var anchors: [String] = ["top", "model-manager", "session-card", "ai-models", "archive-list", "semantic-search"]
         for session in store.archivedSessions {
             anchors.append("archive-session-\(session.index)")
         }
@@ -1415,6 +1537,7 @@ struct ContentView: View {
 
     private func prepareAIModels() async {
         let ai = AudioIntelligence.shared
+        applyTuning()
         ai.configure()
         ai.enrollMockVoice()
         aiStatusLines = ai.statusLines
@@ -1422,14 +1545,45 @@ struct ContentView: View {
         enrolledVoiceDimension = ai.registeredVoiceDimension
         for line in ai.statusLines { log("AI model: \(line)") }
         log("AI encoder: \(ai.encoderInfo)")
+        log("MODEL MGMT tuning applied: \(tuningStore.deviationCount) deviations from defaults")
+
+        // Record every bundled checkpoint as a "load" call with its real
+        // on-disk status, so the log tab is truthful even before any clip runs.
+        for model in ModelRegistry.models {
+            let status = ModelRegistry.runtimeStatus(model)
+            callLog.record(
+                modelID: model.id,
+                operation: "load",
+                modeRaw: nil,
+                parameters: ["bundlePath": model.bundlePath, "engine": model.engine],
+                elapsed: 0,
+                result: status.exists
+                    ? "已打包 · \(model.isDirectory ? "\(status.fileCount) 个文件" : "\(status.bytes) bytes")"
+                    : "缺失 · \(status.resolvedPath)",
+                status: status.exists ? .ok : .failed,
+                origin: callOrigin
+            )
+        }
+        log("MODEL MGMT load calls logged: \(ModelRegistry.models.count) models")
 
         if let sample = Bundle.main.url(forResource: "recording", withExtension: "wav") {
+            let probeStart = Date()
             let probe = ai.senseVoiceTranscribe(audioURL: sample)
             if !probe.text.isEmpty {
                 senseVoicePreview = probe.text
                 senseVoiceLanguage = probe.language
             }
             log("SenseVoice probe: lang=\(probe.language) text=\(probe.text) note=\(probe.note)")
+            callLog.record(
+                modelID: "sense-voice",
+                operation: "probe",
+                modeRaw: nil,
+                parameters: tuningParams("senseVoice"),
+                elapsed: Date().timeIntervalSince(probeStart),
+                result: probe.text.isEmpty ? probe.note : probe.text,
+                status: probe.text.isEmpty ? .empty : .ok,
+                origin: callOrigin
+            )
         }
         markScreen("端侧四模型加载 · 声纹模拟注册 · SenseVoice 试跑")
         try? await Task.sleep(nanoseconds: 5_000_000_000)
@@ -1437,7 +1591,10 @@ struct ContentView: View {
 
     private func analyzeRecording(_ item: RecordingItem, audioURL: URL) async {
         let ai = AudioIntelligence.shared
+        applyTuning()
+        let vadStart = Date()
         let analysis = ai.analyze(audioURL: audioURL)
+        let vadElapsed = Date().timeIntervalSince(vadStart)
         store.updateAnalysis(for: item.id, analysis: analysis)
         let mine = analysis.segments.filter(\.isMe).count
         log("VAD/CAMPPlus \(item.fileName): segments=\(analysis.segments.count) me=\(mine) note=\(analysis.engineNote)")
@@ -1446,7 +1603,30 @@ struct ContentView: View {
                        segment.start, segment.end, segment.similarity,
                        segment.isMe ? "YES" : "NO"))
         }
+        callLog.record(
+            modelID: "silero-vad",
+            operation: "vad+speaker",
+            modeRaw: selectedMode.rawValue,
+            parameters: tuningParams("vad+speaker"),
+            elapsed: vadElapsed,
+            result: "\(analysis.segments.count) 段 · \(mine) 段判为我 · \(analysis.engineNote)",
+            status: analysis.segments.isEmpty ? .empty : .ok,
+            origin: callOrigin
+        )
+        callLog.record(
+            modelID: "campplus",
+            operation: "speaker-verify",
+            modeRaw: selectedMode.rawValue,
+            parameters: tuningParams("vad+speaker"),
+            elapsed: vadElapsed,
+            result: "\(mine)/\(analysis.segments.count) 段判为「我」· 参考向量 \(analysis.speakerDimension) 维",
+            status: analysis.speakerDimension == 0 ? .failed : .ok,
+            origin: callOrigin
+        )
+
+        let senseStart = Date()
         let sense = ai.senseVoiceTranscribe(audioURL: audioURL)
+        let senseElapsed = Date().timeIntervalSince(senseStart)
         if !sense.text.isEmpty {
             store.updateSenseVoice(for: item.id, text: sense.text, language: sense.language)
             senseVoicePreview = sense.text
@@ -1455,9 +1635,22 @@ struct ContentView: View {
         } else {
             log("SenseVoice \(item.fileName): empty, \(sense.note)")
         }
+        callLog.record(
+            modelID: "sense-voice",
+            operation: "senseVoice",
+            modeRaw: selectedMode.rawValue,
+            parameters: tuningParams("senseVoice"),
+            elapsed: senseElapsed,
+            result: sense.text.isEmpty ? sense.note : "lang=\(sense.language) · \(sense.text)",
+            status: sense.text.isEmpty ? .empty : .ok,
+            origin: callOrigin
+        )
+        log("MODEL MGMT call logged: vad+speaker / speaker-verify / senseVoice for \(item.fileName)")
     }
 
     private func rebuildSearchIndex() async {
+        let ai = AudioIntelligence.shared
+        applyTuning()
         let documents = store.items.map { item -> (id: String, title: String, text: String) in
             let parts = [item.transcript, item.senseVoiceText]
                 .compactMap { $0 }
@@ -1468,7 +1661,9 @@ struct ContentView: View {
                 text: parts.isEmpty ? item.name : parts.joined(separator: " ")
             )
         }
-        let indexed = AudioIntelligence.shared.buildIndex(from: documents)
+        let indexStart = Date()
+        let indexed = ai.buildIndex(from: documents)
+        let indexElapsed = Date().timeIntervalSince(indexStart)
         for document in indexed {
             if let uuid = UUID(uuidString: document.id) {
                 store.updateSearchVector(for: uuid, vector: document.vector)
@@ -1479,6 +1674,17 @@ struct ContentView: View {
             ? "EmbeddingGemma 不可用"
             : "EmbeddingGemma Q8_0 · 768 维词向量池化"
         log("Search index built: \(indexed.count) docs, dim=\(indexed.first?.vector.count ?? 0), \(searchEngineNote)")
+        callLog.record(
+            modelID: "embeddinggemma",
+            operation: "embedding-index",
+            modeRaw: nil,
+            parameters: tuningParams("embedding-index"),
+            elapsed: indexElapsed,
+            result: "\(indexed.count) 条归档 · \(indexed.first?.vector.count ?? 0) 维向量 · \(searchEngineNote)",
+            status: indexed.isEmpty ? .failed : .ok,
+            origin: callOrigin
+        )
+        log("MODEL MGMT call logged: embedding-index docs=\(indexed.count)")
     }
 
     private func runSemanticSearch(_ query: String) async {
@@ -1498,12 +1704,67 @@ struct ContentView: View {
                 vector: vector
             ))
         }
-        let hits = AudioIntelligence.shared.search(query: query, in: documents)
+        let ai = AudioIntelligence.shared
+        applyTuning()
+        let searchStart = Date()
+        let hits = ai.search(query: query, in: documents)
+        let searchElapsed = Date().timeIntervalSince(searchStart)
         searchHits = hits
         log("Semantic search [\(query)]: \(hits.count) hits")
         for hit in hits.prefix(5) {
             log(String(format: "  hit score=%.4f %@ | %@", hit.score, hit.title, hit.snippet))
         }
+        callLog.record(
+            modelID: "embeddinggemma",
+            operation: "semantic-search",
+            modeRaw: nil,
+            parameters: tuningParams("semantic-search"),
+            elapsed: searchElapsed,
+            result: "查询 [\(query)] · \(hits.count) 命中 · top=\(hits.first.map { String(format: "%.4f", $0.score) } ?? "—")",
+            status: hits.isEmpty ? .empty : .ok,
+            origin: callOrigin
+        )
+        log("MODEL MGMT call logged: semantic-search query=[\(query)] hits=\(hits.count)")
+    }
+
+    /// 打开「模式和模型」管理界面，逐段停留以便 CI 每个分段截一张静帧。
+    /// 演示中只改动一个不影响转写结果的参数（searchLimit）来证明参数可编辑
+    /// 且会写进配置/日志，随后恢复默认，保证后续流程结果不变。
+    private func demoModelManagement() async {
+        log("DEMO model management started")
+        scrollAnchor = "model-manager"
+        try? await Task.sleep(nanoseconds: 1_000_000_000)
+
+        showingModelManager = true
+        managementSection = .overview
+        await settleThenMark("模式和模型 · 概览：部署状态 / 调用统计 / 完整链路", seconds: 5)
+
+        managementSection = .models
+        await settleThenMark("模式和模型 · 模型清单：6 个模型真实打包状态与源码追溯", seconds: 5)
+
+        managementSection = .bindings
+        await settleThenMark("模式和模型 · 模式映射：普通/精准 → 主 ASR + 辅助模型链", seconds: 5)
+
+        managementSection = .tuning
+        await settleThenMark("模式和模型 · 参数配置：17 项可编辑且生效的推理参数", seconds: 4)
+        // Prove editability without changing any transcription behaviour.
+        tuningStore.tuning.searchLimit = 5
+        applyTuning()
+        log("MODEL MGMT demo: searchLimit temporarily set to 5, deviations=\(tuningStore.deviationCount)")
+        await settleThenMark("模式和模型 · 参数已修改（偏离默认 \(tuningStore.deviationCount) 项）", seconds: 4)
+        tuningStore.reset()
+        applyTuning()
+        log("MODEL MGMT demo: tuning restored to defaults, deviations=\(tuningStore.deviationCount)")
+
+        managementSection = .calls
+        await settleThenMark("模式和模型 · 调用日志：模型 / 模式 / 参数快照 / 耗时 / 结果", seconds: 6)
+
+        if let url = callLog.exportSnapshot(tuning: tuningStore.tuning) {
+            log("MODEL MGMT export: \(url.lastPathComponent), calls=\(callLog.records.count)")
+        }
+        showingModelManager = false
+        log("DEMO model management finished, total calls=\(callLog.records.count)")
+        try? await Task.sleep(nanoseconds: 1_000_000_000)
     }
 
     private func demoSemanticSearch() async {
@@ -1524,6 +1785,19 @@ struct ContentView: View {
     }
 
     // MARK: - Helpers
+
+    /// 当前 App 是手动操作还是 CI 自动演示，用于调用日志的「来源」字段。
+    private var callOrigin: String {
+        CommandLine.arguments.contains("--auto-run") ? "CI 自动演示" : "手动操作"
+    }
+
+    private func tuningParams(_ operation: String) -> [String: String] {
+        tuningStore.snapshot(operation: operation)
+    }
+
+    private func applyTuning() {
+        tuningStore.applyToAudioIntelligence(AudioIntelligence.shared)
+    }
 
     private func setStage(_ s: Stage, detail: String, progress: Double) {
         stage = s
