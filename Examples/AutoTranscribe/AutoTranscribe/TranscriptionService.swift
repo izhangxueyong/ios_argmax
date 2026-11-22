@@ -93,11 +93,10 @@ final class TranscriptionService: ObservableObject {
     private var kits: [String: WhisperKit] = [:]
 
     var loadedModelSummary: String {
-        var loaded: [String] = []
-        for mode in TranscriptionMode.allCases {
-            if kits[mode.rawValue] != nil { loaded.append(mode.shortModelTitle) }
+        let names = kits.keys.sorted().map { folder in
+            folder == "whisper-turbo" ? "Whisper Turbo" : "Whisper Base"
         }
-        return loaded.isEmpty ? "未加载" : loaded.joined(separator: " + ")
+        return names.isEmpty ? "未加载" : names.joined(separator: " + ")
     }
 
     /// Transcribe one recording and report its real wall-clock cost and the
@@ -106,10 +105,15 @@ final class TranscriptionService: ObservableObject {
         audioURL: URL,
         mode: TranscriptionMode,
         target: TranscriptionTarget,
-        tuning: ModelTuning = .defaults
+        tuning: ModelTuning = .defaults,
+        modelFolder: String? = nil
     ) async throws -> TranscriptionOutcome {
         let start = Date()
-        let kit = try await loadKit(for: mode)
+        // The active chain preset decides which bundled model actually runs.
+        // `mode` is only the default when the chain says "auto".
+        let folder = modelFolder ?? mode.folderName
+        let isBaseModel = folder == "whisper-base"
+        let kit = try await loadKit(folder: folder)
 
         var detectedCode: String?
         if let detection = try? await kit.detectLanguage(audioPath: audioURL.path) {
@@ -126,7 +130,7 @@ final class TranscriptionService: ObservableObject {
         // skipSpecialTokens, withoutTimestamps.
         let options = Self.makeOptions(
             language: language,
-            mode: mode,
+            isBaseModel: isBaseModel,
             fallback: false,
             tuning: tuning
         )
@@ -140,7 +144,7 @@ final class TranscriptionService: ObservableObject {
         if !Self.isMeaningful(text) {
             let fallbackOptions = Self.makeOptions(
                 language: detectedCode ?? language,
-                mode: mode,
+                isBaseModel: isBaseModel,
                 fallback: true,
                 tuning: tuning
             )
@@ -161,11 +165,14 @@ final class TranscriptionService: ObservableObject {
 
     private static func makeOptions(
         language: String?,
-        mode: TranscriptionMode,
+        isBaseModel: Bool,
         fallback: Bool,
         tuning: ModelTuning
     ) -> DecodingOptions {
-        let isBase = mode == .standard
+        // Base-specific recovery is keyed off the ACTUAL model that will run,
+        // not off the mode. Switching the ordinary mode to a Turbo chain must
+        // not keep the small-model workarounds enabled.
+        let isBase = isBaseModel
         // `usePrefillPrompt` MUST stay true: when false WhisperKit feeds the
         // decoder only a bare SOT token, dropping the language / task /
         // timestamp prompt entirely (see TranscribeTask.swift).
@@ -239,9 +246,9 @@ final class TranscriptionService: ObservableObject {
         return sanitize(results.map { $0.text }.joined(separator: " "))
     }
 
-    private func loadKit(for mode: TranscriptionMode) async throws -> WhisperKit {
-        if let kit = kits[mode.rawValue] { return kit }
-        let directory = try bundledModelDirectory(named: mode.folderName)
+    private func loadKit(folder: String) async throws -> WhisperKit {
+        if let kit = kits[folder] { return kit }
+        let directory = try bundledModelDirectory(named: folder)
         let config = WhisperKitConfig(
             modelFolder: directory.path,
             verbose: true,
@@ -251,7 +258,7 @@ final class TranscriptionService: ObservableObject {
             download: false
         )
         let kit = try await WhisperKit(config)
-        kits[mode.rawValue] = kit
+        kits[folder] = kit
         return kit
     }
 

@@ -187,6 +187,30 @@ enum LanguageCatalog {
     static func validated(_ target: TranscriptionTarget, for mode: TranscriptionMode) -> TranscriptionTarget {
         targets(for: mode).first { $0.id == target.id } ?? defaultTarget(for: mode)
     }
+
+    // MARK: 按「实际主模型」判断，而不是按模式
+    // 自定义模型链可以把普通模式换成 Turbo，或把精准模式换成 Base。
+    // 语言目录、默认项和非法项回落都必须跟着真实模型走，否则会丢粤语
+    // 或把 yue 传给不支持它的 base tokenizer。
+
+    static func targets(forModelID id: String) -> [TranscriptionTarget] {
+        id == "whisper-turbo" ? turboTargets : baseTargets
+    }
+
+    static func countLabel(forModelID id: String) -> String {
+        id == "whisper-turbo"
+            ? "Whisper Turbo · \(turboCodes.count) 种可选识别语言（含粤语）"
+            : "Whisper Base · \(baseCodes.count) 种可选识别语言（不含粤语）"
+    }
+
+    static func defaultTarget(forModelID id: String) -> TranscriptionTarget {
+        targets(forModelID: id)[0]
+    }
+
+    static func validated(_ target: TranscriptionTarget, forModelID id: String) -> TranscriptionTarget {
+        let list = targets(forModelID: id)
+        return list.first { $0.id == target.id } ?? list[0]
+    }
 }
 
 enum RecordingSource: String, Codable, CaseIterable, Sendable {

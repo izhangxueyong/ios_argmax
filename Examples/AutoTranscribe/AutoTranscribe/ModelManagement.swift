@@ -533,7 +533,10 @@ final class ModelTuningStore: ObservableObject {
     }
 
     func valueText(for key: TuningKey) -> String {
-        let t = tuning
+        Self.text(for: key, tuning: tuning)
+    }
+
+    static func text(for key: TuningKey, tuning t: ModelTuning) -> String {
         switch key {
         case .temperature: return String(format: "%.2f", t.temperature)
         case .fallbackTemperature: return String(format: "%.2f", t.fallbackTemperature)
@@ -555,42 +558,48 @@ final class ModelTuningStore: ObservableObject {
         }
     }
 
-    /// 把当前值一次性同步给端侧 AI 引擎（标量赋值，无跨模块初始化器风险）。
-    func applyToAudioIntelligence(_ ai: AudioIntelligence) {
-        ai.vadThreshold = Float(tuning.vadThreshold)
-        ai.vadMinSilenceDuration = Float(tuning.vadMinSilence)
-        ai.vadMinSpeechDuration = Float(tuning.vadMinSpeech)
-        ai.vadWindowSize = tuning.vadWindowSize
-        ai.vadMaxSpeechDuration = Float(tuning.vadMaxSpeech)
-        ai.speakerSimilarityThreshold = tuning.speakerThreshold
-        ai.senseVoiceLanguageSetting = tuning.senseVoiceLanguage
-        ai.senseVoiceUseITN = tuning.senseVoiceITN
-        ai.senseVoiceThreadCount = tuning.senseVoiceThreads
-        ai.searchResultLimit = tuning.searchLimit
+    /// 把值同步给端侧 AI 引擎（标量赋值，无跨模块初始化器风险）。
+    /// `using` 允许按当前模式实际生效的配置方案同步，而不是全局编辑缓冲。
+    func applyToAudioIntelligence(_ ai: AudioIntelligence, using override: ModelTuning? = nil) {
+        let t = override ?? tuning
+        ai.vadThreshold = Float(t.vadThreshold)
+        ai.vadMinSilenceDuration = Float(t.vadMinSilence)
+        ai.vadMinSpeechDuration = Float(t.vadMinSpeech)
+        ai.vadWindowSize = t.vadWindowSize
+        ai.vadMaxSpeechDuration = Float(t.vadMaxSpeech)
+        ai.speakerSimilarityThreshold = t.speakerThreshold
+        ai.senseVoiceLanguageSetting = t.senseVoiceLanguage
+        ai.senseVoiceUseITN = t.senseVoiceITN
+        ai.senseVoiceThreadCount = t.senseVoiceThreads
+        ai.searchResultLimit = t.searchLimit
     }
 
-    /// 生成一份可写进调用日志的参数快照。
-    func snapshot(operation: String) -> [String: String] {
+    /// 生成一份可写进调用日志的参数快照。`using` 允许按「当前模式实际生效的
+    /// 配置方案」取参数，而不是按全局编辑缓冲取值。
+    func snapshot(operation: String, using override: ModelTuning? = nil) -> [String: String] {
         var params: [String: String] = [:]
+        let text: (TuningKey) -> String = { key in
+            Self.text(for: key, tuning: override ?? self.tuning)
+        }
         switch operation {
         case "transcribe", "retranscribe":
             for key in TuningKey.allCases where key.group == "Whisper 解码" {
-                params[key.label] = valueText(for: key)
+                params[key.label] = text(key)
             }
         case "vad+speaker":
             for key in TuningKey.allCases where key.group == "Silero VAD" || key.group == "CAMPPlus 声纹" {
-                params[key.label] = valueText(for: key)
+                params[key.label] = text(key)
             }
         case "senseVoice":
             for key in TuningKey.allCases where key.group == "SenseVoice" {
-                params[key.label] = valueText(for: key)
+                params[key.label] = text(key)
             }
         case "embedding-index", "semantic-search":
             for key in TuningKey.allCases where key.group == "EmbeddingGemma 搜索" {
-                params[key.label] = valueText(for: key)
+                params[key.label] = text(key)
             }
         default:
-            for key in TuningKey.allCases { params[key.label] = valueText(for: key) }
+            for key in TuningKey.allCases { params[key.label] = text(key) }
         }
         return params
     }
@@ -845,11 +854,13 @@ struct ExportSnapshot: Codable {
 struct ModelManagementView: View {
     @ObservedObject var tuningStore: ModelTuningStore
     @ObservedObject var callLog: ModelCallLog
+    @ObservedObject var profileStore: ModeProfileStore
     @Binding var selection: ManagementSection
     var onClose: () -> Void
     var onLog: (String) -> Void
 
     @State private var callFilter: CallFilter = .all
+    @State private var tuningMode: TranscriptionMode = .standard
 
     var body: some View {
         NavigationStack {
@@ -914,8 +925,12 @@ struct ModelManagementView: View {
 
             MMCard(title: "配置状态", symbol: "slider.horizontal.3") {
                 MMKeyValue("可配置参数", "\(TuningCatalog.specs.count) 项")
-                MMKeyValue("偏离默认", "\(tuningStore.deviationCount) 项")
-                MMKeyValue("配置持久化", "Documents/model_config.json")
+                MMKeyValue("配置方案", "\(profileStore.profiles.count) 个 · 自定义 \(profileStore.customConfigCount)")
+                MMKeyValue("模型链", "\(profileStore.chains.count) 条 · 自定义 \(profileStore.customChainCount)")
+                MMKeyValue("普通模式", "\(profileStore.config(for: .standard).name) + \(profileStore.chain(for: .standard).name)")
+                MMKeyValue("精准模式", "\(profileStore.config(for: .precise).name) + \(profileStore.chain(for: .precise).name)")
+                MMKeyValue("编辑缓冲偏离", "\(tuningStore.deviationCount) 项")
+                MMKeyValue("配置持久化", "model_config.json · mode_profiles.json")
                 MMKeyValue("调用日志持久化", "Documents/model_calls.json")
                 Button {
                     if let url = callLog.exportSnapshot(tuning: tuningStore.tuning) {
@@ -959,18 +974,32 @@ struct ModelManagementView: View {
 
     private var bindingsSection: some View {
         VStack(spacing: 12) {
-            ForEach(ModeBindingRegistry.bindings) { binding in
-                ModeBindingCard(binding: binding)
+            MMCard(title: "两个模式各自独立配置", symbol: "slider.horizontal.3") {
+                Text("每个模式可以分别选择「配置方案」（17 项推理参数的一套命名快照）和「模型链」（主 ASR + 辅助模型链）。切换后立即作用于下一次转写，并写进调用日志。")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                Text("内置方案只读；点「另存为自定义配置」或「新建自定义链」即可得到可命名的 xx 自定义配置 / xx 自定义模型链。")
+                    .font(.caption2)
+                    .foregroundColor(.blue)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
 
-            MMCard(title: "语言目录差异", symbol: "globe") {
+            ForEach(TranscriptionMode.allCases) { mode in
+                ModeProfileCard(mode: mode, store: profileStore, onLog: onLog)
+            }
+
+            ProfileLibraryCard(store: profileStore, onLog: onLog)
+
+            MMCard(title: "语言目录按实际主模型判断", symbol: "globe") {
                 Text("Whisper 的 language 参数是「把音频当作何种语言解码」，不是翻译。")
                     .font(.caption2)
                     .foregroundColor(.orange)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                MMKeyValue("普通模式", "99 语种 · 无粤语 yue · 自动检测 + 99 = 100 项")
-                MMKeyValue("精准模式", "100 语种 · 含粤语 yue · 自动检测 + 100 = 101 项")
-                Text("切换模式时 selectedTarget 会回落到该模式默认项；选错语言可在条目的感叹号备注里重新转写重选。")
+                ForEach(TranscriptionMode.allCases) { mode in
+                    MMKeyValue(mode.title, languageNote(for: mode))
+                }
+                Text("把普通模式换成 Turbo 链后，语言目录会自动变成 100 语种（含粤语）；换回 Base 则回到 99 语种。选错语言可在条目的感叹号备注里重新转写重选。")
                     .font(.caption2)
                     .foregroundColor(.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -978,17 +1007,54 @@ struct ModelManagementView: View {
         }
     }
 
+    private func languageNote(for mode: TranscriptionMode) -> String {
+        let primary = profileStore.primaryModelID(for: mode)
+        let isTurbo = primary == "whisper-turbo"
+        let count = isTurbo ? LanguageCatalog.turboCodes.count : LanguageCatalog.baseCodes.count
+        return "\(primary) · \(count) 语种\(isTurbo ? " · 含粤语" : " · 无粤语")"
+    }
+
     // MARK: 参数配置
 
     private var tuningSection: some View {
         VStack(spacing: 12) {
+            MMCard(title: "按模式编辑配置方案", symbol: "square.and.pencil") {
+                Picker("编辑哪个模式", selection: $tuningMode) {
+                    ForEach(TranscriptionMode.allCases) { mode in
+                        Text(mode.title).tag(mode)
+                    }
+                }
+                .pickerStyle(.segmented)
+                MMKeyValue("当前配置方案", profileStore.config(for: tuningMode).name)
+                MMKeyValue("当前模型链", "\(profileStore.chain(for: tuningMode).name) · \(profileStore.primaryModelID(for: tuningMode))")
+                Text("下方是编辑缓冲。点「载入所选方案」读入该模式的 17 项参数，改完点「保存到当前方案」写回；若当前是内置方案，会自动派生一份自定义副本，内置方案不会被改掉。")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                HStack(spacing: 8) {
+                    Button {
+                        tuningStore.tuning = profileStore.tuning(for: tuningMode)
+                        onLog("MODEL PROFILE loaded tuning from \(profileStore.config(for: tuningMode).name) mode=\(tuningMode.rawValue)")
+                    } label: {
+                        Label("载入所选方案", systemImage: "arrow.down.circle").font(.caption2.bold())
+                    }
+                    .buttonStyle(.bordered)
+                    Button {
+                        profileStore.applyTuning(tuningStore.tuning, for: tuningMode, onLog: onLog)
+                    } label: {
+                        Label("保存到当前方案", systemImage: "arrow.up.circle").font(.caption2.bold())
+                    }
+                    .buttonStyle(.bordered)
+                }
+            }
+
             MMCard(title: "参数生效说明", symbol: "info.circle.fill") {
                 Text("此页参数会真实作用于下一次调用：Whisper 解码参数传入 DecodingOptions；VAD / 声纹 / SenseVoice / 搜索参数写入端侧引擎。每次调用的参数快照会记入「日志」分段。")
                     .font(.caption2)
                     .foregroundColor(.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
                 HStack {
-                    Text("偏离默认 \(tuningStore.deviationCount) 项")
+                    Text("编辑缓冲偏离默认 \(tuningStore.deviationCount) 项")
                         .font(.caption.bold())
                         .foregroundColor(tuningStore.deviationCount == 0 ? .green : .orange)
                     Spacer()
@@ -1385,3 +1451,504 @@ struct CallRecordCard: View {
         }
     }
 }
+
+// MARK: - 配置方案（Profile）与模型链预设（Chain Preset）
+//
+// 之前的实现只有一份全局 ModelTuning 和一张只读的模式映射表，因此
+// 「模式」页无法选择配置方案或模型链。这里补上两层可持久化、可命名、
+// 可按模式分别绑定的配置实体：
+//   * ModelConfigProfile：17 项推理参数的一套命名快照
+//   * ModelChainPreset：主 ASR + 辅助模型链的一套命名执行计划
+// 两者都不是静态展示：主 ASR 决定 WhisperKitConfig(modelFolder:)，
+// stages 决定 VAD / 声纹 / SenseVoice / 向量索引是否被调用。
+
+struct ModelConfigProfile: Codable, Identifiable, Equatable, Sendable {
+    var id: String
+    var name: String
+    var note: String
+    var tuning: ModelTuning
+    var isBuiltIn: Bool
+    var createdAt: Date
+}
+
+struct ModelChainPreset: Codable, Identifiable, Equatable, Sendable {
+    var id: String
+    var name: String
+    var note: String
+    /// "auto" = 跟随模式默认主模型；也可强制 "whisper-base" / "whisper-turbo"。
+    var primaryModelID: String
+    /// 实际会执行的辅助模型，顺序即执行顺序。
+    var stages: [String]
+    var isBuiltIn: Bool
+    var createdAt: Date
+
+    var primaryLabel: String {
+        switch primaryModelID {
+        case "auto": return "跟随模式默认"
+        case "whisper-turbo": return "Whisper Turbo · 632MB"
+        default: return "Whisper Base"
+        }
+    }
+
+    func resolvedPrimary(for mode: TranscriptionMode) -> String {
+        primaryModelID == "auto"
+            ? (mode == .standard ? "whisper-base" : "whisper-turbo")
+            : primaryModelID
+    }
+
+    func resolvedFolder(for mode: TranscriptionMode) -> String {
+        resolvedPrimary(for: mode) == "whisper-turbo" ? "whisper-turbo" : "whisper-base"
+    }
+}
+
+struct ModeProfileSelection: Codable, Equatable, Sendable {
+    var modeRaw: String
+    var configID: String
+    var chainID: String
+}
+
+struct ModeProfileSnapshot: Codable {
+    var profiles: [ModelConfigProfile]
+    var chains: [ModelChainPreset]
+    var selections: [ModeProfileSelection]
+}
+
+final class ModeProfileStore: ObservableObject {
+    static let defaultConfigID = "config-default"
+    static let defaultChainID = "chain-default"
+    static let allStageIDs = ["silero-vad", "campplus", "sense-voice", "embeddinggemma"]
+
+    @Published private(set) var profiles: [ModelConfigProfile]
+    @Published private(set) var chains: [ModelChainPreset]
+    @Published private(set) var selections: [ModeProfileSelection]
+
+    private let fileURL: URL = FileManager.default
+        .urls(for: .documentDirectory, in: .userDomainMask)[0]
+        .appendingPathComponent("mode_profiles.json")
+
+    init() {
+        let builtInProfiles = Self.makeBuiltInProfiles()
+        let builtInChains = Self.makeBuiltInChains()
+        var loadedProfiles = builtInProfiles
+        var loadedChains = builtInChains
+        var loadedSelections = Self.makeDefaultSelections()
+
+        if let data = try? Data(contentsOf: fileURL) {
+            let decoder = JSONDecoder()
+            decoder.dateDecodingStrategy = .iso8601
+            if let snap = try? decoder.decode(ModeProfileSnapshot.self, from: data) {
+                loadedProfiles += snap.profiles.filter { !$0.isBuiltIn }
+                loadedChains += snap.chains.filter { !$0.isBuiltIn }
+                for mode in TranscriptionMode.allCases {
+                    if let saved = snap.selections.first(where: { $0.modeRaw == mode.rawValue }),
+                       loadedProfiles.contains(where: { $0.id == saved.configID }),
+                       loadedChains.contains(where: { $0.id == saved.chainID }),
+                       let index = loadedSelections.firstIndex(where: { $0.modeRaw == mode.rawValue }) {
+                        loadedSelections[index] = saved
+                    }
+                }
+            }
+        }
+        profiles = loadedProfiles
+        chains = loadedChains
+        selections = loadedSelections
+    }
+
+    private static func makeBuiltInProfiles() -> [ModelConfigProfile] {
+        let epoch = Date(timeIntervalSince1970: 0)
+        var base = ModelTuning.defaults
+        base.temperature = 0.2
+        base.fallbackTemperature = 0.4
+        base.fallbackCount = 2
+        var turbo = ModelTuning.defaults
+        turbo.temperatureFallbackCount = 3
+        turbo.searchLimit = 6
+        return [
+            ModelConfigProfile(id: defaultConfigID, name: "默认配置",
+                               note: "17 项出厂参数 · 两种模式共用的基线",
+                               tuning: .defaults, isBuiltIn: true, createdAt: epoch),
+            ModelConfigProfile(id: "config-base", name: "Whisper Base 默认配置",
+                               note: "小模型保守解码 · 提高温度、缩短 fallback",
+                               tuning: base, isBuiltIn: true, createdAt: epoch),
+            ModelConfigProfile(id: "config-turbo", name: "Whisper Turbo 默认配置",
+                               note: "大模型精确解码 · 减少 fallback、收紧搜索条数",
+                               tuning: turbo, isBuiltIn: true, createdAt: epoch)
+        ]
+    }
+
+    private static func makeBuiltInChains() -> [ModelChainPreset] {
+        let epoch = Date(timeIntervalSince1970: 0)
+        return [
+            ModelChainPreset(id: defaultChainID, name: "默认模型链",
+                             note: "主 ASR 跟随模式 + VAD → 声纹 → SenseVoice → 向量索引",
+                             primaryModelID: "auto", stages: allStageIDs,
+                             isBuiltIn: true, createdAt: epoch),
+            ModelChainPreset(id: "chain-minimal", name: "极简链 · 仅 VAD",
+                             note: "跳过声纹 / 二次识别 / 向量索引，只做语音段检测",
+                             primaryModelID: "auto", stages: ["silero-vad"],
+                             isBuiltIn: true, createdAt: epoch),
+            ModelChainPreset(id: "chain-turbo", name: "Turbo 全量链",
+                             note: "强制主 ASR 用 632MB Turbo，保留全部辅助模型",
+                             primaryModelID: "whisper-turbo", stages: allStageIDs,
+                             isBuiltIn: true, createdAt: epoch)
+        ]
+    }
+
+    private static func makeDefaultSelections() -> [ModeProfileSelection] {
+        TranscriptionMode.allCases.map {
+            ModeProfileSelection(modeRaw: $0.rawValue,
+                                 configID: defaultConfigID,
+                                 chainID: defaultChainID)
+        }
+    }
+
+    // MARK: 读取当前模式生效的配置
+
+    func selection(for mode: TranscriptionMode) -> ModeProfileSelection {
+        selections.first { $0.modeRaw == mode.rawValue }
+            ?? ModeProfileSelection(modeRaw: mode.rawValue,
+                                    configID: Self.defaultConfigID,
+                                    chainID: Self.defaultChainID)
+    }
+
+    func config(for mode: TranscriptionMode) -> ModelConfigProfile {
+        profiles.first { $0.id == selection(for: mode).configID } ?? profiles[0]
+    }
+
+    func chain(for mode: TranscriptionMode) -> ModelChainPreset {
+        chains.first { $0.id == selection(for: mode).chainID } ?? chains[0]
+    }
+
+    func tuning(for mode: TranscriptionMode) -> ModelTuning { config(for: mode).tuning }
+    func primaryModelID(for mode: TranscriptionMode) -> String { chain(for: mode).resolvedPrimary(for: mode) }
+    func folder(for mode: TranscriptionMode) -> String { chain(for: mode).resolvedFolder(for: mode) }
+    func stages(for mode: TranscriptionMode) -> [String] { chain(for: mode).stages }
+    func uses(_ modelID: String, for mode: TranscriptionMode) -> Bool { stages(for: mode).contains(modelID) }
+
+    var customConfigCount: Int { profiles.filter { !$0.isBuiltIn }.count }
+    var customChainCount: Int { chains.filter { !$0.isBuiltIn }.count }
+
+    // MARK: 修改并持久化
+
+    func setConfig(id: String, for mode: TranscriptionMode, onLog: (String) -> Void) {
+        guard profiles.contains(where: { $0.id == id }) else { return }
+        updateSelection(for: mode) { $0.configID = id }
+        onLog("MODEL PROFILE mode=\(mode.rawValue) config=\(profiles.first { $0.id == id }?.name ?? id)")
+    }
+
+    func setChain(id: String, for mode: TranscriptionMode, onLog: (String) -> Void) {
+        guard chains.contains(where: { $0.id == id }) else { return }
+        updateSelection(for: mode) { $0.chainID = id }
+        let primary = primaryModelID(for: mode)
+        onLog("MODEL PROFILE mode=\(mode.rawValue) chain=\(chains.first { $0.id == id }?.name ?? id) primary=\(primary) stages=\(stages(for: mode).joined(separator: ","))")
+    }
+
+    private func updateSelection(for mode: TranscriptionMode, mutate: (inout ModeProfileSelection) -> Void) {
+        if let index = selections.firstIndex(where: { $0.modeRaw == mode.rawValue }) {
+            mutate(&selections[index])
+        } else {
+            var fresh = ModeProfileSelection(modeRaw: mode.rawValue,
+                                             configID: Self.defaultConfigID,
+                                             chainID: Self.defaultChainID)
+            mutate(&fresh)
+            selections.append(fresh)
+        }
+        persist()
+    }
+
+    /// 以当前所选方案为模板另存一份可编辑的自定义配置，并立即切到它。
+    @discardableResult
+    func saveCustomConfig(name: String, for mode: TranscriptionMode, onLog: (String) -> Void) -> String {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let finalName = trimmed.isEmpty ? "自定义配置 \(customConfigCount + 1)" : trimmed
+        let id = "config-custom-\(UUID().uuidString.prefix(8))"
+        let profile = ModelConfigProfile(id: id, name: finalName,
+                                         note: "由「\(config(for: mode).name)」另存 · 可单独修改 17 项参数",
+                                         tuning: tuning(for: mode), isBuiltIn: false, createdAt: Date())
+        profiles.append(profile)
+        setConfig(id: id, for: mode, onLog: onLog)
+        onLog("MODEL PROFILE saved custom config=\(finalName) id=\(id)")
+        return id
+    }
+
+    /// 新建自定义模型链：指定主 ASR 与勾选的辅助模型，并立即切到它。
+    @discardableResult
+    func saveCustomChain(name: String, primary: String, stages: [String],
+                         for mode: TranscriptionMode, onLog: (String) -> Void) -> String {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let finalName = trimmed.isEmpty ? "自定义链 \(customChainCount + 1)" : trimmed
+        let id = "chain-custom-\(UUID().uuidString.prefix(8))"
+        let ordered = Self.allStageIDs.filter { stages.contains($0) }
+        let chain = ModelChainPreset(id: id, name: finalName,
+                                     note: "自定义 · 主 ASR \(chainLabel(primary)) · 辅助 \(ordered.count) 个",
+                                     primaryModelID: primary, stages: ordered,
+                                     isBuiltIn: false, createdAt: Date())
+        chains.append(chain)
+        setChain(id: id, for: mode, onLog: onLog)
+        onLog("MODEL PROFILE saved custom chain=\(finalName) id=\(id) stages=\(ordered.joined(separator: ","))")
+        return id
+    }
+
+    private func chainLabel(_ primary: String) -> String {
+        switch primary {
+        case "auto": return "跟随模式默认"
+        case "whisper-turbo": return "Turbo"
+        default: return "Base"
+        }
+    }
+
+    /// 参数页编辑后写回。若当前选中的是内置方案，自动派生自定义副本，
+    /// 避免把内置默认方案改掉。
+    func applyTuning(_ tuning: ModelTuning, for mode: TranscriptionMode, onLog: (String) -> Void) {
+        var targetID = selection(for: mode).configID
+        if profiles.first(where: { $0.id == targetID })?.isBuiltIn == true {
+            targetID = saveCustomConfig(name: "", for: mode, onLog: onLog)
+        }
+        if let index = profiles.firstIndex(where: { $0.id == targetID }) {
+            profiles[index].tuning = tuning
+            persist()
+            onLog("MODEL PROFILE tuning written to \(profiles[index].name) mode=\(mode.rawValue)")
+        }
+    }
+
+    func deleteCustomConfig(id: String, onLog: (String) -> Void) {
+        guard let profile = profiles.first(where: { $0.id == id }), !profile.isBuiltIn else { return }
+        profiles.removeAll { $0.id == id }
+        for mode in TranscriptionMode.allCases where selection(for: mode).configID == id {
+            updateSelection(for: mode) { $0.configID = Self.defaultConfigID }
+        }
+        onLog("MODEL PROFILE deleted config=\(profile.name)")
+    }
+
+    func deleteCustomChain(id: String, onLog: (String) -> Void) {
+        guard let chain = chains.first(where: { $0.id == id }), !chain.isBuiltIn else { return }
+        chains.removeAll { $0.id == id }
+        for mode in TranscriptionMode.allCases where selection(for: mode).chainID == id {
+            updateSelection(for: mode) { $0.chainID = Self.defaultChainID }
+        }
+        onLog("MODEL PROFILE deleted chain=\(chain.name)")
+    }
+
+    func resetAll(onLog: (String) -> Void) {
+        profiles = Self.makeBuiltInProfiles()
+        chains = Self.makeBuiltInChains()
+        selections = Self.makeDefaultSelections()
+        persist()
+        onLog("MODEL PROFILE reset to built-in defaults")
+    }
+
+    private func persist() {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        encoder.dateEncodingStrategy = .iso8601
+        let snapshot = ModeProfileSnapshot(profiles: profiles.filter { !$0.isBuiltIn },
+                                           chains: chains.filter { !$0.isBuiltIn },
+                                           selections: selections)
+        guard let data = try? encoder.encode(snapshot) else { return }
+        try? data.write(to: fileURL, options: .atomic)
+    }
+}
+
+// MARK: - 模式页：两个真正会生效的选择器
+
+struct ModeProfileCard: View {
+    let mode: TranscriptionMode
+    @ObservedObject var store: ModeProfileStore
+    var onLog: (String) -> Void
+
+    @State private var showingSaveConfig = false
+    @State private var configName = ""
+    @State private var showingNewChain = false
+    @State private var chainName = ""
+    @State private var chainPrimary = "auto"
+    @State private var chainStages: Set<String> = Set(ModeProfileStore.allStageIDs)
+
+    private var activeConfig: ModelConfigProfile { store.config(for: mode) }
+    private var activeChain: ModelChainPreset { store.chain(for: mode) }
+    private var activePrimaryName: String {
+        ModelRegistry.descriptor(store.primaryModelID(for: mode))?.name ?? store.primaryModelID(for: mode)
+    }
+
+    private var configBinding: Binding<String> {
+        Binding(get: { store.selection(for: mode).configID },
+                set: { store.setConfig(id: $0, for: mode, onLog: onLog) })
+    }
+
+    private var chainBinding: Binding<String> {
+        Binding(get: { store.selection(for: mode).chainID },
+                set: { store.setChain(id: $0, for: mode, onLog: onLog) })
+    }
+
+    var body: some View {
+        MMCard(title: mode.title, symbol: mode == .standard ? "bolt.fill" : "sparkles") {
+            Text("配置方案").font(.caption.bold())
+            Picker("配置方案", selection: configBinding) {
+                ForEach(store.profiles) { profile in
+                    Text(profile.name + (profile.isBuiltIn ? "" : " · 自定义")).tag(profile.id)
+                }
+            }
+            .pickerStyle(.menu)
+            .font(.caption)
+            Text(activeConfig.note).font(.caption2).foregroundColor(.secondary)
+            MMKeyValue("解码温度", String(format: "%.2f", activeConfig.tuning.temperature))
+            MMKeyValue("搜索条数", "\(activeConfig.tuning.searchLimit)")
+
+            Divider()
+            Text("模型链").font(.caption.bold())
+            Picker("模型链", selection: chainBinding) {
+                ForEach(store.chains) { chain in
+                    Text(chain.name + (chain.isBuiltIn ? "" : " · 自定义")).tag(chain.id)
+                }
+            }
+            .pickerStyle(.menu)
+            .font(.caption)
+            Text(activeChain.note).font(.caption2).foregroundColor(.secondary)
+            MMKeyValue("主 ASR", activePrimaryName)
+            MMKeyValue("模型目录", "Models/\(store.folder(for: mode))")
+            if activeChain.stages.isEmpty {
+                Text("辅助模型链为空 · 只跑主 ASR 转写")
+                    .font(.caption2).foregroundColor(.orange)
+            } else {
+                ForEach(activeChain.stages.indices, id: \.self) { index in
+                    PipelineRow(index: index, modelID: activeChain.stages[index])
+                }
+            }
+
+            Divider()
+            HStack(spacing: 8) {
+                Button {
+                    configName = activeConfig.name + " · 副本"
+                    showingSaveConfig = true
+                } label: {
+                    Label("另存为自定义配置", systemImage: "plus.square")
+                        .font(.caption2.bold())
+                }
+                .buttonStyle(.bordered)
+                Button {
+                    chainName = ""
+                    chainPrimary = activeChain.primaryModelID
+                    chainStages = Set(activeChain.stages)
+                    showingNewChain = true
+                } label: {
+                    Label("新建自定义链", systemImage: "arrow.triangle.branch")
+                        .font(.caption2.bold())
+                }
+                .buttonStyle(.bordered)
+            }
+        }
+        .alert("另存为自定义配置", isPresented: $showingSaveConfig) {
+            TextField("方案名称", text: $configName)
+            Button("保存") {
+                _ = store.saveCustomConfig(name: configName, for: mode, onLog: onLog)
+            }
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text("以「\(activeConfig.name)」的 17 项参数为起点另存，保存后可单独修改并在这里切换。")
+        }
+        .sheet(isPresented: $showingNewChain) { chainEditor }
+    }
+
+    private func stageBinding(_ id: String) -> Binding<Bool> {
+        Binding(get: { chainStages.contains(id) },
+                set: { enabled in
+                    if enabled { chainStages.insert(id) } else { chainStages.remove(id) }
+                })
+    }
+
+    private var chainEditor: some View {
+        NavigationStack {
+            Form {
+                Section("链名称") {
+                    TextField("例如：会议双人链", text: $chainName)
+                }
+                Section("主 ASR") {
+                    Picker("主模型", selection: $chainPrimary) {
+                        Text("跟随模式默认").tag("auto")
+                        Text("Whisper Base").tag("whisper-base")
+                        Text("Whisper Turbo · 632MB").tag("whisper-turbo")
+                    }
+                    .pickerStyle(.segmented)
+                    Text("强制指定主模型后，语言目录与解码策略都会按实际模型判断，不再按模式硬编码。")
+                        .font(.caption2).foregroundColor(.secondary)
+                }
+                Section("辅助模型链（勾选才会被调用）") {
+                    ForEach(ModeProfileStore.allStageIDs, id: \.self) { id in
+                        Toggle(ModelRegistry.descriptor(id)?.name ?? id, isOn: stageBinding(id))
+                    }
+                }
+                Section {
+                    Text("未勾选的模型不会出现在调用日志里；链为空时只跑主 ASR。")
+                        .font(.caption2).foregroundColor(.secondary)
+                }
+            }
+            .navigationTitle("新建模型链")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("取消") { showingNewChain = false }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("保存") {
+                        let ordered = ModeProfileStore.allStageIDs.filter { chainStages.contains($0) }
+                        let id = store.saveCustomChain(name: chainName, primary: chainPrimary,
+                                                       stages: ordered, for: mode, onLog: onLog)
+                        store.setChain(id: id, for: mode, onLog: onLog)
+                        showingNewChain = false
+                    }
+                }
+            }
+        }
+    }
+}
+
+struct ProfileLibraryCard: View {
+    @ObservedObject var store: ModeProfileStore
+    var onLog: (String) -> Void
+
+    var body: some View {
+        MMCard(title: "方案库", symbol: "square.stack.3d.up") {
+            Text("配置方案 \(store.profiles.count) 个（自定义 \(store.customConfigCount)）· 模型链 \(store.chains.count) 条（自定义 \(store.customChainCount)）")
+                .font(.caption2).foregroundColor(.secondary)
+            Divider()
+            Text("配置方案").font(.caption.bold())
+            ForEach(store.profiles) { profile in
+                HStack(spacing: 6) {
+                    Text(profile.name).font(.caption)
+                    Spacer()
+                    Text(profile.isBuiltIn ? "内置" : "自定义")
+                        .font(.caption2).foregroundColor(profile.isBuiltIn ? .secondary : .blue)
+                    if !profile.isBuiltIn {
+                        Button("删除") { store.deleteCustomConfig(id: profile.id, onLog: onLog) }
+                            .font(.caption2).buttonStyle(.borderless)
+                    }
+                }
+            }
+            Divider()
+            Text("模型链").font(.caption.bold())
+            ForEach(store.chains) { chain in
+                HStack(spacing: 6) {
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(chain.name).font(.caption)
+                        Text("\(chain.primaryLabel) · 辅助 \(chain.stages.count) 个")
+                            .font(.caption2).foregroundColor(.secondary)
+                    }
+                    Spacer()
+                    if !chain.isBuiltIn {
+                        Button("删除") { store.deleteCustomChain(id: chain.id, onLog: onLog) }
+                            .font(.caption2).buttonStyle(.borderless)
+                    } else {
+                        Text("内置").font(.caption2).foregroundColor(.secondary)
+                    }
+                }
+            }
+            Divider()
+            MMKeyValue("持久化", "Documents/mode_profiles.json")
+            HStack {
+                Spacer()
+                Button("全部恢复内置默认") { store.resetAll(onLog: onLog) }
+                    .font(.caption2.bold()).buttonStyle(.bordered)
+            }
+        }
+    }
+}
+

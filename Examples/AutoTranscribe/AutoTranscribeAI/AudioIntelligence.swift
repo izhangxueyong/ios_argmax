@@ -109,6 +109,8 @@ public final class AudioIntelligence: @unchecked Sendable {
     public var vadWindowSize: Int = 512
     public var vadMaxSpeechDuration: Float = 8.0
     public var speakerSimilarityThreshold: Double = 0.62
+    /// 由「模型链」预设控制：关闭后 analyze() 只做 VAD 分段，不再调用 CAMPPlus。
+    public var enableSpeakerVerification: Bool = true
     public var senseVoiceLanguageSetting: String = "auto" {
         didSet { cachedRecognizer = nil }
     }
@@ -210,6 +212,16 @@ public final class AudioIntelligence: @unchecked Sendable {
         if ranges.isEmpty {
             ranges = Self.energySegments(samples: samples)
             note = "能量检测（Silero VAD 未返回语音段）"
+        }
+        if !enableSpeakerVerification {
+            let vadOnly: [VoiceSegment] = ranges.map { range in
+                let start = Double(range.0) / 16_000.0
+                let end = Double(min(range.1, samples.count)) / 16_000.0
+                return VoiceSegment(start: start, end: max(end, start + 0.01),
+                                    isMe: false, similarity: 0)
+            }
+            return AudioAnalysis(duration: duration, segments: vadOnly, speakerDimension: 0,
+                                 engineNote: note + " · CAMPPlus 已按模型链关闭")
         }
         if referenceVector.isEmpty { enrollMockVoice() }
 

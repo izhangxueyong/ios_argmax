@@ -46,6 +46,7 @@ struct ContentView: View {
     @StateObject private var service = TranscriptionService()
     @StateObject private var tuningStore = ModelTuningStore()
     @StateObject private var callLog = ModelCallLog()
+    @StateObject private var profileStore = ModeProfileStore()
 
     @State private var selectedMode: TranscriptionMode = .standard
     @State private var selectedTarget: TranscriptionTarget = LanguageCatalog.defaultTarget(for: .standard)
@@ -214,6 +215,7 @@ struct ContentView: View {
             ModelManagementView(
                 tuningStore: tuningStore,
                 callLog: callLog,
+                profileStore: profileStore,
                 selection: $managementSection,
                 onClose: {
                     showingModelManager = false
@@ -248,7 +250,7 @@ struct ContentView: View {
                 set: { newMode in
                     selectedMode = newMode
                     // The two catalogs are different: never carry an illegal target over.
-                    selectedTarget = LanguageCatalog.defaultTarget(for: newMode)
+                    selectedTarget = LanguageCatalog.defaultTarget(forModelID: profileStore.primaryModelID(for: newMode))
                 }
             )) {
                 ForEach(TranscriptionMode.allCases) { mode in
@@ -276,13 +278,13 @@ struct ContentView: View {
                 Text("识别语言").font(.caption.bold())
                 Spacer()
                 Picker("识别语言", selection: $selectedTarget) {
-                    ForEach(LanguageCatalog.targets(for: selectedMode)) { option in
+                    ForEach(LanguageCatalog.targets(forModelID: profileStore.primaryModelID(for: selectedMode))) { option in
                         Text(option.title).tag(option)
                     }
                 }
                 .pickerStyle(.menu)
             }
-            Text(LanguageCatalog.countLabel(for: selectedMode))
+            Text(LanguageCatalog.countLabel(forModelID: profileStore.primaryModelID(for: selectedMode)))
                 .font(.caption2)
                 .foregroundColor(.blue)
             Text("选什么语言，就把录音当作什么语言转写，输出同语种文本；不是翻译。")
@@ -449,7 +451,7 @@ struct ContentView: View {
                 .font(.caption2)
                 .foregroundColor(.secondary)
             Menu {
-                ForEach(LanguageCatalog.targets(for: selectedMode).filter { $0.languageCode != nil }) { option in
+                ForEach(LanguageCatalog.targets(forModelID: profileStore.primaryModelID(for: selectedMode)).filter { $0.languageCode != nil }) { option in
                     Button(option.title) {
                         var updated = holdLanguages
                         updated[slot] = option.languageCode ?? "en"
@@ -974,7 +976,7 @@ struct ContentView: View {
             initialMode = selectedMode
         }
         retranscribeMode = initialMode
-        retranscribeTarget = LanguageCatalog.defaultTarget(for: initialMode)
+        retranscribeTarget = LanguageCatalog.defaultTarget(forModelID: profileStore.primaryModelID(for: initialMode))
         retranscribeNote = ""
         retranscribeResult = nil
         reviewTarget = .retranscribe(item)
@@ -1108,7 +1110,8 @@ struct ContentView: View {
         // What the user asked for, NOT a translation target.
         let chosen = LanguageCatalog.displayName(for: target.languageCode)
         return TranscriptionMeta(
-            modelName: mode.modelTitle,
+            modelName: profileStore.primaryModelID(for: mode) == "whisper-turbo"
+                ? "Whisper Turbo · 632MB" : "Whisper Base",
             modeTitle: mode.title,
             modeRaw: mode.rawValue,
             elapsed: outcome.elapsed,
@@ -1126,25 +1129,33 @@ struct ContentView: View {
             return
         }
         let mode = selectedMode
+        // The active chain decides the real primary model; the active config
+        // profile decides the 17 decoding parameters. Neither is hard-coded.
+        let primary = profileStore.primaryModelID(for: mode)
+        let folder = profileStore.folder(for: mode)
+        let effectiveTuning = profileStore.tuning(for: mode)
+        let chainName = profileStore.chain(for: mode).name
+        let configName = profileStore.config(for: mode).name
         // A hold-to-talk clip carries the language of the button that recorded
         // it. That language wins over the global picker for this one clip.
         let target: TranscriptionTarget
         if let code = item.holdLanguageCode,
-           let matched = LanguageCatalog.targets(for: mode).first(where: { $0.languageCode == code }) {
+           let matched = LanguageCatalog.targets(forModelID: primary).first(where: { $0.languageCode == code }) {
             target = matched
         } else {
-            target = LanguageCatalog.validated(selectedTarget, for: mode)
+            target = LanguageCatalog.validated(selectedTarget, forModelID: primary)
         }
         currentItemName = item.name
         transcript = ""
-        setStage(.loading, detail: "加载内置 \(mode.modelTitle)…", progress: 0.1)
-        log("Transcribe start: \(item.fileName), mode=\(mode.rawValue), language=\(target.id) (from \(item.holdLanguageCode ?? "global picker"))")
+        setStage(.loading, detail: "加载内置 \(primary == "whisper-turbo" ? "Whisper Turbo · 632MB" : "Whisper Base")…", progress: 0.1)
+        log("Transcribe start: \(item.fileName), mode=\(mode.rawValue), model=\(primary), chain=\(chainName), config=\(configName), language=\(target.id) (from \(item.holdLanguageCode ?? "global picker"))")
 
-        let params = tuningParams("transcribe")
+        let params = tuningParams("transcribe", mode: mode)
         let callStart = Date()
         do {
             let outcome = try await service.transcribe(
-                audioURL: url, mode: mode, target: target, tuning: tuningStore.tuning
+                audioURL: url, mode: mode, target: target,
+                tuning: effectiveTuning, modelFolder: folder
             )
             transcript = outcome.text
             let meta = makeMeta(
@@ -1160,7 +1171,7 @@ struct ContentView: View {
                 log("INVALID TRANSCRIPT diagnostic: \(diagnostic)")
             }
             callLog.record(
-                modelID: mode == .standard ? "whisper-base" : "whisper-turbo",
+                modelID: profileStore.primaryModelID(for: mode),
                 operation: "transcribe",
                 modeRaw: mode.rawValue,
                 parameters: params,
@@ -1176,7 +1187,7 @@ struct ContentView: View {
             setStage(.failed, detail: msg, progress: 0)
             log("Transcribe failed: \(msg)")
             callLog.record(
-                modelID: mode == .standard ? "whisper-base" : "whisper-turbo",
+                modelID: profileStore.primaryModelID(for: mode),
                 operation: "transcribe",
                 modeRaw: mode.rawValue,
                 parameters: params,
@@ -1199,18 +1210,22 @@ struct ContentView: View {
             retranscribeNote = "找不到录音文件"
             return
         }
-        let validated = LanguageCatalog.validated(target, for: mode)
+        let primary = profileStore.primaryModelID(for: mode)
+        let folder = profileStore.folder(for: mode)
+        let effectiveTuning = profileStore.tuning(for: mode)
+        let validated = LanguageCatalog.validated(target, forModelID: primary)
         retranscribeBusy = true
         retranscribeResult = nil
-        retranscribeNote = "正在用 \(mode.modelTitle) · \(validated.title) 重新转写…"
+        retranscribeNote = "正在用 \(primary == "whisper-turbo" ? "Whisper Turbo" : "Whisper Base") · \(validated.title) 重新转写…"
         setStage(.loading, detail: retranscribeNote, progress: 0.15)
-        log("RETRANSCRIBE start: \(item.fileName), mode=\(mode.rawValue), target=\(validated.id)")
-        let params = tuningParams("retranscribe")
+        log("RETRANSCRIBE start: \(item.fileName), mode=\(mode.rawValue), model=\(primary), chain=\(profileStore.chain(for: mode).name), config=\(profileStore.config(for: mode).name), target=\(validated.id)")
+        let params = tuningParams("retranscribe", mode: mode)
         let callStart = Date()
 
         do {
             let outcome = try await service.transcribe(
-                audioURL: url, mode: mode, target: validated, tuning: tuningStore.tuning
+                audioURL: url, mode: mode, target: validated,
+                tuning: effectiveTuning, modelFolder: folder
             )
             let meta = makeMeta(
                 mode: mode,
@@ -1230,7 +1245,7 @@ struct ContentView: View {
                 log("INVALID RETRANSCRIPT diagnostic: \(diagnostic)")
             }
             callLog.record(
-                modelID: mode == .standard ? "whisper-base" : "whisper-turbo",
+                modelID: profileStore.primaryModelID(for: mode),
                 operation: "retranscribe",
                 modeRaw: mode.rawValue,
                 parameters: params,
@@ -1252,7 +1267,7 @@ struct ContentView: View {
             setStage(.failed, detail: retranscribeNote, progress: 0)
             log("RETRANSCRIBE failed: \(msg)")
             callLog.record(
-                modelID: mode == .standard ? "whisper-base" : "whisper-turbo",
+                modelID: profileStore.primaryModelID(for: mode),
                 operation: "retranscribe",
                 modeRaw: mode.rawValue,
                 parameters: params,
@@ -1591,66 +1606,88 @@ struct ContentView: View {
 
     private func analyzeRecording(_ item: RecordingItem, audioURL: URL) async {
         let ai = AudioIntelligence.shared
-        applyTuning()
-        let vadStart = Date()
-        let analysis = ai.analyze(audioURL: audioURL)
-        let vadElapsed = Date().timeIntervalSince(vadStart)
-        store.updateAnalysis(for: item.id, analysis: analysis)
-        let mine = analysis.segments.filter(\.isMe).count
-        log("VAD/CAMPPlus \(item.fileName): segments=\(analysis.segments.count) me=\(mine) note=\(analysis.engineNote)")
-        for segment in analysis.segments.prefix(4) {
-            log(String(format: "  VAD segment %.2f-%.2fs score=%.3f me=%@",
-                       segment.start, segment.end, segment.similarity,
-                       segment.isMe ? "YES" : "NO"))
-        }
-        callLog.record(
-            modelID: "silero-vad",
-            operation: "vad+speaker",
-            modeRaw: selectedMode.rawValue,
-            parameters: tuningParams("vad+speaker"),
-            elapsed: vadElapsed,
-            result: "\(analysis.segments.count) 段 · \(mine) 段判为我 · \(analysis.engineNote)",
-            status: analysis.segments.isEmpty ? .empty : .ok,
-            origin: callOrigin
-        )
-        callLog.record(
-            modelID: "campplus",
-            operation: "speaker-verify",
-            modeRaw: selectedMode.rawValue,
-            parameters: tuningParams("vad+speaker"),
-            elapsed: vadElapsed,
-            result: "\(mine)/\(analysis.segments.count) 段判为「我」· 参考向量 \(analysis.speakerDimension) 维",
-            status: analysis.speakerDimension == 0 ? .failed : .ok,
-            origin: callOrigin
-        )
+        let mode = selectedMode
+        applyTuning(for: mode)
+        let runVAD = profileStore.uses("silero-vad", for: mode)
+        let runSpeaker = profileStore.uses("campplus", for: mode)
+        let runSense = profileStore.uses("sense-voice", for: mode)
+        log("MODEL CHAIN \(item.fileName): \(profileStore.chain(for: mode).name) · vad=\(runVAD) campplus=\(runSpeaker) senseVoice=\(runSense) embeddinggemma=\(profileStore.uses("embeddinggemma", for: mode))")
 
-        let senseStart = Date()
-        let sense = ai.senseVoiceTranscribe(audioURL: audioURL)
-        let senseElapsed = Date().timeIntervalSince(senseStart)
-        if !sense.text.isEmpty {
-            store.updateSenseVoice(for: item.id, text: sense.text, language: sense.language)
-            senseVoicePreview = sense.text
-            senseVoiceLanguage = sense.language
-            log("SenseVoice \(item.fileName): lang=\(sense.language) text=\(sense.text)")
+        if runVAD {
+            ai.enableSpeakerVerification = runSpeaker
+            let vadStart = Date()
+            let analysis = ai.analyze(audioURL: audioURL)
+            let vadElapsed = Date().timeIntervalSince(vadStart)
+            store.updateAnalysis(for: item.id, analysis: analysis)
+            let mine = analysis.segments.filter(\.isMe).count
+            log("VAD/CAMPPlus \(item.fileName): segments=\(analysis.segments.count) me=\(mine) note=\(analysis.engineNote)")
+            for segment in analysis.segments.prefix(4) {
+                log(String(format: "  VAD segment %.2f-%.2fs score=%.3f me=%@",
+                           segment.start, segment.end, segment.similarity,
+                           segment.isMe ? "YES" : "NO"))
+            }
+            callLog.record(
+                modelID: "silero-vad",
+                operation: "vad+speaker",
+                modeRaw: mode.rawValue,
+                parameters: tuningParams("vad+speaker", mode: mode),
+                elapsed: vadElapsed,
+                result: "\(analysis.segments.count) 段 · \(mine) 段判为我 · \(analysis.engineNote)",
+                status: analysis.segments.isEmpty ? .empty : .ok,
+                origin: callOrigin
+            )
+            if runSpeaker {
+                callLog.record(
+                    modelID: "campplus",
+                    operation: "speaker-verify",
+                    modeRaw: mode.rawValue,
+                    parameters: tuningParams("vad+speaker", mode: mode),
+                    elapsed: vadElapsed,
+                    result: "\(mine)/\(analysis.segments.count) 段判为「我」· 参考向量 \(analysis.speakerDimension) 维",
+                    status: analysis.speakerDimension == 0 ? .failed : .ok,
+                    origin: callOrigin
+                )
+            }
+            ai.enableSpeakerVerification = true
         } else {
-            log("SenseVoice \(item.fileName): empty, \(sense.note)")
+            log("MODEL CHAIN skipped silero-vad / campplus for \(item.fileName)")
         }
-        callLog.record(
-            modelID: "sense-voice",
-            operation: "senseVoice",
-            modeRaw: selectedMode.rawValue,
-            parameters: tuningParams("senseVoice"),
-            elapsed: senseElapsed,
-            result: sense.text.isEmpty ? sense.note : "lang=\(sense.language) · \(sense.text)",
-            status: sense.text.isEmpty ? .empty : .ok,
-            origin: callOrigin
-        )
-        log("MODEL MGMT call logged: vad+speaker / speaker-verify / senseVoice for \(item.fileName)")
+
+        if runSense {
+            let senseStart = Date()
+            let sense = ai.senseVoiceTranscribe(audioURL: audioURL)
+            let senseElapsed = Date().timeIntervalSince(senseStart)
+            if !sense.text.isEmpty {
+                store.updateSenseVoice(for: item.id, text: sense.text, language: sense.language)
+                senseVoicePreview = sense.text
+                senseVoiceLanguage = sense.language
+                log("SenseVoice \(item.fileName): lang=\(sense.language) text=\(sense.text)")
+            } else {
+                log("SenseVoice \(item.fileName): empty, \(sense.note)")
+            }
+            callLog.record(
+                modelID: "sense-voice",
+                operation: "senseVoice",
+                modeRaw: mode.rawValue,
+                parameters: tuningParams("senseVoice", mode: mode),
+                elapsed: senseElapsed,
+                result: sense.text.isEmpty ? sense.note : "lang=\(sense.language) · \(sense.text)",
+                status: sense.text.isEmpty ? .empty : .ok,
+                origin: callOrigin
+            )
+        } else {
+            log("MODEL CHAIN skipped sense-voice for \(item.fileName)")
+        }
+        log("MODEL MGMT call logged: chain-aware analysis for \(item.fileName)")
     }
 
     private func rebuildSearchIndex() async {
+        guard profileStore.uses("embeddinggemma", for: selectedMode) else {
+            log("MODEL CHAIN skipped embeddinggemma index · \(profileStore.chain(for: selectedMode).name)")
+            return
+        }
         let ai = AudioIntelligence.shared
-        applyTuning()
+        applyTuning(for: selectedMode)
         let documents = store.items.map { item -> (id: String, title: String, text: String) in
             let parts = [item.transcript, item.senseVoiceText]
                 .compactMap { $0 }
@@ -1689,6 +1726,11 @@ struct ContentView: View {
 
     private func runSemanticSearch(_ query: String) async {
         guard !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        guard profileStore.uses("embeddinggemma", for: selectedMode) else {
+            log("MODEL CHAIN skipped semantic search · \(profileStore.chain(for: selectedMode).name)")
+            searchHits = []
+            return
+        }
         searchQuery = query
         // Build the document list explicitly. Xcode 16.4's Swift compiler
         // mis-infers compactMap's closure result as non-optional here, which
@@ -1736,6 +1778,7 @@ struct ContentView: View {
         try? await Task.sleep(nanoseconds: 1_000_000_000)
 
         showingModelManager = true
+        let profileLog: (String) -> Void = { message in log(message) }
         managementSection = .overview
         await settleThenMark("模式和模型 · 概览：部署状态 / 调用统计 / 完整链路", seconds: 5)
 
@@ -1743,28 +1786,85 @@ struct ContentView: View {
         await settleThenMark("模式和模型 · 模型清单：6 个模型真实打包状态与源码追溯", seconds: 5)
 
         managementSection = .bindings
-        await settleThenMark("模式和模型 · 模式映射：普通/精准 → 主 ASR + 辅助模型链", seconds: 5)
+        await settleThenMark("模式和模型 · 模式页：每个模式可选「配置方案」与「模型链」", seconds: 5)
+
+        // 1) 切到内置的 Turbo 默认配置 + Turbo 全量链
+        profileStore.setConfig(id: "config-turbo", for: .standard, onLog: profileLog)
+        profileStore.setChain(id: "chain-turbo", for: .standard, onLog: profileLog)
+        await settleThenMark("模式和模型 · 普通模式改用「Whisper Turbo 默认配置 + Turbo 全量链」", seconds: 5)
+
+        // 2) 命名另存出 xx 自定义配置 / xx 自定义模型链
+        let customConfig = profileStore.saveCustomConfig(name: "演示 · 会议配置", for: .standard, onLog: profileLog)
+        profileStore.setConfig(id: customConfig, for: .standard, onLog: profileLog)
+        let customChain = profileStore.saveCustomChain(
+            name: "演示 · 双人会议链", primary: "whisper-turbo",
+            stages: ["silero-vad", "campplus", "sense-voice"],
+            for: .standard, onLog: profileLog
+        )
+        profileStore.setChain(id: customChain, for: .standard, onLog: profileLog)
+        await settleThenMark("模式和模型 · 已保存「演示 · 会议配置」与「演示 · 双人会议链」", seconds: 5)
+
+        // 3) 用普通模式真实跑一次，证明主 ASR 确实变成了 Turbo
+        await verifyProfileRuntime()
+        await settleThenMark("模式和模型 · 已按新模式链重跑转写（调用日志可核对主 ASR）", seconds: 4)
 
         managementSection = .tuning
-        await settleThenMark("模式和模型 · 参数配置：17 项可编辑且生效的推理参数", seconds: 4)
-        // Prove editability without changing any transcription behaviour.
+        await settleThenMark("模式和模型 · 参数页：按模式载入 / 保存到配置方案", seconds: 4)
+        tuningStore.tuning = profileStore.tuning(for: .standard)
         tuningStore.tuning.searchLimit = 5
-        applyTuning()
-        log("MODEL MGMT demo: searchLimit temporarily set to 5, deviations=\(tuningStore.deviationCount)")
-        await settleThenMark("模式和模型 · 参数已修改（偏离默认 \(tuningStore.deviationCount) 项）", seconds: 4)
+        applyTuning(for: .standard)
+        log("MODEL MGMT demo: editor buffer changed, deviations=\(tuningStore.deviationCount)")
+        await settleThenMark("模式和模型 · 参数已修改（编辑缓冲偏离 \(tuningStore.deviationCount) 项）", seconds: 4)
+        profileStore.applyTuning(tuningStore.tuning, for: .standard, onLog: profileLog)
+        await settleThenMark("模式和模型 · 参数已写入当前配置方案", seconds: 4)
         tuningStore.reset()
         applyTuning()
-        log("MODEL MGMT demo: tuning restored to defaults, deviations=\(tuningStore.deviationCount)")
+        log("MODEL MGMT demo: editor buffer restored, deviations=\(tuningStore.deviationCount)")
 
         managementSection = .calls
-        await settleThenMark("模式和模型 · 调用日志：模型 / 模式 / 参数快照 / 耗时 / 结果", seconds: 6)
+        await settleThenMark("模式和模型 · 调用日志：模型 / 模式 / 配置方案 / 模型链 / 参数快照", seconds: 6)
 
         if let url = callLog.exportSnapshot(tuning: tuningStore.tuning) {
             log("MODEL MGMT export: \(url.lastPathComponent), calls=\(callLog.records.count)")
         }
         showingModelManager = false
+        profileStore.resetAll(onLog: profileLog)
         log("DEMO model management finished, total calls=\(callLog.records.count)")
         try? await Task.sleep(nanoseconds: 1_000_000_000)
+    }
+
+    /// 用内置 JFK 样本按「当前模式所选方案 / 链」真实跑一次转写，
+    /// 把实际主模型写进调用日志——证明选择生效，不是静态展示。
+    private func verifyProfileRuntime() async {
+        guard let sample = Bundle.main.url(forResource: "recording", withExtension: "wav") else {
+            log("MODEL PROFILE verify skipped: bundled sample missing")
+            return
+        }
+        let mode: TranscriptionMode = .standard
+        let folder = profileStore.folder(for: mode)
+        let primary = profileStore.primaryModelID(for: mode)
+        let tuning = profileStore.tuning(for: mode)
+        let target = LanguageCatalog.defaultTarget(forModelID: primary)
+        log("MODEL PROFILE verify start: mode=\(mode.rawValue) primary=\(primary) folder=\(folder) config=\(profileStore.config(for: mode).name) chain=\(profileStore.chain(for: mode).name)")
+        do {
+            let outcome = try await service.transcribe(
+                audioURL: sample, mode: mode, target: target,
+                tuning: tuning, modelFolder: folder
+            )
+            callLog.record(
+                modelID: primary,
+                operation: "profile-verify",
+                modeRaw: mode.rawValue,
+                parameters: tuningParams("transcribe", mode: mode),
+                elapsed: outcome.elapsed,
+                result: "chain=\(profileStore.chain(for: mode).name) · config=\(profileStore.config(for: mode).name) · folder=\(folder) · \(outcome.text.prefix(90))",
+                status: outcome.text.isEmpty ? .empty : .ok,
+                origin: callOrigin
+            )
+            log("MODEL PROFILE verify done: model=\(primary) elapsed=\(String(format: "%.1f", outcome.elapsed)) text=\(outcome.text.prefix(90))")
+        } catch {
+            log("MODEL PROFILE verify failed: \(error.localizedDescription)")
+        }
     }
 
     private func demoSemanticSearch() async {
@@ -1791,12 +1891,27 @@ struct ContentView: View {
         CommandLine.arguments.contains("--auto-run") ? "CI 自动演示" : "手动操作"
     }
 
-    private func tuningParams(_ operation: String) -> [String: String] {
-        tuningStore.snapshot(operation: operation)
+    /// 调用日志的参数快照取「该模式当前实际生效的配置方案」，并附上
+    /// 配置方案名 / 模型链名 / 解析后的主 ASR / 辅助链，便于事后追溯。
+    private func tuningParams(_ operation: String, mode: TranscriptionMode? = nil) -> [String: String] {
+        let activeMode = mode ?? selectedMode
+        var params = tuningStore.snapshot(
+            operation: operation,
+            using: profileStore.tuning(for: activeMode)
+        )
+        params["配置方案"] = profileStore.config(for: activeMode).name
+        params["模型链"] = profileStore.chain(for: activeMode).name
+        params["主 ASR"] = profileStore.primaryModelID(for: activeMode)
+        params["辅助链"] = profileStore.stages(for: activeMode).joined(separator: ",")
+        return params
     }
 
-    private func applyTuning() {
-        tuningStore.applyToAudioIntelligence(AudioIntelligence.shared)
+    private func applyTuning(for mode: TranscriptionMode? = nil) {
+        let activeMode = mode ?? selectedMode
+        tuningStore.applyToAudioIntelligence(
+            AudioIntelligence.shared,
+            using: profileStore.tuning(for: activeMode)
+        )
     }
 
     private func setStage(_ s: Stage, detail: String, progress: Double) {
@@ -2202,6 +2317,7 @@ struct ReviewSheet: View {
                     item: store.item(with: item.id) ?? item,
                     mode: $retranscribeMode,
                     target: $retranscribeTarget,
+                    profileStore: profileStore,
                     busy: retranscribeBusy,
                     note: retranscribeNote,
                     result: retranscribeResult,
@@ -2361,14 +2477,19 @@ struct RetranscribeView: View {
     let item: RecordingItem
     @Binding var mode: TranscriptionMode
     @Binding var target: TranscriptionTarget
+    @ObservedObject var profileStore: ModeProfileStore
     let busy: Bool
     let note: String
     let result: TranscriptionMeta?
     let onStart: (TranscriptionMode, TranscriptionTarget) -> Void
     @Environment(\.dismiss) private var dismiss
 
-    private var options: [TranscriptionTarget] { LanguageCatalog.targets(for: mode) }
-    private var effectiveTarget: TranscriptionTarget { LanguageCatalog.validated(target, for: mode) }
+    private var options: [TranscriptionTarget] {
+        LanguageCatalog.targets(forModelID: profileStore.primaryModelID(for: mode))
+    }
+    private var effectiveTarget: TranscriptionTarget {
+        LanguageCatalog.validated(target, forModelID: profileStore.primaryModelID(for: mode))
+    }
 
     var body: some View {
         NavigationStack {
@@ -2441,7 +2562,7 @@ struct RetranscribeView: View {
                 get: { mode },
                 set: { newMode in
                     mode = newMode
-                    target = LanguageCatalog.defaultTarget(for: newMode)
+                    target = LanguageCatalog.defaultTarget(forModelID: profileStore.primaryModelID(for: newMode))
                 }
             )) {
                 ForEach(TranscriptionMode.allCases) { option in
@@ -2449,7 +2570,7 @@ struct RetranscribeView: View {
                 }
             }
             .pickerStyle(.segmented)
-            Text("模型：\(mode.modelTitle) · Models/\(mode.folderName)")
+            Text("模型：\(profileStore.primaryModelID(for: mode)) · Models/\(profileStore.folder(for: mode)) · \(profileStore.chain(for: mode).name)")
                 .font(.caption2)
                 .foregroundColor(.secondary)
         }
@@ -2467,7 +2588,7 @@ struct RetranscribeView: View {
                 }
             }
             .pickerStyle(.menu)
-            Text(LanguageCatalog.countLabel(for: mode))
+            Text(LanguageCatalog.countLabel(forModelID: profileStore.primaryModelID(for: mode)))
                 .font(.caption.bold())
                 .foregroundColor(.blue)
             Text("当前：\(effectiveTarget.title) · \(effectiveTarget.detail)")
