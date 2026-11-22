@@ -47,6 +47,7 @@ struct ContentView: View {
     @StateObject private var tuningStore = ModelTuningStore()
     @StateObject private var callLog = ModelCallLog()
     @StateObject private var profileStore = ModeProfileStore()
+    @StateObject private var configGuide = ConfigDemoGuide()
 
     @State private var selectedMode: TranscriptionMode = .standard
     @State private var selectedTarget: TranscriptionTarget = LanguageCatalog.defaultTarget(for: .standard)
@@ -217,6 +218,7 @@ struct ContentView: View {
                 tuningStore: tuningStore,
                 callLog: callLog,
                 profileStore: profileStore,
+                guide: configGuide,
                 selection: $managementSection,
                 onClose: {
                     showingModelManager = false
@@ -1774,6 +1776,9 @@ struct ContentView: View {
     /// 打开「模式和模型」管理界面，逐段停留以便 CI 每个分段截一张静帧。
     /// 演示中只改动一个不影响转写结果的参数（searchLimit）来证明参数可编辑
     /// 且会写进配置/日志，随后恢复默认，保证后续流程结果不变。
+    /// 配置教学录像：逐步展开两个选择器的真实选项清单，点选、另存、新建链、
+    /// 真实转写验证、参数写回、日志核对。每一步都调用 markScreen，CI 会为
+    /// 每一步抓一张截帧。
     private func demoModelManagement() async {
         log("DEMO model management started")
         scrollAnchor = "model-manager"
@@ -1782,53 +1787,148 @@ struct ContentView: View {
         showingModelManager = true
         let profileLog: (String) -> Void = { message in log(message) }
         managementSection = .overview
-        await settleThenMark("模式和模型 · 概览：部署状态 / 调用统计 / 完整链路", seconds: 5)
+        configGuide.active = true
+        configGuide.total = 15
 
+        // 1 · 入口与概览
+        configGuide.announce(step: 1,
+            title: "第 1 步 · 打开「模式和模型」",
+            detail: "五个分段：概览 / 模型 / 模式 / 参数 / 日志。配置方案与模型链在「模式」分段。",
+            hint: "先看部署状态与调用统计")
+        await settleThenMark("配置教学 1 · 概览：6 个模型 · 调用统计 · 配置状态", seconds: 5)
+
+        // 2 · 模型清单
         managementSection = .models
-        await settleThenMark("模式和模型 · 模型清单：6 个模型真实打包状态与源码追溯", seconds: 5)
+        configGuide.announce(step: 2,
+            title: "第 2 步 · 核对模型清单",
+            detail: "两个 Whisper 主 ASR + Silero VAD / CAMPPlus / SenseVoice / EmbeddingGemma 四个端侧模型。",
+            hint: "确认两个主模型目录")
+        await settleThenMark("配置教学 2 · 模型清单：whisper-base / whisper-turbo / 4 个辅助模型", seconds: 5)
 
+        // 3 · 模式页
         managementSection = .bindings
-        await settleThenMark("模式和模型 · 模式页：每个模式可选「配置方案」与「模型链」", seconds: 5)
+        configGuide.announce(step: 3,
+            title: "第 3 步 · 切到「模式」分段",
+            detail: "普通模式与精准模式各有一张卡片，分别选「配置方案」与「模型链」，互不串线。",
+            hint: "下面以普通模式演示", focus: .config)
+        await settleThenMark("配置教学 3 · 模式页：默认配置 + 默认模型链（两个选择器）", seconds: 5)
 
-        // 1) 切到内置的 Turbo 默认配置 + Turbo 全量链
+        // 4 · 展开配置方案选项清单
+        configGuide.present(.configOptions, for: .standard)
+        configGuide.announce(step: 4,
+            title: "第 4 步 · 点「配置方案」展开选项清单",
+            detail: "清单列出 3 套内置方案和所有自定义方案，并显示每套的温度 / fallback / 搜索条数。",
+            hint: "▼ 选项清单已展开", focus: .config)
+        await settleThenMark("配置教学 4 · 配置方案选项清单展开：3 内置 + 自定义", seconds: 6)
+
+        // 5 · 选中 Turbo 配置
+        configGuide.dismiss()
         profileStore.setConfig(id: "config-turbo", for: .standard, onLog: profileLog)
-        profileStore.setChain(id: "chain-turbo", for: .standard, onLog: profileLog)
-        await settleThenMark("模式和模型 · 普通模式改用「Whisper Turbo 默认配置 + Turbo 全量链」", seconds: 5)
+        configGuide.announce(step: 5,
+            title: "第 5 步 · 选中「Whisper Turbo 默认配置」",
+            detail: "卡片数值随之变化：温度 0.00 / 搜索条数 6 / fallback 3，选择已写入 mode_profiles.json。",
+            hint: "选择立即生效", focus: .chain)
+        await settleThenMark("配置教学 5 · 普通模式配置方案 → Whisper Turbo 默认配置", seconds: 6)
 
-        // 2) 命名另存出 xx 自定义配置 / xx 自定义模型链
+        // 6 · 展开模型链选项清单
+        configGuide.present(.chainOptions, for: .standard)
+        configGuide.announce(step: 6,
+            title: "第 6 步 · 点「模型链」展开选项清单",
+            detail: "清单列出 3 条内置链和所有自定义链，显示主 ASR 与辅助链步骤。",
+            hint: "▼ 模型链清单已展开", focus: .chain)
+        await settleThenMark("配置教学 6 · 模型链选项清单展开：3 内置 + 自定义", seconds: 6)
+
+        // 7 · 选中 Turbo 全量链
+        configGuide.dismiss()
+        profileStore.setChain(id: "chain-turbo", for: .standard, onLog: profileLog)
+        configGuide.announce(step: 7,
+            title: "第 7 步 · 选中「Turbo 全量链」",
+            detail: "主 ASR 变 Whisper Turbo，模型目录 Models/whisper-turbo，辅助链 4 步。普通模式也能强制用 Turbo。",
+            hint: "看卡片下半部分", focus: .save)
+        await settleThenMark("配置教学 7 · 普通模式模型链 → Turbo 全量链（主 ASR / 目录 / 辅助链已变）", seconds: 6)
+
+        // 8 · 另存自定义配置表单
+        configGuide.present(.saveConfig, for: .standard)
+        configGuide.announce(step: 8,
+            title: "第 8 步 · 点「另存为自定义配置」",
+            detail: "以当前方案的 17 项参数为起点，输入名称即可生成一份可单独编辑的自定义配置。",
+            hint: "▼ 命名表单已展开", focus: .save)
+        await settleThenMark("配置教学 8 · 另存自定义配置：输入名称「演示 · 会议配置」", seconds: 6)
+
+        // 9 · 保存自定义配置
+        configGuide.dismiss()
         let customConfig = profileStore.saveCustomConfig(name: "演示 · 会议配置", for: .standard, onLog: profileLog)
         profileStore.setConfig(id: customConfig, for: .standard, onLog: profileLog)
-        let customChain = profileStore.saveCustomChain(
-            name: "演示 · 双人会议链", primary: "whisper-turbo",
-            stages: ["silero-vad", "campplus", "sense-voice"],
-            for: .standard, onLog: profileLog
-        )
+        configGuide.announce(step: 9,
+            title: "第 9 步 · 保存并切换到自定义配置",
+            detail: "方案库现在多出「演示 · 会议配置 · 自定义」，内置方案保持只读不变。",
+            hint: "xx 自定义配置已生成", focus: .chainEditor)
+        await settleThenMark("配置教学 9 · 已保存「演示 · 会议配置」· 自定义（方案库可见）", seconds: 6)
+
+        // 10 · 新建自定义链表单
+        configGuide.present(.newChain, for: .standard)
+        configGuide.announce(step: 10,
+            title: "第 10 步 · 点「新建自定义链」",
+            detail: "表单里选主 ASR（本例强制 Turbo），并勾选要调用的辅助模型（本例去掉向量索引，保留 3 步）。",
+            hint: "▼ 主 ASR + 4 个开关", focus: .chainEditor)
+        await settleThenMark("配置教学 10 · 新建自定义链：主 ASR = Turbo · 辅助 3 步（去掉 EmbeddingGemma）", seconds: 7)
+
+        // 11 · 保存自定义链
+        configGuide.dismiss()
+        let customChain = profileStore.saveCustomChain(name: "演示 · 双人会议链",
+                                                       primary: "whisper-turbo",
+                                                       stages: ["silero-vad", "campplus", "sense-voice"],
+                                                       for: .standard, onLog: profileLog)
         profileStore.setChain(id: customChain, for: .standard, onLog: profileLog)
-        await settleThenMark("模式和模型 · 已保存「演示 · 会议配置」与「演示 · 双人会议链」", seconds: 5)
+        configGuide.announce(step: 11,
+            title: "第 11 步 · 保存并切换到自定义模型链",
+            detail: "卡片显示「演示 · 双人会议链 · 自定义」，主 ASR Turbo，辅助链从 4 步裁到 3 步。",
+            hint: "xx 自定义模型链已生成")
+        await settleThenMark("配置教学 11 · 已保存「演示 · 双人会议链」· 自定义（辅助 3 步）", seconds: 6)
 
-        // 3) 用普通模式真实跑一次，证明主 ASR 确实变成了 Turbo
+        // 12 · 真实转写验证
+        configGuide.announce(step: 12,
+            title: "第 12 步 · 用新链真实跑一次转写",
+            detail: "普通模式按新链加载 Models/whisper-turbo 跑 JFK 样本，结果写进调用日志（约 36 秒）。",
+            hint: "不是静态展示，是真的推理")
         await verifyProfileRuntime()
-        await settleThenMark("模式和模型 · 已按新模式链重跑转写（调用日志可核对主 ASR）", seconds: 4)
+        await settleThenMark("配置教学 12 · profile-verify 完成：主 ASR = whisper-turbo · 输出 JFK 原句", seconds: 4)
 
+        // 13 · 参数页写回
         managementSection = .tuning
-        await settleThenMark("模式和模型 · 参数页：按模式载入 / 保存到配置方案", seconds: 4)
+        configGuide.announce(step: 13,
+            title: "第 13 步 · 参数页微调并写回当前方案",
+            detail: "「载入所选方案」读入 17 项参数，改完点「保存到当前方案」；内置方案会自动派生自定义副本。",
+            hint: "示例：搜索条数 6 → 5")
         tuningStore.tuning = profileStore.tuning(for: .standard)
         tuningStore.tuning.searchLimit = 5
         applyTuning(for: .standard)
         log("MODEL MGMT demo: editor buffer changed, deviations=\(tuningStore.deviationCount)")
-        await settleThenMark("模式和模型 · 参数已修改（编辑缓冲偏离 \(tuningStore.deviationCount) 项）", seconds: 4)
         profileStore.applyTuning(tuningStore.tuning, for: .standard, onLog: profileLog)
-        await settleThenMark("模式和模型 · 参数已写入当前配置方案", seconds: 4)
+        await settleThenMark("配置教学 13 · 参数页：搜索条数 6 → 5，已写回「演示 · 会议配置」", seconds: 6)
         tuningStore.reset()
         applyTuning()
-        log("MODEL MGMT demo: editor buffer restored, deviations=\(tuningStore.deviationCount)")
 
+        // 14 · 日志页核对
         managementSection = .calls
-        await settleThenMark("模式和模型 · 调用日志：模型 / 模式 / 配置方案 / 模型链 / 参数快照", seconds: 6)
+        configGuide.announce(step: 14,
+            title: "第 14 步 · 日志页核对配置是否真的生效",
+            detail: "profile-verify 记录里写明主 ASR、模型目录、配置方案、模型链、辅助链和 17 项参数快照。",
+            hint: "调用日志逐条可查")
+        await settleThenMark("配置教学 14 · 调用日志：profile-verify 主 ASR / 模型链 / 配置方案 / 参数快照", seconds: 7)
+
+        // 15 · 方案库与复位
+        managementSection = .bindings
+        configGuide.announce(step: 15,
+            title: "第 15 步 · 方案库管理与复位",
+            detail: "内置项标「内置」不可改，自定义项带「删除」；「全部恢复内置默认」可一键复位。",
+            hint: "持久化 Documents/mode_profiles.json")
+        await settleThenMark("配置教学 15 · 方案库：内置只读 / 自定义可删 / 一键恢复内置默认", seconds: 6)
 
         if let url = callLog.exportSnapshot(tuning: tuningStore.tuning) {
             log("MODEL MGMT export: \(url.lastPathComponent), calls=\(callLog.records.count)")
         }
+        configGuide.active = false
         showingModelManager = false
         profileStore.resetAll(onLog: profileLog)
         log("DEMO model management finished, total calls=\(callLog.records.count)")

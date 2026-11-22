@@ -402,6 +402,9 @@ jobs:
           echo "=== '模式和模型' management screen lines ==="
           grep -E "MODEL MGMT|MODEL PROFILE|MODEL CHAIN|DEMO model management|tuning applied|call logged|load calls logged|deviations" "$DOCS/progress.log" || true
 
+          echo "=== 配置教学录像章节（DEMO screen 时间码） ==="
+          grep -E "DEMO screen [0-9]+: 配置教学" "$DOCS/progress.log" || true
+
           echo "=== mode profiles (mode_profiles.json) ==="
           cat "$DOCS/mode_profiles.json" 2>/dev/null || echo "(missing; built-in defaults only)"
 

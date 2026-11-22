@@ -855,6 +855,7 @@ struct ModelManagementView: View {
     @ObservedObject var tuningStore: ModelTuningStore
     @ObservedObject var callLog: ModelCallLog
     @ObservedObject var profileStore: ModeProfileStore
+    @ObservedObject var guide: ConfigDemoGuide
     @Binding var selection: ManagementSection
     var onClose: () -> Void
     var onLog: (String) -> Void
@@ -865,6 +866,7 @@ struct ModelManagementView: View {
     var body: some View {
         NavigationStack {
             VStack(spacing: 0) {
+                ConfigDemoBanner(guide: guide)
                 Picker("分段", selection: $selection) {
                     ForEach(ManagementSection.allCases) { section in
                         Text(section.title).tag(section)
@@ -894,6 +896,10 @@ struct ModelManagementView: View {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("完成") { onClose() }
                 }
+            }
+            .sheet(item: $guide.presentedSheet) { sheet in
+                ConfigDemoSheetView(guide: guide, store: profileStore,
+                                    sheet: sheet, onLog: onLog)
             }
         }
     }
@@ -986,7 +992,8 @@ struct ModelManagementView: View {
             }
 
             ForEach(TranscriptionMode.allCases) { mode in
-                ModeProfileCard(mode: mode, store: profileStore, onLog: onLog)
+                ModeProfileCard(mode: mode, store: profileStore,
+                                guide: guide, onLog: onLog)
             }
 
             ProfileLibraryCard(store: profileStore, onLog: onLog)
@@ -1749,19 +1756,13 @@ final class ModeProfileStore: ObservableObject {
     }
 }
 
-// MARK: - 模式页：两个真正会生效的选择器
+// MARK: - 模式页：两个真正会生效、且可展开的选择器
 
 struct ModeProfileCard: View {
     let mode: TranscriptionMode
     @ObservedObject var store: ModeProfileStore
+    @ObservedObject var guide: ConfigDemoGuide
     var onLog: (String) -> Void
-
-    @State private var showingSaveConfig = false
-    @State private var configName = ""
-    @State private var showingNewChain = false
-    @State private var chainName = ""
-    @State private var chainPrimary = "auto"
-    @State private var chainStages: Set<String> = Set(ModeProfileStore.allStageIDs)
 
     private var activeConfig: ModelConfigProfile { store.config(for: mode) }
     private var activeChain: ModelChainPreset { store.chain(for: mode) }
@@ -1769,39 +1770,51 @@ struct ModeProfileCard: View {
         ModelRegistry.descriptor(store.primaryModelID(for: mode))?.name ?? store.primaryModelID(for: mode)
     }
 
-    private var configBinding: Binding<String> {
-        Binding(get: { store.selection(for: mode).configID },
-                set: { store.setConfig(id: $0, for: mode, onLog: onLog) })
-    }
-
-    private var chainBinding: Binding<String> {
-        Binding(get: { store.selection(for: mode).chainID },
-                set: { store.setChain(id: $0, for: mode, onLog: onLog) })
+    private func highlighted(_ focus: ConfigDemoFocus) -> Bool {
+        guide.active && guide.focus == focus && guide.targetMode == mode
     }
 
     var body: some View {
         MMCard(title: mode.title, symbol: mode == .standard ? "bolt.fill" : "sparkles") {
             Text("配置方案").font(.caption.bold())
-            Picker("配置方案", selection: configBinding) {
-                ForEach(store.profiles) { profile in
-                    Text(profile.name + (profile.isBuiltIn ? "" : " · 自定义")).tag(profile.id)
+            Button { guide.present(.configOptions, for: mode) } label: {
+                HStack(spacing: 6) {
+                    Text(activeConfig.name).font(.caption)
+                    if !activeConfig.isBuiltIn {
+                        Text("自定义").font(.caption2).foregroundColor(.blue)
+                    }
+                    Spacer()
+                    Image(systemName: "chevron.up.chevron.down").font(.caption2)
                 }
+                .padding(8)
+                .background(RoundedRectangle(cornerRadius: 7)
+                    .fill(highlighted(.config) ? Color.orange.opacity(0.28) : Color(.secondarySystemBackground)))
+                .overlay(RoundedRectangle(cornerRadius: 7)
+                    .stroke(highlighted(.config) ? Color.orange : Color.clear, lineWidth: 3))
             }
-            .pickerStyle(.menu)
-            .font(.caption)
+            .buttonStyle(.plain)
             Text(activeConfig.note).font(.caption2).foregroundColor(.secondary)
             MMKeyValue("解码温度", String(format: "%.2f", activeConfig.tuning.temperature))
             MMKeyValue("搜索条数", "\(activeConfig.tuning.searchLimit)")
 
             Divider()
             Text("模型链").font(.caption.bold())
-            Picker("模型链", selection: chainBinding) {
-                ForEach(store.chains) { chain in
-                    Text(chain.name + (chain.isBuiltIn ? "" : " · 自定义")).tag(chain.id)
+            Button { guide.present(.chainOptions, for: mode) } label: {
+                HStack(spacing: 6) {
+                    Text(activeChain.name).font(.caption)
+                    if !activeChain.isBuiltIn {
+                        Text("自定义").font(.caption2).foregroundColor(.blue)
+                    }
+                    Spacer()
+                    Image(systemName: "chevron.up.chevron.down").font(.caption2)
                 }
+                .padding(8)
+                .background(RoundedRectangle(cornerRadius: 7)
+                    .fill(highlighted(.chain) ? Color.orange.opacity(0.28) : Color(.secondarySystemBackground)))
+                .overlay(RoundedRectangle(cornerRadius: 7)
+                    .stroke(highlighted(.chain) ? Color.orange : Color.clear, lineWidth: 3))
             }
-            .pickerStyle(.menu)
-            .font(.caption)
+            .buttonStyle(.plain)
             Text(activeChain.note).font(.caption2).foregroundColor(.secondary)
             MMKeyValue("主 ASR", activePrimaryName)
             MMKeyValue("模型目录", "Models/\(store.folder(for: mode))")
@@ -1816,86 +1829,20 @@ struct ModeProfileCard: View {
 
             Divider()
             HStack(spacing: 8) {
-                Button {
-                    configName = activeConfig.name + " · 副本"
-                    showingSaveConfig = true
-                } label: {
+                Button { guide.present(.saveConfig, for: mode) } label: {
                     Label("另存为自定义配置", systemImage: "plus.square")
                         .font(.caption2.bold())
                 }
                 .buttonStyle(.bordered)
-                Button {
-                    chainName = ""
-                    chainPrimary = activeChain.primaryModelID
-                    chainStages = Set(activeChain.stages)
-                    showingNewChain = true
-                } label: {
+                .overlay(RoundedRectangle(cornerRadius: 7)
+                    .stroke(highlighted(.save) ? Color.orange : Color.clear, lineWidth: 3))
+                Button { guide.present(.newChain, for: mode) } label: {
                     Label("新建自定义链", systemImage: "arrow.triangle.branch")
                         .font(.caption2.bold())
                 }
                 .buttonStyle(.bordered)
-            }
-        }
-        .alert("另存为自定义配置", isPresented: $showingSaveConfig) {
-            TextField("方案名称", text: $configName)
-            Button("保存") {
-                _ = store.saveCustomConfig(name: configName, for: mode, onLog: onLog)
-            }
-            Button("取消", role: .cancel) {}
-        } message: {
-            Text("以「\(activeConfig.name)」的 17 项参数为起点另存，保存后可单独修改并在这里切换。")
-        }
-        .sheet(isPresented: $showingNewChain) { chainEditor }
-    }
-
-    private func stageBinding(_ id: String) -> Binding<Bool> {
-        Binding(get: { chainStages.contains(id) },
-                set: { enabled in
-                    if enabled { chainStages.insert(id) } else { chainStages.remove(id) }
-                })
-    }
-
-    private var chainEditor: some View {
-        NavigationStack {
-            Form {
-                Section("链名称") {
-                    TextField("例如：会议双人链", text: $chainName)
-                }
-                Section("主 ASR") {
-                    Picker("主模型", selection: $chainPrimary) {
-                        Text("跟随模式默认").tag("auto")
-                        Text("Whisper Base").tag("whisper-base")
-                        Text("Whisper Turbo · 632MB").tag("whisper-turbo")
-                    }
-                    .pickerStyle(.segmented)
-                    Text("强制指定主模型后，语言目录与解码策略都会按实际模型判断，不再按模式硬编码。")
-                        .font(.caption2).foregroundColor(.secondary)
-                }
-                Section("辅助模型链（勾选才会被调用）") {
-                    ForEach(ModeProfileStore.allStageIDs, id: \.self) { id in
-                        Toggle(ModelRegistry.descriptor(id)?.name ?? id, isOn: stageBinding(id))
-                    }
-                }
-                Section {
-                    Text("未勾选的模型不会出现在调用日志里；链为空时只跑主 ASR。")
-                        .font(.caption2).foregroundColor(.secondary)
-                }
-            }
-            .navigationTitle("新建模型链")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("取消") { showingNewChain = false }
-                }
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("保存") {
-                        let ordered = ModeProfileStore.allStageIDs.filter { chainStages.contains($0) }
-                        let id = store.saveCustomChain(name: chainName, primary: chainPrimary,
-                                                       stages: ordered, for: mode, onLog: onLog)
-                        store.setChain(id: id, for: mode, onLog: onLog)
-                        showingNewChain = false
-                    }
-                }
+                .overlay(RoundedRectangle(cornerRadius: 7)
+                    .stroke(highlighted(.chainEditor) ? Color.orange : Color.clear, lineWidth: 3))
             }
         }
     }
@@ -1947,6 +1894,247 @@ struct ProfileLibraryCard: View {
                 Spacer()
                 Button("全部恢复内置默认") { store.resetAll(onLog: onLog) }
                     .font(.caption2.bold()).buttonStyle(.bordered)
+            }
+        }
+    }
+}
+
+// MARK: - 配置教学：可展开的选项清单与分步引导
+//
+// 这里的每个 sheet 都是真实可交互的界面：用户手动点选与 CI 自动演示走的是
+// 同一条路径（ModeProfileStore.setConfig / setChain / saveCustomConfig /
+// saveCustomChain），因此录像里看到的「展开选项 → 选中 → 卡片变化」不是贴图。
+
+enum ConfigDemoFocus: String, Equatable {
+    case none, config, chain, save, chainEditor
+}
+
+enum ConfigDemoSheet: String, Identifiable {
+    case configOptions, chainOptions, saveConfig, newChain
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .configOptions: return "选择配置方案"
+        case .chainOptions: return "选择模型链"
+        case .saveConfig: return "另存为自定义配置"
+        case .newChain: return "新建自定义链"
+        }
+    }
+}
+
+final class ConfigDemoGuide: ObservableObject {
+    @Published var active = false
+    @Published var step = 0
+    @Published var total = 15
+    @Published var title = ""
+    @Published var detail = ""
+    @Published var hint = ""
+    @Published var focus: ConfigDemoFocus = .none
+    @Published var targetMode: TranscriptionMode = .standard
+    @Published var presentedSheet: ConfigDemoSheet? = nil
+    @Published var configName = ""
+    @Published var chainName = ""
+    @Published var chainPrimary = "auto"
+    @Published var chainStages: Set<String> = Set(ModeProfileStore.allStageIDs)
+
+    func announce(step: Int, title: String, detail: String,
+                  hint: String = "", focus: ConfigDemoFocus = .none) {
+        self.step = step
+        self.title = title
+        self.detail = detail
+        self.hint = hint
+        self.focus = focus
+    }
+
+    func present(_ sheet: ConfigDemoSheet, for mode: TranscriptionMode) {
+        targetMode = mode
+        switch sheet {
+        case .saveConfig:
+            configName = "演示 · 会议配置"
+        case .newChain:
+            chainName = "演示 · 双人会议链"
+            chainPrimary = "whisper-turbo"
+            chainStages = Set(["silero-vad", "campplus", "sense-voice"])
+        default:
+            break
+        }
+        presentedSheet = sheet
+    }
+
+    func dismiss() { presentedSheet = nil }
+}
+
+struct ConfigDemoBanner: View {
+    @ObservedObject var guide: ConfigDemoGuide
+
+    var body: some View {
+        Group {
+            if guide.active {
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack(spacing: 8) {
+                        Text("配置教学 \(guide.step)/\(guide.total)").font(.caption2.bold())
+                        Spacer()
+                        if !guide.hint.isEmpty { Text(guide.hint).font(.caption2) }
+                    }
+                    .foregroundColor(.white.opacity(0.9))
+                    Text(guide.title).font(.subheadline.bold()).foregroundColor(.white)
+                    Text(guide.detail).font(.caption2).foregroundColor(.white.opacity(0.95))
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .background(LinearGradient(colors: [Color.indigo, Color.purple.opacity(0.85)],
+                                           startPoint: .leading, endPoint: .trailing))
+            }
+        }
+    }
+}
+
+struct ConfigDemoSheetView: View {
+    @ObservedObject var guide: ConfigDemoGuide
+    @ObservedObject var store: ModeProfileStore
+    let sheet: ConfigDemoSheet
+    var onLog: (String) -> Void
+
+    private var mode: TranscriptionMode { guide.targetMode }
+
+    var body: some View {
+        NavigationStack {
+            VStack(spacing: 0) {
+                ConfigDemoBanner(guide: guide)
+                Form {
+                    switch sheet {
+                    case .configOptions:
+                        Section("配置方案 · 点一项立即生效") {
+                            ForEach(store.profiles) { profile in
+                                Button {
+                                    store.setConfig(id: profile.id, for: mode, onLog: onLog)
+                                    guide.dismiss()
+                                } label: { configRow(profile) }
+                            }
+                        }
+                        Section {
+                            Text("内置方案只读。想改 17 项参数，请点「另存为自定义配置」得到可命名的自定义副本。")
+                                .font(.caption2).foregroundColor(.secondary)
+                            Text("当前模式：\(mode.title) · 选择写入 Documents/mode_profiles.json")
+                                .font(.caption2).foregroundColor(.secondary)
+                        }
+                    case .chainOptions:
+                        Section("模型链 · 点一项立即生效") {
+                            ForEach(store.chains) { chain in
+                                Button {
+                                    store.setChain(id: chain.id, for: mode, onLog: onLog)
+                                    guide.dismiss()
+                                } label: { chainRow(chain) }
+                            }
+                        }
+                        Section {
+                            Text("模型链决定主 ASR 的 bundle 目录与语言目录，以及 VAD / 声纹 / SenseVoice / 向量索引哪些会被调用。")
+                                .font(.caption2).foregroundColor(.secondary)
+                        }
+                    case .saveConfig:
+                        Section("方案名称") {
+                            TextField("例如：会议配置", text: $guide.configName)
+                        }
+                        Section("起点参数") {
+                            Text("以「\(store.config(for: mode).name)」的 17 项参数为起点")
+                            Text("解码温度 \(String(format: "%.2f", store.tuning(for: mode).temperature)) · 搜索条数 \(store.tuning(for: mode).searchLimit)")
+                                .font(.caption2).foregroundColor(.secondary)
+                        }
+                        Section {
+                            Button {
+                                _ = store.saveCustomConfig(name: guide.configName, for: mode, onLog: onLog)
+                                guide.dismiss()
+                            } label: {
+                                Label("保存并切换到自定义配置", systemImage: "square.and.arrow.down")
+                            }
+                        }
+                    case .newChain:
+                        Section("链名称") {
+                            TextField("例如：双人会议链", text: $guide.chainName)
+                        }
+                        Section("主 ASR") {
+                            Picker("主模型", selection: $guide.chainPrimary) {
+                                Text("跟随模式默认").tag("auto")
+                                Text("Whisper Base").tag("whisper-base")
+                                Text("Whisper Turbo · 632MB").tag("whisper-turbo")
+                            }
+                            .pickerStyle(.segmented)
+                            Text("强制指定后，转写按实际模型目录加载，不再按模式硬编码。")
+                                .font(.caption2).foregroundColor(.secondary)
+                        }
+                        Section("辅助模型链（勾选才会被调用）") {
+                            ForEach(ModeProfileStore.allStageIDs, id: \.self) { id in
+                                Toggle(ModelRegistry.descriptor(id)?.name ?? id,
+                                       isOn: Binding(get: { guide.chainStages.contains(id) },
+                                                     set: { enabled in
+                                                         if enabled { guide.chainStages.insert(id) }
+                                                         else { guide.chainStages.remove(id) }
+                                                     }))
+                            }
+                        }
+                        Section {
+                            Text("未勾选的模型不会出现在调用日志里；链为空时只跑主 ASR。")
+                                .font(.caption2).foregroundColor(.secondary)
+                            Button {
+                                let ordered = ModeProfileStore.allStageIDs.filter { guide.chainStages.contains($0) }
+                                _ = store.saveCustomChain(name: guide.chainName,
+                                                          primary: guide.chainPrimary,
+                                                          stages: ordered, for: mode, onLog: onLog)
+                                guide.dismiss()
+                            } label: {
+                                Label("保存并切换到自定义链", systemImage: "square.and.arrow.down")
+                            }
+                        }
+                    }
+                }
+            }
+            .navigationTitle(sheet.title)
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("取消") { guide.dismiss() }
+                }
+            }
+        }
+    }
+
+    private func configRow(_ profile: ModelConfigProfile) -> some View {
+        HStack(alignment: .top, spacing: 8) {
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 5) {
+                    Text(profile.name).font(.subheadline)
+                    Text(profile.isBuiltIn ? "内置" : "自定义")
+                        .font(.caption2).foregroundColor(profile.isBuiltIn ? .secondary : .blue)
+                }
+                Text(profile.note).font(.caption2).foregroundColor(.secondary)
+                Text("温度 \(String(format: "%.2f", profile.tuning.temperature)) · fallback \(profile.tuning.temperatureFallbackCount) · 搜索 \(profile.tuning.searchLimit)")
+                    .font(.caption2.monospacedDigit()).foregroundColor(.secondary)
+            }
+            Spacer()
+            if store.selection(for: mode).configID == profile.id {
+                Image(systemName: "checkmark.circle.fill").foregroundColor(.green)
+            }
+        }
+    }
+
+    private func chainRow(_ chain: ModelChainPreset) -> some View {
+        HStack(alignment: .top, spacing: 8) {
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 5) {
+                    Text(chain.name).font(.subheadline)
+                    Text(chain.isBuiltIn ? "内置" : "自定义")
+                        .font(.caption2).foregroundColor(chain.isBuiltIn ? .secondary : .blue)
+                }
+                Text(chain.note).font(.caption2).foregroundColor(.secondary)
+                Text("主 ASR \(chain.primaryLabel) · 辅助 \(chain.stages.count) 步 · \(chain.stages.joined(separator: " → "))")
+                    .font(.caption2).foregroundColor(.secondary)
+            }
+            Spacer()
+            if store.selection(for: mode).chainID == chain.id {
+                Image(systemName: "checkmark.circle.fill").foregroundColor(.green)
             }
         }
     }
