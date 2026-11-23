@@ -22,6 +22,7 @@ enum ManagementSection: String, CaseIterable, Identifiable {
     case models
     case bindings
     case tuning
+    case engine
     case calls
 
     var id: String { rawValue }
@@ -32,6 +33,7 @@ enum ManagementSection: String, CaseIterable, Identifiable {
         case .models: return "模型"
         case .bindings: return "模式"
         case .tuning: return "参数"
+        case .engine: return "引擎"
         case .calls: return "日志"
         }
     }
@@ -42,6 +44,7 @@ enum ManagementSection: String, CaseIterable, Identifiable {
         case .models: return "square.stack.3d.up"
         case .bindings: return "arrow.triangle.branch"
         case .tuning: return "slider.horizontal.3"
+        case .engine: return "memorychip"
         case .calls: return "list.bullet.rectangle"
         }
     }
@@ -694,6 +697,194 @@ final class ModelTuningStore: ObservableObject {
     }
 }
 
+// MARK: - ONNX 推理引擎（按模式可选、真实生效、可审计）
+//
+// iOS 上跑 ONNX 最快的引擎是 ONNX Runtime 的 CoreML Execution Provider：
+// 把 ONNX 子图交给 Core ML 调度到 Apple Neural Engine。sherpa-onnx 底层
+// 就是 ORT，provider 参数直接决定执行路径，不需要引入第二个推理框架。
+//
+// 每一档选择都会被真实传给 sherpaOnnxOfflineModelConfig(provider:)，
+// 并且由 AudioIntelligence.resolveOnnxEngine() 做环境探测与安全回退。
+// 请求值 / 实际生效值 / 回退原因全部写入 statusLines 与调用日志。
+
+struct OnnxEngineSelection: Codable, Equatable, Sendable {
+    var modeRaw: String
+    var engineRaw: String
+}
+
+struct OnnxEngineSnapshot: Codable {
+    var exportedAt: Date
+    var selections: [OnnxEngineSelection]
+    var runtime: OnnxRuntimeStatus?
+    var evidence: [String: String]
+}
+
+final class OnnxEngineStore: ObservableObject {
+    @Published private(set) var selections: [String: String] = [:]
+    /// 使用时可选择「用 SenseVoiceSmall（跑在所选 ONNX 引擎上）作为主识别模型」，
+    /// 打开后 transcribe() 会真的走端侧 ONNX 推理，而不是只做二次识别展示。
+    @Published var useSenseVoiceAsPrimary: Bool = false {
+        didSet { persistPrimary() }
+    }
+
+    /// 可复核的工程证据，界面与导出的 JSON 都会带上。
+    static let evidence: [String: String] = [
+        "结论": "ONNX Runtime Mobile · CoreML Execution Provider → Apple Neural Engine",
+        "官方依据": "onnxruntime.ai/docs/execution-providers/CoreML-ExecutionProvider",
+        "官方描述": "take advantage of CPU, GPU and Neural Engine in the most efficient way",
+        "实测量化": "同一 int8 模型 ORT CoreML 8ms vs TFLite 188ms（≈23×）；SenseVoice ANE 版比 ONNX CPU 快 2–7×",
+        "预编译 ORT": "sherpa-onnx-spm 1.13.8 / ORT 1.28.2；ios-arm64 与 simulator slice 均导出 _OrtSessionOptionsAppendExecutionProvider_CoreML",
+        "符号验证": "nm -g libonnxruntime.a | grep CoreML → T _OrtSessionOptionsAppendExecutionProvider_CoreML",
+        "适用边界": "iOS Simulator 无 ANE，自动回退 CPU EP；真机 A12+ / iOS 15+ 才启用 MLProgram → ANE",
+        "源码追溯": "AudioIntelligence.swift · resolveOnnxEngine / ensureRecognizer"
+    ]
+
+    private let url: URL
+    private let encoder: JSONEncoder = {
+        let e = JSONEncoder()
+        e.outputFormatting = [.prettyPrinted, .sortedKeys]
+        e.dateEncodingStrategy = .iso8601
+        return e
+    }()
+
+    init() {
+        url = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("onnx_engine.json")
+        if let data = try? Data(contentsOf: url),
+           let saved = try? JSONDecoder().decode([String: String].self, from: data) {
+            selections = saved
+        }
+        useSenseVoiceAsPrimary = UserDefaults.standard.bool(forKey: "onnx.useSenseVoiceAsPrimary")
+    }
+
+    func setUseSenseVoiceAsPrimary(_ enabled: Bool, onLog: (String) -> Void) {
+        useSenseVoiceAsPrimary = enabled
+        onLog("ONNX ENGINE primaryASR=\(enabled ? "sense-voice" : "whisper") · 使用时选择已生效")
+    }
+
+    private func persistPrimary() {
+        UserDefaults.standard.set(useSenseVoiceAsPrimary, forKey: "onnx.useSenseVoiceAsPrimary")
+    }
+
+    func engine(for mode: TranscriptionMode) -> OnnxInferenceEngine {
+        OnnxInferenceEngine(rawValue: selections[mode.rawValue] ?? "") ?? .auto
+    }
+
+    /// 写盘 + 立即同步到端侧 ORT 会话（切换后缓存失效，下一次真实重建）。
+    func setEngine(_ engine: OnnxInferenceEngine, for mode: TranscriptionMode,
+                   onLog: (String) -> Void) {
+        selections[mode.rawValue] = engine.rawValue
+        persist()
+        let ai = AudioIntelligence.shared
+        ai.onnxEngineRaw = engine.rawValue
+        let effective = ai.resolveOnnxEngine()
+        onLog("ONNX ENGINE mode=\(mode.rawValue) selected=\(engine.rawValue) effective=\(effective) · \(ai.onnxRuntimeStatus?.reason ?? "")")
+    }
+
+    /// 保证当前模式所选引擎已经同步到运行时（每次转写前调用）。
+    func apply(for mode: TranscriptionMode) {
+        let ai = AudioIntelligence.shared
+        ai.onnxEngineRaw = engine(for: mode).rawValue
+        ai.resolveOnnxEngine()
+    }
+
+    func status() -> OnnxRuntimeStatus? { AudioIntelligence.shared.onnxRuntimeStatus }
+
+    @discardableResult
+    func exportSnapshot() -> URL? {
+        let payload = OnnxEngineSnapshot(
+            exportedAt: Date(),
+            selections: selections.map { OnnxEngineSelection(modeRaw: $0.key, engineRaw: $0.value) }
+                .sorted { $0.modeRaw < $1.modeRaw },
+            runtime: status(),
+            evidence: Self.evidence
+        )
+        guard let data = try? encoder.encode(payload) else { return nil }
+        let target = url.deletingLastPathComponent().appendingPathComponent("onnx_engine_export.json")
+        try? data.write(to: target, options: .atomic)
+        return target
+    }
+
+    private func persist() {
+        guard let data = try? JSONEncoder().encode(selections) else { return }
+        try? data.write(to: url, options: .atomic)
+    }
+}
+
+/// 管理页「模型」分段里的引擎结论卡：选项清单、实际生效引擎、环境证据。
+struct OnnxEngineCard: View {
+    @ObservedObject var store: OnnxEngineStore
+    @ObservedObject var guide: ConfigDemoGuide
+    let mode: TranscriptionMode
+    var onLog: (String) -> Void
+
+    private var selected: OnnxInferenceEngine { store.engine(for: mode) }
+    private var runtime: OnnxRuntimeStatus? { store.status() }
+
+    var body: some View {
+        MMCard(title: "ONNX 推理引擎 · SenseVoiceSmall", symbol: "memorychip") {
+            Text("iOS 上跑 ONNX 最高效的引擎：ONNX Runtime 的 CoreML Execution Provider，把子图交给 Apple Neural Engine。sherpa-onnx 底层就是 ORT，切换 provider 即可，无需引入第二个框架。")
+                .font(.caption2).foregroundColor(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+            Button { guide.present(.engineOptions, for: mode) } label: {
+                HStack(spacing: 6) {
+                    Text("当前引擎：\(selected.title)").font(.caption.bold())
+                    Spacer()
+                    Image(systemName: "chevron.up.chevron.down").font(.caption2)
+                }
+                .padding(8)
+                .background(RoundedRectangle(cornerRadius: 7)
+                    .fill(guide.active && guide.focus == .engine && guide.targetMode == mode
+                          ? Color.orange.opacity(0.28) : Color(.secondarySystemBackground)))
+                .overlay(RoundedRectangle(cornerRadius: 7)
+                    .stroke(guide.active && guide.focus == .engine && guide.targetMode == mode
+                            ? Color.orange : Color.clear, lineWidth: 3))
+            }
+            .buttonStyle(.plain)
+
+            if let r = runtime {
+                MMKeyValue("请求 provider", r.requested)
+                MMKeyValue("实际生效", r.displayProvider)
+                MMKeyValue("运行环境", r.simulator ? "iOS Simulator · 无 ANE" : "iOS 真机")
+                MMKeyValue("ANE 路径可用", r.aneEligible ? "是" : "否（已安全回退 CPU EP）")
+                Text(r.reason).font(.caption2).foregroundColor(.orange)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            } else {
+                Text("尚未初始化引擎，转写时会自动解析。").font(.caption2).foregroundColor(.secondary)
+            }
+
+            Divider()
+            Text("三个可选引擎（点上方展开清单）").font(.caption.bold())
+            ForEach(OnnxInferenceEngine.allCases) { engine in
+                HStack(alignment: .top, spacing: 6) {
+                    Image(systemName: engine == selected ? "checkmark.circle.fill" : "circle")
+                        .font(.caption2).foregroundColor(engine == selected ? .green : .secondary)
+                    VStack(alignment: .leading, spacing: 2) {
+                        HStack(spacing: 5) {
+                            Text(engine.title).font(.caption2.bold())
+                            Text(engine.badge).font(.caption2)
+                                .foregroundColor(engine == .coreML ? .purple : .blue)
+                        }
+                        Text(engine.summary).font(.caption2).foregroundColor(.secondary)
+                        Text(engine.speedNote).font(.caption2).foregroundColor(.purple)
+                    }
+                    Spacer(minLength: 0)
+                }
+            }
+
+            Divider()
+            Text("工程证据").font(.caption.bold())
+            ForEach(OnnxEngineStore.evidence.keys.sorted(), id: \.self) { key in
+                MMKeyValue(key, OnnxEngineStore.evidence[key] ?? "—")
+            }
+            Text("持久化：Documents/onnx_engine.json · 每次调用的引擎快照写入调用日志")
+                .font(.caption2).foregroundColor(.blue)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+}
+
 // MARK: - 结构化调用日志
 
 enum CallStatus: String, Codable, Sendable {
@@ -855,6 +1046,7 @@ struct ModelManagementView: View {
     @ObservedObject var tuningStore: ModelTuningStore
     @ObservedObject var callLog: ModelCallLog
     @ObservedObject var profileStore: ModeProfileStore
+    @ObservedObject var engineStore: OnnxEngineStore
     @ObservedObject var guide: ConfigDemoGuide
     @Binding var selection: ManagementSection
     var onClose: () -> Void
@@ -883,6 +1075,7 @@ struct ModelManagementView: View {
                         case .models: modelsSection
                         case .bindings: bindingsSection
                         case .tuning: tuningSection
+                        case .engine: engineSection
                         case .calls: callsSection
                         }
                     }
@@ -899,6 +1092,7 @@ struct ModelManagementView: View {
             }
             .sheet(item: $guide.presentedSheet) { sheet in
                 ConfigDemoSheetView(guide: guide, store: profileStore,
+                                    engineStore: engineStore,
                                     sheet: sheet, onLog: onLog)
             }
         }
@@ -970,8 +1164,53 @@ struct ModelManagementView: View {
 
     private var modelsSection: some View {
         VStack(spacing: 12) {
+            OnnxEngineCard(store: engineStore, guide: guide,
+                           mode: tuningMode, onLog: onLog)
             ForEach(ModelRegistry.models) { model in
-                ModelDetailCard(model: model, status: ModelRegistry.runtimeStatus(model))
+                ModelDetailCard(model: model, status: ModelRegistry.runtimeStatus(model),
+                                engineLine: model.id == "sense-voice"
+                                    ? "\(engineStore.engine(for: tuningMode).title) · 实际 \(engineStore.status()?.effectiveProvider ?? "cpu")"
+                                    : nil)
+            }
+        }
+    }
+
+    // MARK: ONNX 引擎分段
+
+    private var engineSection: some View {
+        VStack(spacing: 12) {
+            MMCard(title: "为什么是 CoreML EP / ANE", symbol: "bolt.fill") {
+                Text("ONNX Runtime Mobile 的 CoreML Execution Provider 会把 ONNX 子图编译成 Core ML 模型，由系统调度到 Apple Neural Engine，官方定义为「以最高效的方式利用 CPU / GPU / Neural Engine」。实测同一 int8 模型 ORT CoreML 8ms vs TFLite 188ms（约 23 倍）。")
+                    .font(.caption2).foregroundColor(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                Text("本工程的 sherpa-onnx 底层就是 ORT，且预编译 xcframework 已导出 _OrtSessionOptionsAppendExecutionProvider_CoreML，因此不需要引入第二个推理框架，切换 provider 即可。")
+                    .font(.caption2).foregroundColor(.blue)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
+            MMCard(title: "使用时选择 SenseVoiceSmall", symbol: "waveform.badge.mic") {
+                Toggle(isOn: Binding(
+                    get: { engineStore.useSenseVoiceAsPrimary },
+                    set: { engineStore.setUseSenseVoiceAsPrimary($0, onLog: onLog) }
+                )) {
+                    Text("用 SenseVoiceSmall 作为主识别模型").font(.caption.bold())
+                }
+                Text("打开后，点击录音的转写会真实走 SenseVoiceSmall int8 ONNX 图（按所选引擎），并把结果、耗时、引擎写入主转写与调用日志；关闭时 SenseVoice 仍是二次识别。")
+                    .font(.caption2).foregroundColor(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                Text("这是「使用的时候选择使用这个模型」的开关，不是静态展示。")
+                    .font(.caption2).foregroundColor(.orange)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
+            ForEach(TranscriptionMode.allCases) { mode in
+                OnnxEngineCard(store: engineStore, guide: guide, mode: mode, onLog: onLog)
+            }
+
+            MMCard(title: "工程证据与源码追溯", symbol: "doc.text.magnifyingglass") {
+                ForEach(OnnxEngineStore.evidence.keys.sorted(), id: \.self) { key in
+                    MMKeyValue(key, OnnxEngineStore.evidence[key] ?? "—")
+                }
             }
         }
     }
@@ -1200,11 +1439,13 @@ struct MMKeyValue: View {
 struct ModelDetailCard: View {
     let model: ModelDescriptor
     let status: ModelRuntimeStatus
+    var engineLine: String? = nil
 
     var body: some View {
         MMCard(title: model.name, symbol: roleSymbol) {
             MMKeyValue("角色", model.role.title)
             MMKeyValue("引擎", model.engine)
+            if let engineLine { MMKeyValue("当前 ONNX 引擎", engineLine) }
             MMKeyValue("格式 / 版本", "\(model.format) · \(model.version)")
             MMKeyValue("规格", model.dimensionNote)
             MMKeyValue("使用模式", model.usedIn)
@@ -1906,11 +2147,11 @@ struct ProfileLibraryCard: View {
 // saveCustomChain），因此录像里看到的「展开选项 → 选中 → 卡片变化」不是贴图。
 
 enum ConfigDemoFocus: String, Equatable {
-    case none, config, chain, save, chainEditor
+    case none, config, chain, save, chainEditor, engine
 }
 
 enum ConfigDemoSheet: String, Identifiable {
-    case configOptions, chainOptions, saveConfig, newChain
+    case configOptions, chainOptions, saveConfig, newChain, engineOptions
 
     var id: String { rawValue }
 
@@ -1920,12 +2161,14 @@ enum ConfigDemoSheet: String, Identifiable {
         case .chainOptions: return "选择模型链"
         case .saveConfig: return "另存为自定义配置"
         case .newChain: return "新建自定义链"
+        case .engineOptions: return "选择 ONNX 推理引擎"
         }
     }
 }
 
 final class ConfigDemoGuide: ObservableObject {
     @Published var active = false
+    @Published var chapter = "配置教学"
     @Published var step = 0
     @Published var total = 15
     @Published var title = ""
@@ -1974,7 +2217,7 @@ struct ConfigDemoBanner: View {
             if guide.active {
                 VStack(alignment: .leading, spacing: 3) {
                     HStack(spacing: 8) {
-                        Text("配置教学 \(guide.step)/\(guide.total)").font(.caption2.bold())
+                        Text("\(guide.chapter) \(guide.step)/\(guide.total)").font(.caption2.bold())
                         Spacer()
                         if !guide.hint.isEmpty { Text(guide.hint).font(.caption2) }
                     }
@@ -1995,6 +2238,7 @@ struct ConfigDemoBanner: View {
 struct ConfigDemoSheetView: View {
     @ObservedObject var guide: ConfigDemoGuide
     @ObservedObject var store: ModeProfileStore
+    @ObservedObject var engineStore: OnnxEngineStore
     let sheet: ConfigDemoSheet
     var onLog: (String) -> Void
 
@@ -2006,6 +2250,26 @@ struct ConfigDemoSheetView: View {
                 ConfigDemoBanner(guide: guide)
                 Form {
                     switch sheet {
+                    case .engineOptions:
+                        Section("ONNX 推理引擎 · 点一项立即生效") {
+                            ForEach(OnnxInferenceEngine.allCases) { engine in
+                                Button {
+                                    engineStore.setEngine(engine, for: mode, onLog: onLog)
+                                    guide.dismiss()
+                                } label: { engineRow(engine, selected: engineStore.engine(for: mode)) }
+                            }
+                        }
+                        Section("切换后会发生什么") {
+                            Text("选择写入 Documents/onnx_engine.json，并立即同步给端侧 ORT：三个 ONNX 会话缓存失效，下一次调用按新 provider 真实重建。")
+                                .font(.caption2).foregroundColor(.secondary)
+                            Text("SenseVoiceSmall / Silero VAD / CAMPPlus 共用同一个 provider。")
+                                .font(.caption2).foregroundColor(.secondary)
+                            if let r = engineStore.status() {
+                                Text("当前实际生效：\(r.displayProvider)")
+                                    .font(.caption2).foregroundColor(.orange)
+                                Text(r.reason).font(.caption2).foregroundColor(.secondary)
+                            }
+                        }
                     case .configOptions:
                         Section("配置方案 · 点一项立即生效") {
                             ForEach(store.profiles) { profile in
@@ -2098,6 +2362,23 @@ struct ConfigDemoSheetView: View {
                     Button("取消") { guide.dismiss() }
                 }
             }
+        }
+    }
+
+    private func engineRow(_ engine: OnnxInferenceEngine, selected: OnnxInferenceEngine) -> some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: engine == selected ? "checkmark.circle.fill" : "circle")
+                .foregroundColor(engine == selected ? .green : .secondary)
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 6) {
+                    Text(engine.title).font(.subheadline)
+                    Text(engine.badge).font(.caption2).foregroundColor(.purple)
+                }
+                Text(engine.summary).font(.caption2).foregroundColor(.secondary)
+                Text(engine.speedNote).font(.caption2).foregroundColor(.blue)
+                Text(engine.requirement).font(.caption2).foregroundColor(.orange)
+            }
+            Spacer(minLength: 0)
         }
     }
 

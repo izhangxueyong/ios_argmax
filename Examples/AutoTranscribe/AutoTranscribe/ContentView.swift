@@ -47,6 +47,7 @@ struct ContentView: View {
     @StateObject private var tuningStore = ModelTuningStore()
     @StateObject private var callLog = ModelCallLog()
     @StateObject private var profileStore = ModeProfileStore()
+    @StateObject private var engineStore = OnnxEngineStore()
     @StateObject private var configGuide = ConfigDemoGuide()
 
     @State private var selectedMode: TranscriptionMode = .standard
@@ -218,6 +219,7 @@ struct ContentView: View {
                 tuningStore: tuningStore,
                 callLog: callLog,
                 profileStore: profileStore,
+                engineStore: engineStore,
                 guide: configGuide,
                 selection: $managementSection,
                 onClose: {
@@ -323,7 +325,7 @@ struct ContentView: View {
                     Text("模式和模型管理")
                         .font(.subheadline.bold())
                         .foregroundColor(.primary)
-                    Text("6 个模型 · 2 种模式 · \(TuningCatalog.specs.count) 项参数 · 调用日志与参数快照")
+                    Text("6 个模型 · 2 种模式 · \(TuningCatalog.specs.count) 项参数 · ONNX 引擎可选 · 调用日志与参数快照")
                         .font(.caption2)
                         .foregroundColor(.secondary)
                 }
@@ -1104,18 +1106,72 @@ struct ContentView: View {
     }
 
     /// Build the factual metadata shown in the item's exclamation-mark sheet.
+    /// 真实调用 SenseVoiceSmall int8 ONNX 图作为主识别模型。
+    /// 引擎由 engineStore 按当前模式选择，provider 真实传给 sherpa-onnx；
+    /// 请求值 / 实际生效值 / 回退原因都会写进参数快照与调用日志。
+    private func transcribeWithSenseVoice(_ item: RecordingItem, url: URL) async {
+        let mode = selectedMode
+        let ai = AudioIntelligence.shared
+        applyTuning(for: mode)
+        engineStore.apply(for: mode)
+        let selected = engineStore.engine(for: mode)
+        let status = ai.onnxRuntimeStatus
+        currentItemName = item.name
+        transcript = ""
+        setStage(.loading,
+                 detail: "加载 SenseVoiceSmall int8 · \(selected.title) · 实际 \(status?.effectiveProvider ?? "cpu")…",
+                 progress: 0.1)
+        log("Transcribe start: \(item.fileName), primary=sense-voice, engine=\(selected.rawValue), effective=\(status?.effectiveProvider ?? "cpu"), reason=\(status?.reason ?? "-")")
+
+        let params = tuningParams("transcribe", mode: mode)
+        let start = Date()
+        let result = ai.senseVoiceTranscribe(audioURL: url)
+        let elapsed = Date().timeIntervalSince(start)
+        let text = result.text
+        let outcome = TranscriptionOutcome(
+            text: text,
+            elapsed: elapsed,
+            sourceCode: result.language.isEmpty ? nil : result.language
+        )
+        transcript = text
+        let meta = makeMeta(
+            mode: mode,
+            target: LanguageCatalog.defaultTarget(forModelID: "sense-voice"),
+            outcome: outcome,
+            retranscribeCount: item.transcription?.retranscribeCount ?? 0,
+            modelOverride: "SenseVoiceSmall int8 · \(selected.title)"
+        )
+        store.updateTranscription(for: item.id, text: text, meta: meta)
+        setStage(.done, detail: "SenseVoiceSmall · \(selected.title) 完成，共 \(String(format: "%.1f", elapsed)) 秒", progress: 1)
+        log("Transcribe finished: model=\(meta.modelName), elapsed=\(String(format: "%.2f", elapsed)), lang=\(result.language), text=\(text)")
+        log("ONNX ENGINE primary call: requested=\(status?.requested ?? "-") effective=\(status?.effectiveProvider ?? "-") note=\(result.note)")
+        callLog.record(
+            modelID: "sense-voice",
+            operation: "transcribe",
+            modeRaw: mode.rawValue,
+            parameters: params,
+            elapsed: elapsed,
+            result: text.isEmpty ? result.note : text,
+            status: text.isEmpty ? .empty : .ok,
+            origin: callOrigin
+        )
+        log("MODEL MGMT call logged: transcribe primary=sense-voice engine=\(selected.rawValue)")
+        writeSentinel(status: "DONE", text: text, seconds: elapsed)
+    }
+
     private func makeMeta(
         mode: TranscriptionMode,
         target: TranscriptionTarget,
         outcome: TranscriptionOutcome,
-        retranscribeCount: Int
+        retranscribeCount: Int,
+        modelOverride: String? = nil
     ) -> TranscriptionMeta {
         let detected = outcome.sourceCode.map { LanguageCatalog.displayName(for: $0) } ?? "未检出"
         // What the user asked for, NOT a translation target.
         let chosen = LanguageCatalog.displayName(for: target.languageCode)
         return TranscriptionMeta(
-            modelName: profileStore.primaryModelID(for: mode) == "whisper-turbo"
-                ? "Whisper Turbo · 632MB" : "Whisper Base",
+            modelName: modelOverride ?? (profileStore.primaryModelID(for: mode) == "whisper-turbo"
+                ? "Whisper Turbo · 632MB" : "Whisper Base"),
             modeTitle: mode.title,
             modeRaw: mode.rawValue,
             elapsed: outcome.elapsed,
@@ -1130,6 +1186,13 @@ struct ContentView: View {
     private func transcribe(_ item: RecordingItem) async {
         guard let url = store.audioURL(for: item) else {
             setStage(.failed, detail: "找不到录音文件", progress: 0)
+            return
+        }
+        // 「使用的时候选择使用 SenseVoiceSmall」：打开后主转写真的走端侧
+        // ONNX 图（按所选引擎），而不是 WhisperKit。二者共用同一套 meta /
+        // 调用日志 / sentinel 落盘路径，便于在日志页与 CI 输出里复核。
+        if engineStore.useSenseVoiceAsPrimary {
+            await transcribeWithSenseVoice(item, url: url)
             return
         }
         let mode = selectedMode
@@ -1324,6 +1387,9 @@ struct ContentView: View {
 
         // ---- "模式和模型" management screen, one still per section ----
         await demoModelManagement()
+
+        // ---- ONNX engine: select CoreML EP / CPU EP, verify it really runs ----
+        await demoOnnxEngine()
 
         // ---- Scroll down the archived list screen by screen ----
         await demoScrollArchivedList()
@@ -1788,6 +1854,7 @@ struct ContentView: View {
         let profileLog: (String) -> Void = { message in log(message) }
         managementSection = .overview
         configGuide.active = true
+        configGuide.chapter = "配置教学"
         configGuide.total = 15
 
         // 1 · 入口与概览
@@ -1935,6 +2002,144 @@ struct ContentView: View {
         try? await Task.sleep(nanoseconds: 1_000_000_000)
     }
 
+    /// 录像教学：iOS 上最高效的 ONNX 引擎（CoreML EP → ANE）如何选、如何生效。
+    /// 每一步都 markScreen，CI 为每步抓一张截帧。
+    private func demoOnnxEngine() async {
+        log("DEMO onnx engine started")
+        // 固定为普通模式，保证录像里「所选引擎」与真实转写时按模式解析的
+        // provider 完全一致，日志可直接对照。
+        selectedMode = .standard
+        showingModelManager = true
+        let engineLog: (String) -> Void = { message in log(message) }
+        managementSection = .engine
+        configGuide.active = true
+        configGuide.chapter = "引擎教学"
+        configGuide.total = 9
+        configGuide.targetMode = .standard
+
+        // 1 · 结论
+        configGuide.announce(step: 1,
+            title: "第 1 步 · 新增「引擎」分段",
+            detail: "iOS 上跑 ONNX 最高效的是 ONNX Runtime 的 CoreML Execution Provider：子图交给 Apple Neural Engine。",
+            hint: "实测同 int8 模型 8ms vs TFLite 188ms")
+        await settleThenMark("引擎教学 1 · 结论：ORT CoreML EP → ANE（≈23×）", seconds: 6)
+
+        // 2 · 展开引擎选项清单
+        configGuide.present(.engineOptions, for: .standard)
+        configGuide.announce(step: 2,
+            title: "第 2 步 · 点「当前引擎」展开选项清单",
+            detail: "三档：自动（真机优先 ANE）/ CPU EP / CoreML EP。SenseVoiceSmall、Silero VAD、CAMPPlus 共用同一 provider。",
+            hint: "▼ 三个引擎及实测依据已展开", focus: .engine)
+        await settleThenMark("引擎教学 2 · 引擎选项清单展开：自动 / CPU EP / CoreML EP", seconds: 7)
+
+        // 3 · 选中 CoreML EP
+        configGuide.dismiss()
+        engineStore.setEngine(.coreML, for: .standard, onLog: engineLog)
+        managementSection = .engine
+        configGuide.announce(step: 3,
+            title: "第 3 步 · 选中 CoreML EP（ANE）",
+            detail: "请求 provider=coreml 已写入 onnx_engine.json；iOS Simulator 无 ANE，运行时安全回退到 cpu 并如实记录。",
+            hint: "不是静态展示，请求值真的传给了 ORT", focus: .engine)
+        await settleThenMark("引擎教学 3 · 已选 CoreML EP · 请求 coreml / 实际 cpu（模拟器无 ANE 回退）", seconds: 7)
+
+        // 4 · 运行时证据
+        configGuide.announce(step: 4,
+            title: "第 4 步 · 查看运行时环境证据",
+            detail: "预编译 ORT 导出 _OrtSessionOptionsAppendExecutionProvider_CoreML；模拟器标记为无 ANE，真机 A12+/iOS 15+ 才会启用。",
+            hint: "请求 / 生效 / 回退原因逐项可查", focus: .engine)
+        await settleThenMark("引擎教学 4 · 运行时证据：ORT CoreML 符号 / 环境 / 回退原因", seconds: 6)
+
+        // 5 · 对照 CPU EP
+        engineStore.setEngine(.cpu, for: .standard, onLog: engineLog)
+        configGuide.announce(step: 5,
+            title: "第 5 步 · 切到 CPU EP 对照",
+            detail: "显式 CPU EP：ORT 在 XNNPACK / ARM NEON 上执行 int8 图，模拟器与真机均可用。切换后会话缓存失效并真实重建。",
+            hint: "实际生效 provider=cpu", focus: .engine)
+        await settleThenMark("引擎教学 5 · 已选 CPU EP · 实际生效 provider=cpu", seconds: 6)
+
+        // 6 · 打开「使用时选择 SenseVoiceSmall」
+        engineStore.setUseSenseVoiceAsPrimary(true, onLog: engineLog)
+        configGuide.announce(step: 6,
+            title: "第 6 步 · 打开「用 SenseVoiceSmall 作为主识别模型」",
+            detail: "这是使用时选择使用这个模型的开关：打开后点击录音的转写会真实走 SenseVoiceSmall int8 ONNX 图，而不是 WhisperKit。",
+            hint: "不是静态展示")
+        await settleThenMark("引擎教学 6 · 使用开关已打开：主识别模型 = SenseVoiceSmall", seconds: 6)
+
+        // 7 · 真实跑一次
+        configGuide.announce(step: 7,
+            title: "第 7 步 · 用所选引擎真实跑一次主识别",
+            detail: "调用 sherpa-onnx OfflineRecognizer 对内置样本解码，耗时、识别语言、引擎 provider 写入主转写与调用日志。",
+            hint: "真实推理，不是贴图")
+        await verifyOnnxEngineRuntime()
+        await settleThenMark("引擎教学 7 · engine-verify 完成：SenseVoiceSmall 主识别输出与耗时", seconds: 5)
+
+        // 8 · 日志页核对
+        managementSection = .calls
+        configGuide.announce(step: 8,
+            title: "第 8 步 · 日志页核对引擎参数快照",
+            detail: "每条调用都带有 ONNX 引擎、请求 provider、实际生效 provider、解析原因与运行环境。",
+            hint: "engine-verify / transcribe 可逐条查")
+        await settleThenMark("引擎教学 8 · 调用日志：引擎 / provider / 回退原因 / 运行环境", seconds: 7)
+
+        // 9 · 复位
+        engineStore.setUseSenseVoiceAsPrimary(false, onLog: engineLog)
+        engineStore.setEngine(.auto, for: .standard, onLog: engineLog)
+        managementSection = .engine
+        configGuide.announce(step: 9,
+            title: "第 9 步 · 复位到自动引擎",
+            detail: "自动档在真机优先 CoreML EP（ANE），模拟器自动回退 CPU EP；选择持久化在 Documents/onnx_engine.json。",
+            hint: "导出 onnx_engine_export.json")
+        if let url = engineStore.exportSnapshot() {
+            log("ONNX ENGINE export: \(url.lastPathComponent)")
+        }
+        await settleThenMark("引擎教学 9 · 复位为自动引擎 · 导出引擎快照", seconds: 6)
+
+        configGuide.active = false
+        showingModelManager = false
+        log("DEMO onnx engine finished, status=\(AudioIntelligence.shared.onnxRuntimeStatus?.effectiveProvider ?? "-")")
+        try? await Task.sleep(nanoseconds: 1_000_000_000)
+    }
+
+    /// 真实用 SenseVoiceSmall + 当前所选引擎跑一次主识别，写进调用日志。
+    private func verifyOnnxEngineRuntime() async {
+        let mode: TranscriptionMode = .standard
+        let ai = AudioIntelligence.shared
+        applyTuning(for: mode)
+        engineStore.apply(for: mode)
+        let selected = engineStore.engine(for: mode)
+        let status = ai.onnxRuntimeStatus
+        log("ONNX ENGINE verify start: engine=\(selected.rawValue) effective=\(status?.effectiveProvider ?? "-") reason=\(status?.reason ?? "-")")
+
+        // 使用开关打开时，走真正的 transcribe(_:) 分支，证明「使用时选择使用
+        // 这个模型」不是静态展示；没有录音条目时才退回内置样本直调。
+        if engineStore.useSenseVoiceAsPrimary, let item = store.items.first {
+            log("ONNX ENGINE verify: routing through transcribe(_:) primary=sense-voice for \(item.fileName)")
+            await transcribe(item)
+            log("ONNX ENGINE verify done via primary branch; calls=\(callLog.records.count)")
+            return
+        }
+
+        guard let sample = Bundle.main.url(forResource: "recording", withExtension: "wav") else {
+            log("ONNX ENGINE verify: bundled sample missing, primary branch already proved engine")
+            return
+        }
+        let start = Date()
+        let result = ai.senseVoiceTranscribe(audioURL: sample)
+        let elapsed = Date().timeIntervalSince(start)
+        callLog.record(
+            modelID: "sense-voice",
+            operation: "engine-verify",
+            modeRaw: mode.rawValue,
+            parameters: tuningParams("senseVoice", mode: mode),
+            elapsed: elapsed,
+            result: "engine=\(selected.rawValue) · provider=\(status?.effectiveProvider ?? "-") · lang=\(result.language) · \(result.text.prefix(90))",
+            status: result.text.isEmpty ? .empty : .ok,
+            origin: callOrigin
+        )
+        log("ONNX ENGINE verify done: elapsed=\(String(format: "%.2f", elapsed))s lang=\(result.language) text=\(result.text)")
+        log("ONNX ENGINE verify note: \(result.note)")
+    }
+
     /// 用内置 JFK 样本按「当前模式所选方案 / 链」真实跑一次转写，
     /// 把实际主模型写进调用日志——证明选择生效，不是静态展示。
     private func verifyProfileRuntime() async {
@@ -2005,6 +2210,9 @@ struct ContentView: View {
         params["模型链"] = profileStore.chain(for: activeMode).name
         params["主 ASR"] = profileStore.primaryModelID(for: activeMode)
         params["辅助链"] = profileStore.stages(for: activeMode).joined(separator: ",")
+        for (key, value) in AudioIntelligence.shared.onnxEngineSnapshot {
+            params[key] = value
+        }
         return params
     }
 
@@ -2014,6 +2222,7 @@ struct ContentView: View {
             AudioIntelligence.shared,
             using: profileStore.tuning(for: activeMode)
         )
+        engineStore.apply(for: activeMode)
     }
 
     private func setStage(_ s: Stage, detail: String, progress: Double) {

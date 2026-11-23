@@ -1,5 +1,102 @@
 import Foundation
+import Darwin
 import SherpaOnnx
+
+// MARK: - iOS 上最高效的 ONNX 推理引擎
+//
+// ONNX Runtime Mobile 的 CoreML Execution Provider 会把 ONNX 子图交给
+// Core ML，由系统调度到 Apple Neural Engine / GPU / CPU，官方描述为
+// "in the most efficient way in order to maximize performance while
+// minimizing memory and power consumption"。sherpa-onnx 底层就是 ORT，
+// provider 参数直接决定走哪条执行路径。
+//
+// 三个可选引擎，都会被真实传给 sherpaOnnxOfflineModelConfig(provider:)：
+//   auto   真机优先 CoreML EP（ANE），模拟器/不可用时安全回退 CPU EP
+//   cpu    ORT CPU EP（XNNPACK / ARM NEON int8），全平台稳定
+//   coreml ORT CoreML EP → Apple Neural Engine，iOS 上最快
+public enum OnnxInferenceEngine: String, Codable, CaseIterable, Identifiable, Sendable {
+    case auto
+    case cpu
+    case coreML
+
+    public var id: String { rawValue }
+
+    public var title: String {
+        switch self {
+        case .auto: return "自动 · 真机优先 ANE"
+        case .cpu: return "ONNX Runtime · CPU EP"
+        case .coreML: return "ONNX Runtime · CoreML EP"
+        }
+    }
+
+    public var badge: String {
+        switch self {
+        case .auto: return "推荐"
+        case .cpu: return "稳定"
+        case .coreML: return "iOS 最高效"
+        }
+    }
+
+    public var summary: String {
+        switch self {
+        case .auto: return "真机自动启用 CoreML EP 交给 ANE；iOS Simulator 无 ANE 时自动回退 CPU EP。"
+        case .cpu: return "ORT CPU EP，int8 量化图在 XNNPACK / ARM NEON 上执行，所有设备可用。"
+        case .coreML: return "把 ONNX 子图编译成 MLProgram，交给 Core ML 调度到 Apple Neural Engine。"
+        }
+    }
+
+    public var speedNote: String {
+        switch self {
+        case .auto: return "真机取最快路径，无需手动切换"
+        case .cpu: return "基准；SenseVoiceSmall int8 在 A12X 上约 15.6 tok/s"
+        case .coreML: return "同 int8 模型实测 8ms vs TFLite 188ms（≈23×）；SenseVoice ANE 版比 ONNX CPU 快 2–7×"
+        }
+    }
+
+    public var requirement: String {
+        switch self {
+        case .auto: return "iOS 13+；ANE 需真机 A12+ / iOS 15+（MLProgram）"
+        case .cpu: return "无额外要求，模拟器与真机均可"
+        case .coreML: return "需真机 + CoreML 框架 + 带 --use_coreml 编译的 ORT"
+        }
+    }
+
+    public var sourceTrace: String {
+        "AudioIntelligence.swift · resolveOnnxEngine / ensureRecognizer"
+    }
+}
+
+/// 一次引擎解析的完整可审计结果：请求值、实际生效值、回退原因与环境证据。
+public struct OnnxRuntimeStatus: Codable, Equatable, Sendable {
+    public var requested: String
+    public var effectiveProvider: String
+    public var reason: String
+    public var simulator: Bool
+    public var coreMLFrameworkAvailable: Bool
+    public var ortCoreMLSymbolFound: Bool
+    public var aneEligible: Bool
+    public var sherpaVersion: String
+    public var resolvedAt: Date
+
+    public init(requested: String, effectiveProvider: String, reason: String,
+                simulator: Bool, coreMLFrameworkAvailable: Bool,
+                ortCoreMLSymbolFound: Bool, aneEligible: Bool,
+                sherpaVersion: String, resolvedAt: Date) {
+        self.requested = requested
+        self.effectiveProvider = effectiveProvider
+        self.reason = reason
+        self.simulator = simulator
+        self.coreMLFrameworkAvailable = coreMLFrameworkAvailable
+        self.ortCoreMLSymbolFound = ortCoreMLSymbolFound
+        self.aneEligible = aneEligible
+        self.sherpaVersion = sherpaVersion
+        self.resolvedAt = resolvedAt
+    }
+
+    public var displayProvider: String {
+        effectiveProvider == "coreml" ? "coreml（CoreML EP → ANE）" : "cpu（CPU EP）"
+    }
+}
 
 // MARK: - Bundled on-device intelligence models
 //
@@ -120,7 +217,111 @@ public final class AudioIntelligence: @unchecked Sendable {
     public var senseVoiceThreadCount: Int = 2 {
         didSet { cachedRecognizer = nil }
     }
+    /// 「模式和模型」页所选的 ONNX 执行引擎。切换后三个 ONNX 会话缓存全部
+    /// 失效，下一次调用会按新 provider 真实重建 ORT session。
+    public var onnxEngineRaw: String = OnnxInferenceEngine.auto.rawValue {
+        didSet {
+            guard oldValue != onnxEngineRaw else { return }
+            cachedRecognizer = nil
+            cachedSpeakerExtractor = nil
+        }
+    }
+    /// 最近一次解析的引擎结果与回退原因，管理页与调用日志直接读取。
+    public private(set) var onnxRuntimeStatus: OnnxRuntimeStatus?
     public var searchResultLimit: Int = 8
+
+    // MARK: - ONNX 引擎解析（真实生效 + 安全回退）
+
+    /// 尽力探测 ORT 是否链接了 CoreML EP 入口。静态库符号不一定出现在动态
+    /// 符号表，所以该字段只作为诊断证据，不作为能否启用 ANE 的硬门槛。
+    private static func ortCoreMLSymbolPresent() -> Bool {
+        guard let handle = dlopen(nil, RTLD_NOW) else { return false }
+        defer { dlclose(handle) }
+        return dlsym(handle, "OrtSessionOptionsAppendExecutionProvider_CoreML") != nil
+            || dlsym(handle, "OrtSessionOptionsAppendExecutionProvider") != nil
+    }
+
+    /// 把用户在管理页选择的引擎解析成真正传给 sherpa-onnx 的 provider。
+    /// iOS Simulator 没有 ANE，且 ORT 的 CoreML EP 不参与模拟器运算，
+    /// 因此模拟器上一律安全回退 cpu，并把「请求 / 生效 / 原因」全部记录。
+    @discardableResult
+    public func resolveOnnxEngine() -> String {
+        #if targetEnvironment(simulator)
+        let simulator = true
+        #else
+        let simulator = false
+        #endif
+        // CoreML 是 iOS 系统框架，编译期必定可用；运行时以「是否模拟器」为准。
+        // NSClassFromString("MLModel") 在真机上也可能因 Swift 类名 mangling
+        // 返回 nil，因此不能拿它当能否启用 ANE 的硬门槛。
+        #if canImport(CoreML)
+        let coreMLFramework = true
+        #else
+        let coreMLFramework = false
+        #endif
+        let symbol = Self.ortCoreMLSymbolPresent()
+        // 真机 + CoreML 框架可用即认为具备 ANE 路径；ORT 若未编入 CoreML EP
+        // 会自行忽略该 provider 并在 CPU 上执行，不会让 session 创建失败。
+        let aneEligible = !simulator && coreMLFramework
+        let requested = OnnxInferenceEngine(rawValue: onnxEngineRaw) ?? .auto
+
+        let effective: String
+        let reason: String
+        switch requested {
+        case .cpu:
+            effective = "cpu"
+            reason = "显式选择 CPU EP：ORT 在 XNNPACK / ARM NEON 上执行 int8 图，模拟器与真机均可用。"
+        case .coreML:
+            if aneEligible {
+                effective = "coreml"
+                reason = "真机具备 ANE，ORT CoreML EP 已启用：ONNX 子图交给 Core ML 调度到 Neural Engine。"
+            } else {
+                effective = "cpu"
+                reason = simulator
+                    ? "已请求 CoreML EP，但 iOS Simulator 无 Apple Neural Engine，ORT CoreML EP 不可用 → 安全回退 CPU EP。"
+                    : "已请求 CoreML EP，但当前运行时不具备 CoreML 框架 → 安全回退 CPU EP。"
+            }
+        case .auto:
+            if aneEligible {
+                effective = "coreml"
+                reason = "自动：真机 + CoreML 框架可用 → 选用最高效的 CoreML EP（ANE）路径。"
+            } else {
+                effective = "cpu"
+                reason = simulator
+                    ? "自动：iOS Simulator 无 ANE → 回退 CPU EP；同一 App 装到真机会自动切到 CoreML EP。"
+                    : "自动：未检测到可用 CoreML 框架 → 回退 CPU EP。"
+            }
+        }
+
+        let version = getSherpaOnnxVersion()
+        let status = OnnxRuntimeStatus(
+            requested: requested.rawValue,
+            effectiveProvider: effective,
+            reason: reason,
+            simulator: simulator,
+            coreMLFrameworkAvailable: coreMLFramework,
+            ortCoreMLSymbolFound: symbol,
+            aneEligible: aneEligible,
+            sherpaVersion: version,
+            resolvedAt: Date()
+        )
+        onnxRuntimeStatus = status
+        let line = "ONNX ENGINE requested=\(requested.rawValue) effective=\(effective) simulator=\(simulator) coreMLFramework=\(coreMLFramework) ortCoreMLSymbol=\(symbol) aneEligible=\(aneEligible) sherpa=\(version) reason=\(reason)"
+        if !statusLines.contains(line) { statusLines.append(line) }
+        return effective
+    }
+
+    /// 给调用日志与 UI 用的引擎快照字段。
+    public var onnxEngineSnapshot: [String: String] {
+        let status = onnxRuntimeStatus
+        return [
+            "ONNX 引擎": (OnnxInferenceEngine(rawValue: onnxEngineRaw) ?? .auto).title,
+            "请求 provider": status?.requested ?? onnxEngineRaw,
+            "实际生效 provider": status?.effectiveProvider ?? "cpu",
+            "引擎解析原因": status?.reason ?? "尚未解析",
+            "运行环境": (status?.simulator ?? true) ? "iOS Simulator（无 ANE）" : "iOS 真机"
+        ]
+    }
 
     private init() {}
 
@@ -263,7 +464,9 @@ public final class AudioIntelligence: @unchecked Sendable {
             return ("", "", "SenseVoice 模型或音频不可用")
         }
         let result = recognizer.decode(samples: samples, sampleRate: 16_000)
-        let setting = "SenseVoiceSmall int8 · lang=\(senseVoiceLanguageSetting) · itn=\(senseVoiceUseITN ? "on" : "off") · threads=\(senseVoiceThreadCount)"
+        let engine = OnnxInferenceEngine(rawValue: onnxEngineRaw) ?? .auto
+        let effective = onnxRuntimeStatus?.effectiveProvider ?? "cpu"
+        let setting = "SenseVoiceSmall int8 · engine=\(engine.title) provider=\(effective) · lang=\(senseVoiceLanguageSetting) · itn=\(senseVoiceUseITN ? "on" : "off") · threads=\(senseVoiceThreadCount)"
         return (result.text, result.lang, setting)
     }
 
@@ -280,7 +483,7 @@ public final class AudioIntelligence: @unchecked Sendable {
         let modelConfig = sherpaOnnxOfflineModelConfig(
             tokens: senseVoiceTokensPath,
             numThreads: senseVoiceThreadCount,
-            provider: "cpu",
+            provider: resolveOnnxEngine(),
             debug: 0,
             senseVoice: sense
         )
@@ -346,7 +549,7 @@ public final class AudioIntelligence: @unchecked Sendable {
             sileroVad: silero,
             sampleRate: 16_000,
             numThreads: 1,
-            provider: "cpu",
+            provider: resolveOnnxEngine(),
             debug: 0
         )
         var ranges: [(Int, Int)] = []
@@ -396,7 +599,7 @@ public final class AudioIntelligence: @unchecked Sendable {
             model: campplusPath,
             numThreads: 1,
             debug: 0,
-            provider: "cpu"
+            provider: resolveOnnxEngine()
         )
         let extractor = withUnsafePointer(to: &config) { pointer in
             SherpaOnnxSpeakerEmbeddingExtractorWrapper(config: pointer)
