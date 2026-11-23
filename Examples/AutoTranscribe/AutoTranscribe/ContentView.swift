@@ -247,6 +247,14 @@ struct ContentView: View {
         .frame(maxWidth: .infinity)
     }
 
+    private var primaryASRTitle: String {
+        if engineStore.useSenseVoiceAsPrimary {
+            return "SenseVoiceSmall int8（ONNX）"
+        }
+        return profileStore.primaryModelID(for: selectedMode) == "whisper-turbo"
+            ? "Whisper Turbo · 632MB" : "Whisper Base"
+    }
+
     private var modeCard: some View {
         VStack(alignment: .leading, spacing: 10) {
             Text("识别模式").font(.subheadline.bold())
@@ -302,6 +310,37 @@ struct ContentView: View {
             Text(selectedTarget.detail)
                 .font(.caption2)
                 .foregroundColor(.secondary)
+
+            Divider()
+
+            // 「使用的时候选择使用这个模型」：首页直接切换主识别模型，
+            // 不必进管理页。打开后 transcribe(_:) 真实走 SenseVoiceSmall
+            // int8 ONNX 图（按当前模式所选引擎）。
+            HStack(spacing: 8) {
+                Image(systemName: engineStore.useSenseVoiceAsPrimary
+                      ? "waveform.badge.mic" : "brain")
+                    .foregroundColor(engineStore.useSenseVoiceAsPrimary ? .purple : .blue)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("主识别模型：\(primaryASRTitle)")
+                        .font(.caption.bold())
+                    Text(engineStore.useSenseVoiceAsPrimary
+                         ? "端侧 ONNX · 引擎 \(engineStore.engine(for: selectedMode).title) · 实际 provider=\(AudioIntelligence.shared.onnxRuntimeStatus?.effectiveProvider ?? "cpu")"
+                         : "WhisperKit · 按配置方案与模型链加载")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                }
+                Spacer(minLength: 0)
+                Toggle("", isOn: Binding(
+                    get: { engineStore.useSenseVoiceAsPrimary },
+                    set: { newValue in
+                        engineStore.setUseSenseVoiceAsPrimary(newValue, onLog: { log($0) })
+                    }
+                ))
+                .labelsHidden()
+            }
+            Text("打开开关即用 SenseVoiceSmall 作为主识别；关闭时用 WhisperKit。引擎在「模式和模型 → 引擎」里选。")
+                .font(.caption2)
+                .foregroundColor(.orange)
         }
         .padding(14)
         .background(RoundedRectangle(cornerRadius: 14).fill(Color(.secondarySystemGroupedBackground)))
@@ -2014,7 +2053,7 @@ struct ContentView: View {
         managementSection = .engine
         configGuide.active = true
         configGuide.chapter = "引擎教学"
-        configGuide.total = 9
+        configGuide.total = 10
         configGuide.targetMode = .standard
 
         // 1 · 结论
@@ -2093,6 +2132,16 @@ struct ContentView: View {
             log("ONNX ENGINE export: \(url.lastPathComponent)")
         }
         await settleThenMark("引擎教学 9 · 复位为自动引擎 · 导出引擎快照", seconds: 6)
+
+        // 10 · 首页也能直接选：使用时的入口
+        showingModelManager = false
+        engineStore.setUseSenseVoiceAsPrimary(true, onLog: engineLog)
+        configGuide.announce(step: 10,
+            title: "第 10 步 · 首页直接选主识别模型",
+            detail: "不用进管理页：首页「识别模式」卡片就有开关，打开后显示当前 ONNX 引擎与实际 provider，点录音即按 SenseVoiceSmall 转写。",
+            hint: "使用时选择使用这个模型")
+        await settleThenMark("引擎教学 10 · 首页开关：主识别模型 SenseVoiceSmall + 实际 provider", seconds: 7)
+        engineStore.setUseSenseVoiceAsPrimary(false, onLog: engineLog)
 
         configGuide.active = false
         showingModelManager = false
