@@ -788,6 +788,24 @@ final class OnnxEngineStore: ObservableObject {
         ai.resolveOnnxEngine()
     }
 
+    /// 「配置方案 × 模型链」解析结果驱动运行时的唯一落地点：静默同步
+    /// 引擎选择 + 主识别模型开关，并真实重建 ORT session 的 provider。
+    /// 不写调用日志，避免每次转写产生重复记录；组合本身由 comboSnapshot
+    /// 写进每一条调用的参数快照。
+    func applyCombo(engineRaw: String, useSenseVoice: Bool, for mode: TranscriptionMode) {
+        let engine = OnnxInferenceEngine(rawValue: engineRaw) ?? .auto
+        if selections[mode.rawValue] != engine.rawValue {
+            selections[mode.rawValue] = engine.rawValue
+            persist()
+        }
+        if useSenseVoiceAsPrimary != useSenseVoice {
+            useSenseVoiceAsPrimary = useSenseVoice
+        }
+        let ai = AudioIntelligence.shared
+        ai.onnxEngineRaw = engine.rawValue
+        ai.resolveOnnxEngine()
+    }
+
     func status() -> OnnxRuntimeStatus? { AudioIntelligence.shared.onnxRuntimeStatus }
 
     @discardableResult
@@ -814,11 +832,15 @@ final class OnnxEngineStore: ObservableObject {
 /// 管理页「模型」分段里的引擎结论卡：选项清单、实际生效引擎、环境证据。
 struct OnnxEngineCard: View {
     @ObservedObject var store: OnnxEngineStore
+    @ObservedObject var profileStore: ModeProfileStore
     @ObservedObject var guide: ConfigDemoGuide
     let mode: TranscriptionMode
     var onLog: (String) -> Void
 
-    private var selected: OnnxInferenceEngine { store.engine(for: mode) }
+    /// 显示的是「配置方案 × 模型链」解析后的最终引擎，而不是手动临时值。
+    private var selected: OnnxInferenceEngine {
+        OnnxInferenceEngine(rawValue: profileStore.effectiveEngineRaw(for: mode)) ?? .auto
+    }
     private var runtime: OnnxRuntimeStatus? { store.status() }
 
     var body: some View {
@@ -1055,6 +1077,9 @@ struct ModelManagementView: View {
     @State private var callFilter: CallFilter = .all
     @State private var tuningMode: TranscriptionMode = .standard
 
+    /// 「配置方案 × 模型链」解析后的执行组合，模式页/引擎页共用。
+    private var activeCombo: RuntimeCombo { profileStore.combo(for: tuningMode) }
+
     var body: some View {
         NavigationStack {
             VStack(spacing: 0) {
@@ -1164,12 +1189,12 @@ struct ModelManagementView: View {
 
     private var modelsSection: some View {
         VStack(spacing: 12) {
-            OnnxEngineCard(store: engineStore, guide: guide,
-                           mode: tuningMode, onLog: onLog)
+            OnnxEngineCard(store: engineStore, profileStore: profileStore,
+                           guide: guide, mode: tuningMode, onLog: onLog)
             ForEach(ModelRegistry.models) { model in
                 ModelDetailCard(model: model, status: ModelRegistry.runtimeStatus(model),
                                 engineLine: model.id == "sense-voice"
-                                    ? "\(engineStore.engine(for: tuningMode).title) · 实际 \(engineStore.status()?.effectiveProvider ?? "cpu")"
+                                    ? "\(activeCombo.engineTitle)（\(activeCombo.engineSource)）· 实际 \(engineStore.status()?.effectiveProvider ?? "cpu")"
                                     : nil)
             }
         }
@@ -1179,6 +1204,19 @@ struct ModelManagementView: View {
 
     private var engineSection: some View {
         VStack(spacing: 12) {
+            MMCard(title: "执行组合 · 方案 × 链 × 引擎", symbol: "square.stack.3d.up.fill") {
+                Text("配置方案 = 17 项参数 + 主识别模型 + ONNX 引擎；模型链 = 主 ASR + 辅助模型顺序 + 引擎覆盖。两者都能各自绑定不同引擎和主模型。")
+                    .font(.caption2).foregroundColor(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                Text("优先级：模型链 primary 非 auto 时优先，auto 时取配置方案的主识别模型；链引擎非 inherit 时优先，否则取方案引擎。")
+                    .font(.caption2).foregroundColor(.purple)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                MMKeyValue("当前组合", activeCombo.summary)
+                MMKeyValue("方案 / 链", "\(activeCombo.configName) × \(activeCombo.chainName)")
+                MMKeyValue("主模型来源", activeCombo.asrSource)
+                MMKeyValue("引擎来源", activeCombo.engineSource)
+            }
+
             MMCard(title: "为什么是 CoreML EP / ANE", symbol: "bolt.fill") {
                 Text("ONNX Runtime Mobile 的 CoreML Execution Provider 会把 ONNX 子图编译成 Core ML 模型，由系统调度到 Apple Neural Engine，官方定义为「以最高效的方式利用 CPU / GPU / Neural Engine」。实测同一 int8 模型 ORT CoreML 8ms vs TFLite 188ms（约 23 倍）。")
                     .font(.caption2).foregroundColor(.secondary)
@@ -1190,12 +1228,20 @@ struct ModelManagementView: View {
 
             MMCard(title: "使用时选择 SenseVoiceSmall", symbol: "waveform.badge.mic") {
                 Toggle(isOn: Binding(
-                    get: { engineStore.useSenseVoiceAsPrimary },
-                    set: { engineStore.setUseSenseVoiceAsPrimary($0, onLog: onLog) }
+                    get: { profileStore.combo(for: tuningMode).useSenseVoice },
+                    set: { newValue in
+                        profileStore.setConfigPrimaryASR(
+                            newValue ? PrimaryASRChoice.senseVoice.rawValue
+                                     : PrimaryASRChoice.whisper.rawValue,
+                            for: tuningMode, onLog: onLog)
+                        engineStore.applyCombo(
+                            engineRaw: profileStore.effectiveEngineRaw(for: tuningMode),
+                            useSenseVoice: newValue, for: tuningMode)
+                    }
                 )) {
                     Text("用 SenseVoiceSmall 作为主识别模型").font(.caption.bold())
                 }
-                Text("打开后，点击录音的转写会真实走 SenseVoiceSmall int8 ONNX 图（按所选引擎），并把结果、耗时、引擎写入主转写与调用日志；关闭时 SenseVoice 仍是二次识别。")
+                Text("开关会改写当前配置方案（内置方案自动派生自定义副本）。不同配置方案 / 模型链可以分别绑定不同主识别模型与不同 ONNX 引擎，组合在「模式」页配置。若模型链已指定主 ASR，链优先。")
                     .font(.caption2).foregroundColor(.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
                 Text("这是「使用的时候选择使用这个模型」的开关，不是静态展示。")
@@ -1204,7 +1250,8 @@ struct ModelManagementView: View {
             }
 
             ForEach(TranscriptionMode.allCases) { mode in
-                OnnxEngineCard(store: engineStore, guide: guide, mode: mode, onLog: onLog)
+                OnnxEngineCard(store: engineStore, profileStore: profileStore,
+                               guide: guide, mode: mode, onLog: onLog)
             }
 
             MMCard(title: "工程证据与源码追溯", symbol: "doc.text.magnifyingglass") {
@@ -1220,11 +1267,11 @@ struct ModelManagementView: View {
     private var bindingsSection: some View {
         VStack(spacing: 12) {
             MMCard(title: "两个模式各自独立配置", symbol: "slider.horizontal.3") {
-                Text("每个模式可以分别选择「配置方案」（17 项推理参数的一套命名快照）和「模型链」（主 ASR + 辅助模型链）。切换后立即作用于下一次转写，并写进调用日志。")
+                Text("每个模式可以分别选择「配置方案」（17 项参数 + 主识别模型 + ONNX 引擎）和「模型链」（主 ASR + 辅助模型 + 引擎覆盖）。两者都能配不同引擎与主模型，切换后立即作用于下一次转写并写进调用日志。")
                     .font(.caption2)
                     .foregroundColor(.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                Text("内置方案只读；点「另存为自定义配置」或「新建自定义链」即可得到可命名的 xx 自定义配置 / xx 自定义模型链。")
+                Text("优先级：链 primary 非 auto 优先，auto 取方案；链引擎非 inherit 优先，否则取方案。内置项只读，点「另存为自定义配置」或「新建自定义链」即可编辑组合。")
                     .font(.caption2)
                     .foregroundColor(.blue)
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -1705,43 +1752,208 @@ struct CallRecordCard: View {
 // 之前的实现只有一份全局 ModelTuning 和一张只读的模式映射表，因此
 // 「模式」页无法选择配置方案或模型链。这里补上两层可持久化、可命名、
 // 可按模式分别绑定的配置实体：
-//   * ModelConfigProfile：17 项推理参数的一套命名快照
-//   * ModelChainPreset：主 ASR + 辅助模型链的一套命名执行计划
-// 两者都不是静态展示：主 ASR 决定 WhisperKitConfig(modelFolder:)，
-// stages 决定 VAD / 声纹 / SenseVoice / 向量索引是否被调用。
+//   * ModelConfigProfile：17 项推理参数 + 主识别模型 + ONNX 引擎 的命名快照
+//   * ModelChainPreset：主 ASR + 辅助模型链 + 引擎覆盖 的命名执行计划
+// 两者都不是静态展示：主 ASR 决定 WhisperKitConfig(modelFolder:) 或走
+// SenseVoiceSmall ONNX 主转写；stages 决定 VAD / 声纹 / 向量索引是否被调用；
+// 引擎决定真正传给 sherpaOnnxOfflineModelConfig(provider:) 的值。
+//
+// 【执行组合 / RuntimeCombo】把「不同方案 + 不同链 + 不同引擎/主模型」统一起来：
+//   配置方案 = 17 项参数 + primaryASR(whisper / senseVoice) + onnxEngineRaw
+//   模型链   = primaryModelID + stages + onnxEngineRaw(inherit 表示沿用方案)
+//   优先级   = 链 primary 非 auto 时优先，auto 时取方案 primaryASR；
+//              链引擎非 inherit 时优先，否则取方案引擎。
+//   最终由 ContentView.applyTuning(for:) 同步到 OnnxEngineStore 与
+//   AudioIntelligence，真实决定下一次 ORT session 的 provider 和主转写分支。
+
+enum PrimaryASRChoice: String, Codable, CaseIterable, Identifiable, Sendable {
+    case whisper
+    case senseVoice
+
+    var id: String { rawValue }
+    var title: String {
+        self == .whisper ? "WhisperKit（按模型链加载）" : "SenseVoiceSmall int8（ONNX 主识别）"
+    }
+    var short: String { self == .whisper ? "WhisperKit" : "SenseVoiceSmall" }
+}
+
+enum ChainEngineChoice: String, Codable, CaseIterable, Identifiable, Sendable {
+    case inherit
+    case auto
+    case cpu
+    case coreML
+
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .inherit: return "沿用配置方案（inherit）"
+        case .auto: return "覆盖 · 自动（真机优先 ANE）"
+        case .cpu: return "覆盖 · ONNX Runtime CPU EP"
+        case .coreML: return "覆盖 · ONNX Runtime CoreML EP"
+        }
+    }
+    var isOverride: Bool { self != .inherit }
+}
+
+/// 一次「方案 × 链」解析出的完整执行组合，UI 与调用日志共用同一份结果。
+struct RuntimeCombo: Codable, Equatable, Sendable {
+    var configName: String
+    var chainName: String
+    var configASR: String
+    var configEngine: String
+    var chainEngine: String
+    var chainPrimary: String
+    var effectiveASR: String
+    var effectiveEngine: String
+    var engineSource: String
+    var asrSource: String
+    var useSenseVoice: Bool
+    var effectiveProvider: String
+
+    var asrTitle: String {
+        effectiveASR == "sense-voice" ? "SenseVoiceSmall int8" :
+            (effectiveASR == "whisper-turbo" ? "Whisper Turbo · 632MB" : "Whisper Base")
+    }
+    var engineTitle: String {
+        (OnnxInferenceEngine(rawValue: effectiveEngine) ?? .auto).title
+    }
+    var summary: String {
+        "\(asrTitle) + \(engineTitle)（\(engineSource)）→ \(effectiveProvider)"
+    }
+}
 
 struct ModelConfigProfile: Codable, Identifiable, Equatable, Sendable {
     var id: String
     var name: String
     var note: String
     var tuning: ModelTuning
+    /// "whisper" = WhisperKit 主转写；"senseVoice" = SenseVoiceSmall ONNX 主转写。
+    var primaryASR: String
+    /// "auto" / "cpu" / "coreML"，与 OnnxInferenceEngine.rawValue 一致。
+    var onnxEngineRaw: String
     var isBuiltIn: Bool
     var createdAt: Date
+
+    init(id: String, name: String, note: String, tuning: ModelTuning,
+         primaryASR: String = PrimaryASRChoice.whisper.rawValue,
+         onnxEngineRaw: String = OnnxInferenceEngine.auto.rawValue,
+         isBuiltIn: Bool, createdAt: Date) {
+        self.id = id
+        self.name = name
+        self.note = note
+        self.tuning = tuning
+        self.primaryASR = primaryASR
+        self.onnxEngineRaw = onnxEngineRaw
+        self.isBuiltIn = isBuiltIn
+        self.createdAt = createdAt
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, name, note, tuning, primaryASR, onnxEngineRaw, isBuiltIn, createdAt
+    }
+
+    /// 旧版 mode_profiles.json 没有这两个字段；decodeIfPresent 保证向后兼容。
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        name = try c.decode(String.self, forKey: .name)
+        note = try c.decode(String.self, forKey: .note)
+        tuning = try c.decode(ModelTuning.self, forKey: .tuning)
+        primaryASR = try c.decodeIfPresent(String.self, forKey: .primaryASR)
+            ?? PrimaryASRChoice.whisper.rawValue
+        onnxEngineRaw = try c.decodeIfPresent(String.self, forKey: .onnxEngineRaw)
+            ?? OnnxInferenceEngine.auto.rawValue
+        isBuiltIn = try c.decode(Bool.self, forKey: .isBuiltIn)
+        createdAt = try c.decode(Date.self, forKey: .createdAt)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(id, forKey: .id)
+        try c.encode(name, forKey: .name)
+        try c.encode(note, forKey: .note)
+        try c.encode(tuning, forKey: .tuning)
+        try c.encode(primaryASR, forKey: .primaryASR)
+        try c.encode(onnxEngineRaw, forKey: .onnxEngineRaw)
+        try c.encode(isBuiltIn, forKey: .isBuiltIn)
+        try c.encode(createdAt, forKey: .createdAt)
+    }
 }
 
 struct ModelChainPreset: Codable, Identifiable, Equatable, Sendable {
     var id: String
     var name: String
     var note: String
-    /// "auto" = 跟随模式默认主模型；也可强制 "whisper-base" / "whisper-turbo"。
+    /// "auto" 跟随模式默认；也可强制 "whisper-base" / "whisper-turbo" / "sense-voice"。
     var primaryModelID: String
     /// 实际会执行的辅助模型，顺序即执行顺序。
     var stages: [String]
+    /// "inherit" = 沿用配置方案的引擎；否则覆盖为 auto / cpu / coreML。
+    var onnxEngineRaw: String
     var isBuiltIn: Bool
     var createdAt: Date
+
+    init(id: String, name: String, note: String, primaryModelID: String,
+         stages: [String], onnxEngineRaw: String = ChainEngineChoice.inherit.rawValue,
+         isBuiltIn: Bool, createdAt: Date) {
+        self.id = id
+        self.name = name
+        self.note = note
+        self.primaryModelID = primaryModelID
+        self.stages = stages
+        self.onnxEngineRaw = onnxEngineRaw
+        self.isBuiltIn = isBuiltIn
+        self.createdAt = createdAt
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, name, note, primaryModelID, stages, onnxEngineRaw, isBuiltIn, createdAt
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        name = try c.decode(String.self, forKey: .name)
+        note = try c.decode(String.self, forKey: .note)
+        primaryModelID = try c.decode(String.self, forKey: .primaryModelID)
+        stages = try c.decode([String].self, forKey: .stages)
+        onnxEngineRaw = try c.decodeIfPresent(String.self, forKey: .onnxEngineRaw)
+            ?? ChainEngineChoice.inherit.rawValue
+        isBuiltIn = try c.decode(Bool.self, forKey: .isBuiltIn)
+        createdAt = try c.decode(Date.self, forKey: .createdAt)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(id, forKey: .id)
+        try c.encode(name, forKey: .name)
+        try c.encode(note, forKey: .note)
+        try c.encode(primaryModelID, forKey: .primaryModelID)
+        try c.encode(stages, forKey: .stages)
+        try c.encode(onnxEngineRaw, forKey: .onnxEngineRaw)
+        try c.encode(isBuiltIn, forKey: .isBuiltIn)
+        try c.encode(createdAt, forKey: .createdAt)
+    }
 
     var primaryLabel: String {
         switch primaryModelID {
         case "auto": return "跟随模式默认"
         case "whisper-turbo": return "Whisper Turbo · 632MB"
+        case "sense-voice": return "SenseVoiceSmall int8（ONNX 主识别）"
         default: return "Whisper Base"
         }
     }
 
+    var engineLabel: String {
+        (ChainEngineChoice(rawValue: onnxEngineRaw) ?? .inherit).title
+    }
+
     func resolvedPrimary(for mode: TranscriptionMode) -> String {
-        primaryModelID == "auto"
-            ? (mode == .standard ? "whisper-base" : "whisper-turbo")
-            : primaryModelID
+        switch primaryModelID {
+        case "auto": return mode == .standard ? "whisper-base" : "whisper-turbo"
+        case "sense-voice": return "sense-voice"
+        default: return primaryModelID
+        }
     }
 
     func resolvedFolder(for mode: TranscriptionMode) -> String {
@@ -1813,14 +2025,35 @@ final class ModeProfileStore: ObservableObject {
         turbo.searchLimit = 6
         return [
             ModelConfigProfile(id: defaultConfigID, name: "默认配置",
-                               note: "17 项出厂参数 · 两种模式共用的基线",
-                               tuning: .defaults, isBuiltIn: true, createdAt: epoch),
+                               note: "WhisperKit 主识别 · 自动引擎（真机优先 ANE）· 17 项出厂参数",
+                               tuning: .defaults,
+                               primaryASR: PrimaryASRChoice.whisper.rawValue,
+                               onnxEngineRaw: OnnxInferenceEngine.auto.rawValue,
+                               isBuiltIn: true, createdAt: epoch),
             ModelConfigProfile(id: "config-base", name: "Whisper Base 默认配置",
-                               note: "小模型保守解码 · 提高温度、缩短 fallback",
-                               tuning: base, isBuiltIn: true, createdAt: epoch),
+                               note: "WhisperKit + CPU EP · 小模型保守解码、提高温度、缩短 fallback",
+                               tuning: base,
+                               primaryASR: PrimaryASRChoice.whisper.rawValue,
+                               onnxEngineRaw: OnnxInferenceEngine.cpu.rawValue,
+                               isBuiltIn: true, createdAt: epoch),
             ModelConfigProfile(id: "config-turbo", name: "Whisper Turbo 默认配置",
-                               note: "大模型精确解码 · 减少 fallback、收紧搜索条数",
-                               tuning: turbo, isBuiltIn: true, createdAt: epoch)
+                               note: "WhisperKit + 自动引擎 · 大模型精确解码、减少 fallback、收紧搜索条数",
+                               tuning: turbo,
+                               primaryASR: PrimaryASRChoice.whisper.rawValue,
+                               onnxEngineRaw: OnnxInferenceEngine.auto.rawValue,
+                               isBuiltIn: true, createdAt: epoch),
+            ModelConfigProfile(id: "config-sense-coreml", name: "SenseVoice · CoreML EP 方案",
+                               note: "SenseVoiceSmall 作为主识别 · 请求 CoreML EP（模拟器回退 CPU）",
+                               tuning: turbo,
+                               primaryASR: PrimaryASRChoice.senseVoice.rawValue,
+                               onnxEngineRaw: OnnxInferenceEngine.coreML.rawValue,
+                               isBuiltIn: true, createdAt: epoch),
+            ModelConfigProfile(id: "config-sense-cpu", name: "SenseVoice · CPU EP 方案",
+                               note: "SenseVoiceSmall 作为主识别 · 显式 CPU EP 基准",
+                               tuning: base,
+                               primaryASR: PrimaryASRChoice.senseVoice.rawValue,
+                               onnxEngineRaw: OnnxInferenceEngine.cpu.rawValue,
+                               isBuiltIn: true, createdAt: epoch)
         ]
     }
 
@@ -1828,16 +2061,24 @@ final class ModeProfileStore: ObservableObject {
         let epoch = Date(timeIntervalSince1970: 0)
         return [
             ModelChainPreset(id: defaultChainID, name: "默认模型链",
-                             note: "主 ASR 跟随模式 + VAD → 声纹 → SenseVoice → 向量索引",
+                             note: "主 ASR 跟随模式 + 引擎沿用方案 + VAD → 声纹 → SenseVoice → 向量索引",
                              primaryModelID: "auto", stages: allStageIDs,
+                             onnxEngineRaw: ChainEngineChoice.inherit.rawValue,
                              isBuiltIn: true, createdAt: epoch),
             ModelChainPreset(id: "chain-minimal", name: "极简链 · 仅 VAD",
                              note: "跳过声纹 / 二次识别 / 向量索引，只做语音段检测",
                              primaryModelID: "auto", stages: ["silero-vad"],
+                             onnxEngineRaw: ChainEngineChoice.inherit.rawValue,
                              isBuiltIn: true, createdAt: epoch),
             ModelChainPreset(id: "chain-turbo", name: "Turbo 全量链",
                              note: "强制主 ASR 用 632MB Turbo，保留全部辅助模型",
                              primaryModelID: "whisper-turbo", stages: allStageIDs,
+                             onnxEngineRaw: ChainEngineChoice.inherit.rawValue,
+                             isBuiltIn: true, createdAt: epoch),
+            ModelChainPreset(id: "chain-sense-coreml", name: "SenseVoice 主识别链",
+                             note: "链级覆盖：主 ASR = SenseVoiceSmall，引擎强制 CoreML EP（优先于方案）",
+                             primaryModelID: "sense-voice", stages: allStageIDs,
+                             onnxEngineRaw: OnnxInferenceEngine.coreML.rawValue,
                              isBuiltIn: true, createdAt: epoch)
         ]
     }
@@ -1873,6 +2114,75 @@ final class ModeProfileStore: ObservableObject {
     func stages(for mode: TranscriptionMode) -> [String] { chain(for: mode).stages }
     func uses(_ modelID: String, for mode: TranscriptionMode) -> Bool { stages(for: mode).contains(modelID) }
 
+    // MARK: 执行组合解析（配置方案 × 模型链 → 主识别模型 + ONNX 引擎）
+    //
+    // 这是「不同配置方案 / 模型链能不能配不同引擎和模型」的唯一真相源。
+    // 优先级在 RuntimeCombo 注释里写明：链的非 auto 主 ASR、非 inherit 引擎
+    // 会覆盖配置方案；其余沿用方案。ContentView.applyTuning(for:) 在每次
+    // 转写前把结果同步给 OnnxEngineStore 与 AudioIntelligence。
+
+    func combo(for mode: TranscriptionMode) -> RuntimeCombo {
+        let cfg = config(for: mode)
+        let link = chain(for: mode)
+
+        let asr: String
+        let asrSource: String
+        if link.primaryModelID != "auto" {
+            asr = link.resolvedPrimary(for: mode)
+            asrSource = "模型链指定"
+        } else if cfg.primaryASR == PrimaryASRChoice.senseVoice.rawValue {
+            asr = "sense-voice"
+            asrSource = "配置方案指定"
+        } else {
+            asr = link.resolvedPrimary(for: mode)
+            asrSource = "模式默认 + 配置方案"
+        }
+
+        let engine: String
+        let engineSource: String
+        if link.onnxEngineRaw != ChainEngineChoice.inherit.rawValue {
+            engine = link.onnxEngineRaw
+            engineSource = "模型链覆盖"
+        } else {
+            engine = cfg.onnxEngineRaw
+            engineSource = "配置方案"
+        }
+
+        return RuntimeCombo(
+            configName: cfg.name,
+            chainName: link.name,
+            configASR: cfg.primaryASR,
+            configEngine: cfg.onnxEngineRaw,
+            chainEngine: link.onnxEngineRaw,
+            chainPrimary: link.primaryModelID,
+            effectiveASR: asr,
+            effectiveEngine: engine,
+            engineSource: engineSource,
+            asrSource: asrSource,
+            useSenseVoice: asr == "sense-voice",
+            effectiveProvider: AudioIntelligence.shared.onnxRuntimeStatus?.effectiveProvider ?? "cpu"
+        )
+    }
+
+    func effectiveUseSenseVoice(for mode: TranscriptionMode) -> Bool { combo(for: mode).useSenseVoice }
+    func effectiveEngineRaw(for mode: TranscriptionMode) -> String { combo(for: mode).effectiveEngine }
+    func effectiveASR(for mode: TranscriptionMode) -> String { combo(for: mode).effectiveASR }
+
+    /// 组合快照，写入调用日志参数，便于逐条回溯「当时用的是哪个方案/链/引擎」。
+    func comboSnapshot(for mode: TranscriptionMode) -> [String: String] {
+        let c = combo(for: mode)
+        return [
+            "配置方案主识别模型": (PrimaryASRChoice(rawValue: c.configASR) ?? .whisper).short,
+            "配置方案引擎": (OnnxInferenceEngine(rawValue: c.configEngine) ?? .auto).title,
+            "模型链引擎": (ChainEngineChoice(rawValue: c.chainEngine) ?? .inherit).title,
+            "最终主识别模型": c.asrTitle,
+            "最终引擎": c.engineTitle,
+            "引擎来源": c.engineSource,
+            "主模型来源": c.asrSource,
+            "执行组合": c.summary
+        ]
+    }
+
     var customConfigCount: Int { profiles.filter { !$0.isBuiltIn }.count }
     var customChainCount: Int { chains.filter { !$0.isBuiltIn }.count }
 
@@ -1906,34 +2216,43 @@ final class ModeProfileStore: ObservableObject {
 
     /// 以当前所选方案为模板另存一份可编辑的自定义配置，并立即切到它。
     @discardableResult
-    func saveCustomConfig(name: String, for mode: TranscriptionMode, onLog: (String) -> Void) -> String {
+    func saveCustomConfig(name: String, primaryASR: String? = nil,
+                          onnxEngineRaw: String? = nil,
+                          for mode: TranscriptionMode, onLog: (String) -> Void) -> String {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         let finalName = trimmed.isEmpty ? "自定义配置 \(customConfigCount + 1)" : trimmed
+        let source = config(for: mode)
         let id = "config-custom-\(UUID().uuidString.prefix(8))"
-        let profile = ModelConfigProfile(id: id, name: finalName,
-                                         note: "由「\(config(for: mode).name)」另存 · 可单独修改 17 项参数",
-                                         tuning: tuning(for: mode), isBuiltIn: false, createdAt: Date())
+        let asr = primaryASR ?? source.primaryASR
+        let engine = onnxEngineRaw ?? source.onnxEngineRaw
+        let profile = ModelConfigProfile(
+            id: id, name: finalName,
+            note: "由「\(source.name)」另存 · \((PrimaryASRChoice(rawValue: asr) ?? .whisper).short) + \((OnnxInferenceEngine(rawValue: engine) ?? .auto).title)",
+            tuning: tuning(for: mode), primaryASR: asr, onnxEngineRaw: engine,
+            isBuiltIn: false, createdAt: Date())
         profiles.append(profile)
         setConfig(id: id, for: mode, onLog: onLog)
-        onLog("MODEL PROFILE saved custom config=\(finalName) id=\(id)")
+        onLog("MODEL PROFILE saved custom config=\(finalName) id=\(id) primaryASR=\(asr) engine=\(engine)")
         return id
     }
 
-    /// 新建自定义模型链：指定主 ASR 与勾选的辅助模型，并立即切到它。
+    /// 新建自定义模型链：指定主 ASR、辅助模型、引擎覆盖，并立即切到它。
     @discardableResult
     func saveCustomChain(name: String, primary: String, stages: [String],
+                         onnxEngineRaw: String = ChainEngineChoice.inherit.rawValue,
                          for mode: TranscriptionMode, onLog: (String) -> Void) -> String {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         let finalName = trimmed.isEmpty ? "自定义链 \(customChainCount + 1)" : trimmed
         let id = "chain-custom-\(UUID().uuidString.prefix(8))"
         let ordered = Self.allStageIDs.filter { stages.contains($0) }
         let chain = ModelChainPreset(id: id, name: finalName,
-                                     note: "自定义 · 主 ASR \(chainLabel(primary)) · 辅助 \(ordered.count) 个",
+                                     note: "自定义 · 主 ASR \(chainLabel(primary)) · 引擎 \((ChainEngineChoice(rawValue: onnxEngineRaw) ?? .inherit).title) · 辅助 \(ordered.count) 个",
                                      primaryModelID: primary, stages: ordered,
+                                     onnxEngineRaw: onnxEngineRaw,
                                      isBuiltIn: false, createdAt: Date())
         chains.append(chain)
         setChain(id: id, for: mode, onLog: onLog)
-        onLog("MODEL PROFILE saved custom chain=\(finalName) id=\(id) stages=\(ordered.joined(separator: ","))")
+        onLog("MODEL PROFILE saved custom chain=\(finalName) id=\(id) engine=\(onnxEngineRaw) stages=\(ordered.joined(separator: ","))")
         return id
     }
 
@@ -1941,8 +2260,64 @@ final class ModeProfileStore: ObservableObject {
         switch primary {
         case "auto": return "跟随模式默认"
         case "whisper-turbo": return "Turbo"
+        case "sense-voice": return "SenseVoiceSmall"
         default: return "Base"
         }
+    }
+
+    // MARK: 编辑组合（内置项只读 → 自动派生可编辑的自定义副本）
+
+    private func editableConfigID(for mode: TranscriptionMode, onLog: (String) -> Void) -> String {
+        let current = selection(for: mode).configID
+        if profiles.first(where: { $0.id == current })?.isBuiltIn == true {
+            return saveCustomConfig(name: "\(config(for: mode).name) · 组合自定义",
+                                    for: mode, onLog: onLog)
+        }
+        return current
+    }
+
+    private func editableChainID(for mode: TranscriptionMode, onLog: (String) -> Void) -> String {
+        let current = selection(for: mode).chainID
+        if chains.first(where: { $0.id == current })?.isBuiltIn == true {
+            let source = chain(for: mode)
+            return saveCustomChain(name: "\(source.name) · 组合自定义",
+                                   primary: source.primaryModelID, stages: source.stages,
+                                   onnxEngineRaw: source.onnxEngineRaw,
+                                   for: mode, onLog: onLog)
+        }
+        return current
+    }
+
+    func setConfigPrimaryASR(_ raw: String, for mode: TranscriptionMode, onLog: (String) -> Void) {
+        let id = editableConfigID(for: mode, onLog: onLog)
+        guard let index = profiles.firstIndex(where: { $0.id == id }) else { return }
+        profiles[index].primaryASR = raw
+        persist()
+        onLog("MODEL COMBO config=\(profiles[index].name) primaryASR=\(raw) mode=\(mode.rawValue)")
+    }
+
+    func setConfigEngine(_ raw: String, for mode: TranscriptionMode, onLog: (String) -> Void) {
+        let id = editableConfigID(for: mode, onLog: onLog)
+        guard let index = profiles.firstIndex(where: { $0.id == id }) else { return }
+        profiles[index].onnxEngineRaw = raw
+        persist()
+        onLog("MODEL COMBO config=\(profiles[index].name) engine=\(raw) mode=\(mode.rawValue)")
+    }
+
+    func setChainEngine(_ raw: String, for mode: TranscriptionMode, onLog: (String) -> Void) {
+        let id = editableChainID(for: mode, onLog: onLog)
+        guard let index = chains.firstIndex(where: { $0.id == id }) else { return }
+        chains[index].onnxEngineRaw = raw
+        persist()
+        onLog("MODEL COMBO chain=\(chains[index].name) engine=\(raw) mode=\(mode.rawValue)")
+    }
+
+    func setChainPrimary(_ raw: String, for mode: TranscriptionMode, onLog: (String) -> Void) {
+        let id = editableChainID(for: mode, onLog: onLog)
+        guard let index = chains.firstIndex(where: { $0.id == id }) else { return }
+        chains[index].primaryModelID = raw
+        persist()
+        onLog("MODEL COMBO chain=\(chains[index].name) primary=\(raw) mode=\(mode.rawValue)")
     }
 
     /// 参数页编辑后写回。若当前选中的是内置方案，自动派生自定义副本，
@@ -2007,6 +2382,7 @@ struct ModeProfileCard: View {
 
     private var activeConfig: ModelConfigProfile { store.config(for: mode) }
     private var activeChain: ModelChainPreset { store.chain(for: mode) }
+    private var activeCombo: RuntimeCombo { store.combo(for: mode) }
     private var activePrimaryName: String {
         ModelRegistry.descriptor(store.primaryModelID(for: mode))?.name ?? store.primaryModelID(for: mode)
     }
@@ -2037,6 +2413,8 @@ struct ModeProfileCard: View {
             Text(activeConfig.note).font(.caption2).foregroundColor(.secondary)
             MMKeyValue("解码温度", String(format: "%.2f", activeConfig.tuning.temperature))
             MMKeyValue("搜索条数", "\(activeConfig.tuning.searchLimit)")
+            MMKeyValue("方案主识别", (PrimaryASRChoice(rawValue: activeConfig.primaryASR) ?? .whisper).short)
+            MMKeyValue("方案 ONNX 引擎", (OnnxInferenceEngine(rawValue: activeConfig.onnxEngineRaw) ?? .auto).title)
 
             Divider()
             Text("模型链").font(.caption.bold())
@@ -2059,6 +2437,7 @@ struct ModeProfileCard: View {
             Text(activeChain.note).font(.caption2).foregroundColor(.secondary)
             MMKeyValue("主 ASR", activePrimaryName)
             MMKeyValue("模型目录", "Models/\(store.folder(for: mode))")
+            MMKeyValue("链引擎", activeChain.engineLabel)
             if activeChain.stages.isEmpty {
                 Text("辅助模型链为空 · 只跑主 ASR 转写")
                     .font(.caption2).foregroundColor(.orange)
@@ -2085,6 +2464,16 @@ struct ModeProfileCard: View {
                 .overlay(RoundedRectangle(cornerRadius: 7)
                     .stroke(highlighted(.chainEditor) ? Color.orange : Color.clear, lineWidth: 3))
             }
+
+            Divider()
+            Text("最终执行组合").font(.caption.bold())
+            MMKeyValue("主识别模型", activeCombo.asrTitle)
+            MMKeyValue("ONNX 引擎", activeCombo.engineTitle)
+            MMKeyValue("引擎来自", activeCombo.engineSource)
+            MMKeyValue("主模型来自", activeCombo.asrSource)
+            Text(activeCombo.summary)
+                .font(.caption2).foregroundColor(.purple)
+                .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 }
@@ -2117,7 +2506,7 @@ struct ProfileLibraryCard: View {
                 HStack(spacing: 6) {
                     VStack(alignment: .leading, spacing: 1) {
                         Text(chain.name).font(.caption)
-                        Text("\(chain.primaryLabel) · 辅助 \(chain.stages.count) 个")
+                        Text("\(chain.primaryLabel) · 辅助 \(chain.stages.count) 个 · \(chain.engineLabel)")
                             .font(.caption2).foregroundColor(.secondary)
                     }
                     Spacer()
@@ -2181,6 +2570,10 @@ final class ConfigDemoGuide: ObservableObject {
     @Published var chainName = ""
     @Published var chainPrimary = "auto"
     @Published var chainStages: Set<String> = Set(ModeProfileStore.allStageIDs)
+    /// 自定义配置方案 / 模型链表单里的「主识别模型 + 引擎」选择。
+    @Published var configASR = PrimaryASRChoice.whisper.rawValue
+    @Published var configEngine = OnnxInferenceEngine.auto.rawValue
+    @Published var chainEngine = ChainEngineChoice.inherit.rawValue
 
     func announce(step: Int, title: String, detail: String,
                   hint: String = "", focus: ConfigDemoFocus = .none) {
@@ -2196,10 +2589,13 @@ final class ConfigDemoGuide: ObservableObject {
         switch sheet {
         case .saveConfig:
             configName = "演示 · 会议配置"
+            configASR = PrimaryASRChoice.whisper.rawValue
+            configEngine = OnnxInferenceEngine.auto.rawValue
         case .newChain:
             chainName = "演示 · 双人会议链"
             chainPrimary = "whisper-turbo"
             chainStages = Set(["silero-vad", "campplus", "sense-voice"])
+            chainEngine = ChainEngineChoice.inherit.rawValue
         default:
             break
         }
@@ -2254,9 +2650,16 @@ struct ConfigDemoSheetView: View {
                         Section("ONNX 推理引擎 · 点一项立即生效") {
                             ForEach(OnnxInferenceEngine.allCases) { engine in
                                 Button {
-                                    engineStore.setEngine(engine, for: mode, onLog: onLog)
+                                    store.setConfigEngine(engine.rawValue, for: mode, onLog: onLog)
+                                    engineStore.applyCombo(
+                                        engineRaw: store.effectiveEngineRaw(for: mode),
+                                        useSenseVoice: store.effectiveUseSenseVoice(for: mode),
+                                        for: mode)
                                     guide.dismiss()
-                                } label: { engineRow(engine, selected: engineStore.engine(for: mode)) }
+                                } label: {
+                                    engineRow(engine,
+                                              selected: OnnxInferenceEngine(rawValue: store.effectiveEngineRaw(for: mode)) ?? .auto)
+                                }
                             }
                         }
                         Section("切换后会发生什么") {
@@ -2264,6 +2667,8 @@ struct ConfigDemoSheetView: View {
                                 .font(.caption2).foregroundColor(.secondary)
                             Text("SenseVoiceSmall / Silero VAD / CAMPPlus 共用同一个 provider。")
                                 .font(.caption2).foregroundColor(.secondary)
+                            Text("这里改的是「当前配置方案」的引擎。若当前模型链设了非 inherit 的引擎覆盖，链会优先；到「模式」页把链改回 inherit 即可让方案生效。")
+                                .font(.caption2).foregroundColor(.orange)
                             if let r = engineStore.status() {
                                 Text("当前实际生效：\(r.displayProvider)")
                                     .font(.caption2).foregroundColor(.orange)
@@ -2280,7 +2685,7 @@ struct ConfigDemoSheetView: View {
                             }
                         }
                         Section {
-                            Text("内置方案只读。想改 17 项参数，请点「另存为自定义配置」得到可命名的自定义副本。")
+                            Text("每个方案都带自己的「主识别模型 + ONNX 引擎」：WhisperKit / SenseVoiceSmall × 自动 / CPU EP / CoreML EP。内置方案只读；点「另存为自定义配置」可得到能改组合的副本。")
                                 .font(.caption2).foregroundColor(.secondary)
                             Text("当前模式：\(mode.title) · 选择写入 Documents/mode_profiles.json")
                                 .font(.caption2).foregroundColor(.secondary)
@@ -2295,7 +2700,7 @@ struct ConfigDemoSheetView: View {
                             }
                         }
                         Section {
-                            Text("模型链决定主 ASR 的 bundle 目录与语言目录，以及 VAD / 声纹 / SenseVoice / 向量索引哪些会被调用。")
+                            Text("模型链决定主 ASR（可含 SenseVoiceSmall）、辅助模型顺序，以及链级引擎覆盖。inherit = 沿用配置方案；其余值优先于方案。")
                                 .font(.caption2).foregroundColor(.secondary)
                         }
                     case .saveConfig:
@@ -2307,9 +2712,32 @@ struct ConfigDemoSheetView: View {
                             Text("解码温度 \(String(format: "%.2f", store.tuning(for: mode).temperature)) · 搜索条数 \(store.tuning(for: mode).searchLimit)")
                                 .font(.caption2).foregroundColor(.secondary)
                         }
+                        Section("主识别模型 · 每个方案可以不同") {
+                            Picker("主识别模型", selection: $guide.configASR) {
+                                ForEach(PrimaryASRChoice.allCases) { choice in
+                                    Text(choice.title).tag(choice.rawValue)
+                                }
+                            }
+                            .pickerStyle(.menu)
+                            Text("选 SenseVoiceSmall 时，主转写真实走 ONNX 图而不是 WhisperKit。")
+                                .font(.caption2).foregroundColor(.secondary)
+                        }
+                        Section("ONNX 引擎 · 每个方案可以不同") {
+                            Picker("ONNX 引擎", selection: $guide.configEngine) {
+                                ForEach(OnnxInferenceEngine.allCases) { engine in
+                                    Text(engine.title).tag(engine.rawValue)
+                                }
+                            }
+                            .pickerStyle(.menu)
+                            Text("引擎会真实传给 sherpaOnnxOfflineModelConfig(provider:)；模拟器无 ANE 时安全回退 CPU EP。")
+                                .font(.caption2).foregroundColor(.secondary)
+                        }
                         Section {
                             Button {
-                                _ = store.saveCustomConfig(name: guide.configName, for: mode, onLog: onLog)
+                                _ = store.saveCustomConfig(name: guide.configName,
+                                                           primaryASR: guide.configASR,
+                                                           onnxEngineRaw: guide.configEngine,
+                                                           for: mode, onLog: onLog)
                                 guide.dismiss()
                             } label: {
                                 Label("保存并切换到自定义配置", systemImage: "square.and.arrow.down")
@@ -2324,9 +2752,20 @@ struct ConfigDemoSheetView: View {
                                 Text("跟随模式默认").tag("auto")
                                 Text("Whisper Base").tag("whisper-base")
                                 Text("Whisper Turbo · 632MB").tag("whisper-turbo")
+                                Text("SenseVoiceSmall int8（ONNX 主识别）").tag("sense-voice")
                             }
-                            .pickerStyle(.segmented)
-                            Text("强制指定后，转写按实际模型目录加载，不再按模式硬编码。")
+                            .pickerStyle(.menu)
+                            Text("强制指定后，转写按实际模型目录加载；选 SenseVoiceSmall 则主转写走 ONNX 图。")
+                                .font(.caption2).foregroundColor(.secondary)
+                        }
+                        Section("链级 ONNX 引擎覆盖") {
+                            Picker("引擎", selection: $guide.chainEngine) {
+                                ForEach(ChainEngineChoice.allCases) { choice in
+                                    Text(choice.title).tag(choice.rawValue)
+                                }
+                            }
+                            .pickerStyle(.menu)
+                            Text("inherit = 沿用当前配置方案；其余值优先于方案，这就是「同一方案换条链就换引擎」。")
                                 .font(.caption2).foregroundColor(.secondary)
                         }
                         Section("辅助模型链（勾选才会被调用）") {
@@ -2346,7 +2785,9 @@ struct ConfigDemoSheetView: View {
                                 let ordered = ModeProfileStore.allStageIDs.filter { guide.chainStages.contains($0) }
                                 _ = store.saveCustomChain(name: guide.chainName,
                                                           primary: guide.chainPrimary,
-                                                          stages: ordered, for: mode, onLog: onLog)
+                                                          stages: ordered,
+                                                          onnxEngineRaw: guide.chainEngine,
+                                                          for: mode, onLog: onLog)
                                 guide.dismiss()
                             } label: {
                                 Label("保存并切换到自定义链", systemImage: "square.and.arrow.down")
@@ -2393,6 +2834,8 @@ struct ConfigDemoSheetView: View {
                 Text(profile.note).font(.caption2).foregroundColor(.secondary)
                 Text("温度 \(String(format: "%.2f", profile.tuning.temperature)) · fallback \(profile.tuning.temperatureFallbackCount) · 搜索 \(profile.tuning.searchLimit)")
                     .font(.caption2.monospacedDigit()).foregroundColor(.secondary)
+                Text("主识别 \((PrimaryASRChoice(rawValue: profile.primaryASR) ?? .whisper).short) · 引擎 \((OnnxInferenceEngine(rawValue: profile.onnxEngineRaw) ?? .auto).title)")
+                    .font(.caption2).foregroundColor(.purple)
             }
             Spacer()
             if store.selection(for: mode).configID == profile.id {
@@ -2412,6 +2855,8 @@ struct ConfigDemoSheetView: View {
                 Text(chain.note).font(.caption2).foregroundColor(.secondary)
                 Text("主 ASR \(chain.primaryLabel) · 辅助 \(chain.stages.count) 步 · \(chain.stages.joined(separator: " → "))")
                     .font(.caption2).foregroundColor(.secondary)
+                Text("引擎 \(chain.engineLabel)")
+                    .font(.caption2).foregroundColor(.purple)
             }
             Spacer()
             if store.selection(for: mode).chainID == chain.id {

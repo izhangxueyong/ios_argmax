@@ -268,7 +268,7 @@ jobs:
                 "$DOCS/retranscribe_action.log" "$DOCS/model_config.json" \
                 "$DOCS/model_calls.json" "$DOCS/model_management_export.json" \
                 "$DOCS/mode_profiles.json" "$DOCS/onnx_engine.json" \
-                "$DOCS/onnx_engine_export.json" 2>/dev/null || true
+                "$DOCS/onnx_engine_export.json" "$DOCS/combo_profiles.json" 2>/dev/null || true
 
           # Start recording BEFORE launch so the launch animation is captured.
           echo "Starting screen recording..."
@@ -403,11 +403,17 @@ jobs:
           echo "=== '模式和模型' management screen lines ==="
           grep -E "MODEL MGMT|MODEL PROFILE|MODEL CHAIN|DEMO model management|tuning applied|call logged|load calls logged|deviations" "$DOCS/progress.log" || true
 
-          echo "=== 配置教学录像章节（DEMO screen 时间码） ==="
-          grep -E "DEMO screen [0-9]+: (配置教学|引擎教学)" "$DOCS/progress.log" || true
+          echo "=== 教学录像章节（DEMO screen 时间码） ==="
+          grep -E "DEMO screen [0-9]+: (配置教学|引擎教学|组合教学)" "$DOCS/progress.log" || true
+
+          echo "=== MODEL COMBO（配置方案 × 模型链 × 引擎 / 主识别模型） ==="
+          grep -E "MODEL COMBO|DEMO combo profiles|组合教学|执行组合" "$DOCS/progress.log" || true
 
           echo "=== ONNX ENGINE（所选引擎 / 实际生效 provider / 回退原因） ==="
           grep -E "ONNX ENGINE|DEMO onnx engine|engine-verify|引擎教学" "$DOCS/progress.log" || true
+
+          echo "=== combo_profiles.json（A/B/C/D 四次组合） ==="
+          cat "$DOCS/combo_profiles.json" 2>/dev/null || echo "(missing)"
 
           echo "=== mode profiles (mode_profiles.json) ==="
           cat "$DOCS/mode_profiles.json" 2>/dev/null || echo "(missing; built-in defaults only)"
@@ -458,6 +464,9 @@ jobs:
             cp "$DOCS/mode_profiles.json" "$MEDIA_DIR/AutoTranscribe-mode-profiles.json" 2>/dev/null || true
             cp "$DOCS/onnx_engine.json" "$MEDIA_DIR/AutoTranscribe-onnx-engine.json" 2>/dev/null || true
             cp "$DOCS/onnx_engine_export.json" "$MEDIA_DIR/AutoTranscribe-onnx-engine-export.json" 2>/dev/null || true
+            cp "$DOCS/combo_profiles.json" "$MEDIA_DIR/AutoTranscribe-combo-profiles.json" 2>/dev/null || true
+            echo "=== combo_profiles.json ==="
+            cat "$DOCS/combo_profiles.json" 2>/dev/null || echo "(missing)"
             echo "=== onnx_engine_export.json ==="
             cat "$DOCS/onnx_engine_export.json" 2>/dev/null || echo "(missing)"
             ls -lh "$MEDIA_DIR/"*.json

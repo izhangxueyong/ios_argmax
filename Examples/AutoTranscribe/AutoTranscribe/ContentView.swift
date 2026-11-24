@@ -247,13 +247,8 @@ struct ContentView: View {
         .frame(maxWidth: .infinity)
     }
 
-    private var primaryASRTitle: String {
-        if engineStore.useSenseVoiceAsPrimary {
-            return "SenseVoiceSmall int8（ONNX）"
-        }
-        return profileStore.primaryModelID(for: selectedMode) == "whisper-turbo"
-            ? "Whisper Turbo · 632MB" : "Whisper Base"
-    }
+    /// 首页显示的「配置方案 × 模型链」解析结果，与管理页用同一个真相源。
+    private var activeCombo: RuntimeCombo { profileStore.combo(for: selectedMode) }
 
     private var modeCard: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -313,32 +308,37 @@ struct ContentView: View {
 
             Divider()
 
-            // 「使用的时候选择使用这个模型」：首页直接切换主识别模型，
-            // 不必进管理页。打开后 transcribe(_:) 真实走 SenseVoiceSmall
-            // int8 ONNX 图（按当前模式所选引擎）。
+            // 「配置方案 × 模型链」解析出的执行组合，首页直接可见、可直接改。
+            // 开关写回当前配置方案（内置方案自动派生自定义副本），因此与
+            // 管理页里的方案/链选择永远不会互相打架。
             HStack(spacing: 8) {
-                Image(systemName: engineStore.useSenseVoiceAsPrimary
+                Image(systemName: activeCombo.useSenseVoice
                       ? "waveform.badge.mic" : "brain")
-                    .foregroundColor(engineStore.useSenseVoiceAsPrimary ? .purple : .blue)
+                    .foregroundColor(activeCombo.useSenseVoice ? .purple : .blue)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("主识别模型：\(primaryASRTitle)")
+                    Text("主识别模型：\(activeCombo.asrTitle)")
                         .font(.caption.bold())
-                    Text(engineStore.useSenseVoiceAsPrimary
-                         ? "端侧 ONNX · 引擎 \(engineStore.engine(for: selectedMode).title) · 实际 provider=\(AudioIntelligence.shared.onnxRuntimeStatus?.effectiveProvider ?? "cpu")"
-                         : "WhisperKit · 按配置方案与模型链加载")
+                    Text("执行组合：\(activeCombo.engineTitle)（\(activeCombo.engineSource)）· 实际 provider=\(AudioIntelligence.shared.onnxRuntimeStatus?.effectiveProvider ?? "cpu")")
                         .font(.caption2)
                         .foregroundColor(.secondary)
+                    Text("来自「\(activeCombo.configName)」×「\(activeCombo.chainName)」")
+                        .font(.caption2)
+                        .foregroundColor(.blue)
                 }
                 Spacer(minLength: 0)
                 Toggle("", isOn: Binding(
-                    get: { engineStore.useSenseVoiceAsPrimary },
+                    get: { activeCombo.useSenseVoice },
                     set: { newValue in
-                        engineStore.setUseSenseVoiceAsPrimary(newValue, onLog: { log($0) })
+                        profileStore.setConfigPrimaryASR(
+                            newValue ? PrimaryASRChoice.senseVoice.rawValue
+                                     : PrimaryASRChoice.whisper.rawValue,
+                            for: selectedMode, onLog: { log($0) })
+                        applyTuning(for: selectedMode)
                     }
                 ))
                 .labelsHidden()
             }
-            Text("打开开关即用 SenseVoiceSmall 作为主识别；关闭时用 WhisperKit。引擎在「模式和模型 → 引擎」里选。")
+            Text("开关会改写当前配置方案；不同配置方案 / 模型链可分别绑定不同主识别模型和 ONNX 引擎，在「模式和模型 → 模式」里配置。")
                 .font(.caption2)
                 .foregroundColor(.orange)
         }
@@ -364,7 +364,7 @@ struct ContentView: View {
                     Text("模式和模型管理")
                         .font(.subheadline.bold())
                         .foregroundColor(.primary)
-                    Text("6 个模型 · 2 种模式 · \(TuningCatalog.specs.count) 项参数 · ONNX 引擎可选 · 调用日志与参数快照")
+                    Text("6 个模型 · 配置方案 × 模型链 × ONNX 引擎可组合 · 调用日志与参数快照")
                         .font(.caption2)
                         .foregroundColor(.secondary)
                 }
@@ -1152,7 +1152,6 @@ struct ContentView: View {
         let mode = selectedMode
         let ai = AudioIntelligence.shared
         applyTuning(for: mode)
-        engineStore.apply(for: mode)
         let selected = engineStore.engine(for: mode)
         let status = ai.onnxRuntimeStatus
         currentItemName = item.name
@@ -1227,9 +1226,12 @@ struct ContentView: View {
             setStage(.failed, detail: "找不到录音文件", progress: 0)
             return
         }
-        // 「使用的时候选择使用 SenseVoiceSmall」：打开后主转写真的走端侧
-        // ONNX 图（按所选引擎），而不是 WhisperKit。二者共用同一套 meta /
-        // 调用日志 / sentinel 落盘路径，便于在日志页与 CI 输出里复核。
+        // 每次转写前从「配置方案 × 模型链」解析执行组合并同步到运行时：
+        // 主识别模型分支与 ORT provider 都由当前方案/链决定，不依赖缓存状态。
+        applyTuning(for: selectedMode)
+        // 「使用的时候选择使用 SenseVoiceSmall」：组合解析为 SenseVoice 时
+        // 主转写真的走端侧 ONNX 图，而不是 WhisperKit。二者共用同一套
+        // meta / 调用日志 / sentinel 落盘路径，便于在日志页与 CI 输出里复核。
         if engineStore.useSenseVoiceAsPrimary {
             await transcribeWithSenseVoice(item, url: url)
             return
@@ -1429,6 +1431,9 @@ struct ContentView: View {
 
         // ---- ONNX engine: select CoreML EP / CPU EP, verify it really runs ----
         await demoOnnxEngine()
+
+        // ---- 配置方案 / 模型链 各自绑定不同主模型与引擎，并真实跑转写 ----
+        await demoComboProfiles()
 
         // ---- Scroll down the archived list screen by screen ----
         await demoScrollArchivedList()
@@ -2073,7 +2078,9 @@ struct ContentView: View {
 
         // 3 · 选中 CoreML EP
         configGuide.dismiss()
-        engineStore.setEngine(.coreML, for: .standard, onLog: engineLog)
+        // 选引擎 = 改写当前配置方案的 onnxEngineRaw（内置方案自动派生自定义副本）
+        profileStore.setConfigEngine(OnnxInferenceEngine.coreML.rawValue, for: .standard, onLog: engineLog)
+        applyTuning(for: .standard)
         managementSection = .engine
         configGuide.announce(step: 3,
             title: "第 3 步 · 选中 CoreML EP（ANE）",
@@ -2089,7 +2096,8 @@ struct ContentView: View {
         await settleThenMark("引擎教学 4 · 运行时证据：ORT CoreML 符号 / 环境 / 回退原因", seconds: 6)
 
         // 5 · 对照 CPU EP
-        engineStore.setEngine(.cpu, for: .standard, onLog: engineLog)
+        profileStore.setConfigEngine(OnnxInferenceEngine.cpu.rawValue, for: .standard, onLog: engineLog)
+        applyTuning(for: .standard)
         configGuide.announce(step: 5,
             title: "第 5 步 · 切到 CPU EP 对照",
             detail: "显式 CPU EP：ORT 在 XNNPACK / ARM NEON 上执行 int8 图，模拟器与真机均可用。切换后会话缓存失效并真实重建。",
@@ -2097,7 +2105,8 @@ struct ContentView: View {
         await settleThenMark("引擎教学 5 · 已选 CPU EP · 实际生效 provider=cpu", seconds: 6)
 
         // 6 · 打开「使用时选择 SenseVoiceSmall」
-        engineStore.setUseSenseVoiceAsPrimary(true, onLog: engineLog)
+        profileStore.setConfigPrimaryASR(PrimaryASRChoice.senseVoice.rawValue, for: .standard, onLog: engineLog)
+        applyTuning(for: .standard)
         configGuide.announce(step: 6,
             title: "第 6 步 · 打开「用 SenseVoiceSmall 作为主识别模型」",
             detail: "这是使用时选择使用这个模型的开关：打开后点击录音的转写会真实走 SenseVoiceSmall int8 ONNX 图，而不是 WhisperKit。",
@@ -2121,8 +2130,8 @@ struct ContentView: View {
         await settleThenMark("引擎教学 8 · 调用日志：引擎 / provider / 回退原因 / 运行环境", seconds: 7)
 
         // 9 · 复位
-        engineStore.setUseSenseVoiceAsPrimary(false, onLog: engineLog)
-        engineStore.setEngine(.auto, for: .standard, onLog: engineLog)
+        profileStore.resetAll(onLog: engineLog)
+        applyTuning(for: .standard)
         managementSection = .engine
         configGuide.announce(step: 9,
             title: "第 9 步 · 复位到自动引擎",
@@ -2135,13 +2144,16 @@ struct ContentView: View {
 
         // 10 · 首页也能直接选：使用时的入口
         showingModelManager = false
-        engineStore.setUseSenseVoiceAsPrimary(true, onLog: engineLog)
+        profileStore.setConfigPrimaryASR(PrimaryASRChoice.senseVoice.rawValue, for: .standard, onLog: engineLog)
+        applyTuning(for: .standard)
+        scrollAnchor = "mode"
         configGuide.announce(step: 10,
             title: "第 10 步 · 首页直接选主识别模型",
             detail: "不用进管理页：首页「识别模式」卡片就有开关，打开后显示当前 ONNX 引擎与实际 provider，点录音即按 SenseVoiceSmall 转写。",
             hint: "使用时选择使用这个模型")
         await settleThenMark("引擎教学 10 · 首页开关：主识别模型 SenseVoiceSmall + 实际 provider", seconds: 7)
-        engineStore.setUseSenseVoiceAsPrimary(false, onLog: engineLog)
+        profileStore.setConfigPrimaryASR(PrimaryASRChoice.whisper.rawValue, for: .standard, onLog: engineLog)
+        applyTuning(for: .standard)
 
         configGuide.active = false
         showingModelManager = false
@@ -2154,7 +2166,6 @@ struct ContentView: View {
         let mode: TranscriptionMode = .standard
         let ai = AudioIntelligence.shared
         applyTuning(for: mode)
-        engineStore.apply(for: mode)
         let selected = engineStore.engine(for: mode)
         let status = ai.onnxRuntimeStatus
         log("ONNX ENGINE verify start: engine=\(selected.rawValue) effective=\(status?.effectiveProvider ?? "-") reason=\(status?.reason ?? "-")")
@@ -2187,6 +2198,203 @@ struct ContentView: View {
         )
         log("ONNX ENGINE verify done: elapsed=\(String(format: "%.2f", elapsed))s lang=\(result.language) text=\(result.text)")
         log("ONNX ENGINE verify note: \(result.note)")
+    }
+
+    /// 录像教学：不同「配置方案 / 模型链」可以各自绑定不同的主识别模型与
+    /// ONNX 引擎。每一步都 markScreen，且含 3 次真实转写（SenseVoice / Whisper /
+    /// 链级覆盖），调用日志里的 comboSnapshot 可逐条对照。
+    private func demoComboProfiles() async {
+        log("DEMO combo profiles started")
+        selectedMode = .standard
+        let comboLog: (String) -> Void = { message in log(message) }
+        showingModelManager = true
+        managementSection = .bindings
+        configGuide.active = true
+        configGuide.chapter = "组合教学"
+        configGuide.total = 10
+        configGuide.targetMode = .standard
+
+        // 1 · 三层关系与优先级
+        configGuide.announce(step: 1,
+            title: "第 1 步 · 方案 / 链 / 引擎 的三层关系",
+            detail: "配置方案 = 17 项参数 + 主识别模型 + ONNX 引擎；模型链 = 主 ASR + 辅助链 + 引擎覆盖。每张模式卡底部有「最终执行组合」。",
+            hint: "链非 auto / 非 inherit 时优先于方案")
+        await settleThenMark("组合教学 1 · 三层关系与优先级：方案 × 链 × 引擎", seconds: 6)
+
+        // 2 · 展开配置方案清单
+        configGuide.present(.configOptions, for: .standard)
+        configGuide.announce(step: 2,
+            title: "第 2 步 · 展开配置方案清单",
+            detail: "5 个内置方案分别带不同组合：默认(Whisper+自动) / Base(Whisper+CPU) / Turbo(Whisper+自动) / SenseVoice+CoreML / SenseVoice+CPU。",
+            hint: "▼ 每项都标了主识别模型与引擎", focus: .config)
+        await settleThenMark("组合教学 2 · 5 个配置方案各自的主识别模型与 ONNX 引擎", seconds: 7)
+
+        // 3 · 选 SenseVoice · CoreML EP 方案
+        configGuide.dismiss()
+        profileStore.setConfig(id: "config-sense-coreml", for: .standard, onLog: comboLog)
+        applyTuning(for: .standard)
+        let a = profileStore.combo(for: .standard)
+        log("MODEL COMBO A: \(a.summary) · 方案=\(a.configName) · 链=\(a.chainName)")
+        configGuide.announce(step: 3,
+            title: "第 3 步 · 选「SenseVoice · CoreML EP 方案」",
+            detail: "方案级组合立即生效：\(a.summary)。引擎来源=配置方案；请求 coreml 在模拟器安全回退 cpu。",
+            hint: "主识别模型与引擎一起变了", focus: .config)
+        await settleThenMark("组合教学 3 · 方案 A：SenseVoiceSmall + CoreML EP（请求）", seconds: 7)
+
+        // 4 · 真实转写 A
+        configGuide.announce(step: 4,
+            title: "第 4 步 · 用方案 A 真实跑一次转写",
+            detail: "transcribe(_:) 按组合走 SenseVoiceSmall ONNX 主识别，结果、耗时、combo 参数写进调用日志。",
+            hint: "真实推理，不是贴图")
+        showingModelManager = false
+        scrollAnchor = "status"
+        await verifyComboTranscribe(label: "A-sense-coreml")
+        await settleThenMark("组合教学 4 · 方案 A 转写完成：SenseVoiceSmall 主识别输出", seconds: 6)
+        showingModelManager = true
+        managementSection = .bindings
+
+        // 5 · 切回 Whisper + auto，真实转写 B 做对照
+        profileStore.setConfig(id: ModeProfileStore.defaultConfigID, for: .standard, onLog: comboLog)
+        applyTuning(for: .standard)
+        let b = profileStore.combo(for: .standard)
+        log("MODEL COMBO B: \(b.summary) · 方案=\(b.configName) · 链=\(b.chainName)")
+        configGuide.announce(step: 5,
+            title: "第 5 步 · 切回「默认配置」并真实转写",
+            detail: "同一模式只换一个配置方案，主识别模型变回 Whisper Base、引擎变回自动；用 WhisperKit 真跑一次（约 36 秒）。",
+            hint: "两次调用的 combo 参数可直接对照", focus: .config)
+        await settleThenMark("组合教学 5 · 方案 B：Whisper Base + 自动引擎，组合已切换", seconds: 6)
+        showingModelManager = false
+        await verifyComboTranscribe(label: "B-whisper-auto")
+        await settleThenMark("组合教学 5b · 方案 B 转写完成：WhisperKit 主识别输出", seconds: 5)
+        showingModelManager = true
+        managementSection = .bindings
+
+        // 6 · 展开模型链清单
+        configGuide.present(.chainOptions, for: .standard)
+        configGuide.announce(step: 6,
+            title: "第 6 步 · 展开模型链清单",
+            detail: "4 条链各自带引擎设置：默认/极简/Turbo 为 inherit（沿用方案），SenseVoice 主识别链强制覆盖 CoreML EP。",
+            hint: "▼ 链也能配引擎", focus: .chain)
+        await settleThenMark("组合教学 6 · 4 条模型链：inherit 沿用方案 / 链级引擎覆盖", seconds: 7)
+
+        // 7 · 选 SenseVoice 主识别链，链覆盖优先
+        configGuide.dismiss()
+        profileStore.setChain(id: "chain-sense-coreml", for: .standard, onLog: comboLog)
+        applyTuning(for: .standard)
+        let c = profileStore.combo(for: .standard)
+        log("MODEL COMBO C: \(c.summary) · 引擎来源=\(c.engineSource) · 主模型来源=\(c.asrSource)")
+        configGuide.announce(step: 7,
+            title: "第 7 步 · 选「SenseVoice 主识别链」覆盖方案",
+            detail: "链 primary=sense-voice、引擎=coreML 同时覆盖方案：\(c.summary)。这就是「同一方案换条链就换引擎」。",
+            hint: "引擎来源=模型链覆盖", focus: .chain)
+        await settleThenMark("组合教学 7 · 链覆盖生效：引擎来源=模型链覆盖 · 主模型=SenseVoiceSmall", seconds: 7)
+        showingModelManager = false
+        await verifyComboTranscribe(label: "C-chain-override")
+        await settleThenMark("组合教学 7b · 链覆盖组合转写完成，日志可对照 engineSource", seconds: 5)
+        showingModelManager = true
+        managementSection = .bindings
+
+        // 8 · 先让链回到 inherit，方案级组合才不会被链级覆盖遮住
+        profileStore.setChain(id: ModeProfileStore.defaultChainID, for: .standard, onLog: comboLog)
+        applyTuning(for: .standard)
+        configGuide.present(.saveConfig, for: .standard)
+        configGuide.configName = "演示 · SenseVoice CPU 组合"
+        configGuide.configASR = PrimaryASRChoice.senseVoice.rawValue
+        configGuide.configEngine = OnnxInferenceEngine.cpu.rawValue
+        configGuide.announce(step: 8,
+            title: "第 8 步 · 自定义配置里选主模型 + 引擎",
+            detail: "先把链切回 inherit（沿用方案），再在「另存为自定义配置」表单里选主识别模型 SenseVoiceSmall + ONNX 引擎 CPU EP，保存后该方案自带这套组合。",
+            hint: "▼ 组合可编辑、可命名", focus: .save)
+        await settleThenMark("组合教学 8 · 自定义配置表单：主识别模型 + ONNX 引擎两个选择器", seconds: 7)
+        configGuide.dismiss()
+        let customConfig = profileStore.saveCustomConfig(
+            name: "演示 · SenseVoice CPU 组合",
+            primaryASR: PrimaryASRChoice.senseVoice.rawValue,
+            onnxEngineRaw: OnnxInferenceEngine.cpu.rawValue,
+            for: .standard, onLog: comboLog)
+        profileStore.setConfig(id: customConfig, for: .standard, onLog: comboLog)
+        applyTuning(for: .standard)
+        let d8 = profileStore.combo(for: .standard)
+        configGuide.announce(step: 8,
+            title: "第 8 步 · 自定义方案已保存并生效",
+            detail: "方案库多出「演示 · SenseVoice CPU 组合」，组合=\(d8.summary)，引擎来源=配置方案。",
+            hint: "xx 自定义配置", focus: .save)
+        await settleThenMark("组合教学 8b · 已保存自定义方案：SenseVoiceSmall + CPU EP", seconds: 6)
+
+        // 9 · 自定义链表单里选引擎覆盖
+        configGuide.present(.newChain, for: .standard)
+        configGuide.chainName = "演示 · CoreML 覆盖链"
+        configGuide.chainPrimary = "sense-voice"
+        configGuide.chainEngine = OnnxInferenceEngine.coreML.rawValue
+        configGuide.announce(step: 9,
+            title: "第 9 步 · 自定义链里选主 ASR + 引擎覆盖",
+            detail: "同一个自定义方案配的是 CPU EP；在「新建自定义链」表单里把链级引擎覆盖为 CoreML EP，即可只换链就换引擎。",
+            hint: "▼ 链级组合可编辑", focus: .chainEditor)
+        await settleThenMark("组合教学 9 · 自定义链表单：主 ASR = SenseVoiceSmall · 引擎覆盖 = CoreML EP", seconds: 7)
+        configGuide.dismiss()
+        let customChain = profileStore.saveCustomChain(
+            name: "演示 · CoreML 覆盖链", primary: "sense-voice",
+            stages: ["silero-vad", "campplus", "sense-voice"],
+            onnxEngineRaw: OnnxInferenceEngine.coreML.rawValue,
+            for: .standard, onLog: comboLog)
+        profileStore.setChain(id: customChain, for: .standard, onLog: comboLog)
+        applyTuning(for: .standard)
+        let d = profileStore.combo(for: .standard)
+        configGuide.announce(step: 9,
+            title: "第 9 步 · 自定义链已保存并生效",
+            detail: "方案仍是 CPU EP，只换一条链就变成 \(d.summary)；引擎来源=模型链覆盖，辅助链裁到 3 步。",
+            hint: "xx 自定义模型链", focus: .chainEditor)
+        await settleThenMark("组合教学 9b · 已保存自定义链：链级 CoreML EP 覆盖方案 CPU EP", seconds: 6)
+
+        // 10 · 日志页核对 + 复位
+        managementSection = .calls
+        configGuide.announce(step: 10,
+            title: "第 10 步 · 日志页核对组合参数并复位",
+            detail: "每条调用都带「配置方案主识别模型 / 配置方案引擎 / 模型链引擎 / 最终主识别模型 / 最终引擎 / 引擎来源 / 执行组合」。",
+            hint: "A / B / C 三次转写逐条可查")
+        await settleThenMark("组合教学 10 · 调用日志：A/B/C 三次转写的 combo 参数快照", seconds: 7)
+        profileStore.resetAll(onLog: comboLog)
+        applyTuning(for: .standard)
+        managementSection = .bindings
+        configGuide.announce(step: 10,
+            title: "第 10 步 · 已复位到内置默认组合",
+            detail: "普通模式 = 默认配置(Whisper + 自动) × 默认模型链(inherit)，所有自定义方案/链已清除。",
+            hint: "mode_profiles.json 已复位")
+        await settleThenMark("组合教学 10b · 复位：Whisper Base + 自动引擎 × inherit 链", seconds: 6)
+
+        // 导出三次组合的硬证据，CI 会复制成 AutoTranscribe-combo-profiles.json。
+        let rows: [[String: String]] = [
+            ["label": "A-sense-coreml", "combo": a.summary, "engineSource": a.engineSource, "asrSource": a.asrSource],
+            ["label": "B-whisper-auto", "combo": b.summary, "engineSource": b.engineSource, "asrSource": b.asrSource],
+            ["label": "C-chain-override", "combo": c.summary, "engineSource": c.engineSource, "asrSource": c.asrSource],
+            ["label": "D-custom-config", "combo": d8.summary,
+             "engineSource": d8.engineSource, "asrSource": d8.asrSource],
+            ["label": "E-custom-chain", "combo": d.summary,
+             "engineSource": d.engineSource, "asrSource": d.asrSource]
+        ]
+        if let data = try? JSONSerialization.data(withJSONObject: rows,
+                                                  options: [.prettyPrinted, .sortedKeys]),
+           let text = String(data: data, encoding: .utf8) {
+            writeText(text, fileName: "combo_profiles.json")
+            log("MODEL COMBO export: combo_profiles.json rows=\(rows.count)")
+        }
+
+        configGuide.active = false
+        showingModelManager = false
+        log("DEMO combo profiles finished, combo=\(profileStore.combo(for: .standard).summary)")
+        try? await Task.sleep(nanoseconds: 1_000_000_000)
+    }
+
+    /// 用真实录音条目走 transcribe(_:) 主分支，验证当前「方案 × 链」组合。
+    private func verifyComboTranscribe(label: String) async {
+        guard let item = store.items.first else {
+            log("MODEL COMBO verify skipped: no recording item")
+            return
+        }
+        let combo = profileStore.combo(for: .standard)
+        log("MODEL COMBO verify start: label=\(label) combo=\(combo.summary) engineSource=\(combo.engineSource)")
+        await transcribe(item)
+        log("MODEL COMBO verify done: label=\(label) calls=\(callLog.records.count)")
     }
 
     /// 用内置 JFK 样本按「当前模式所选方案 / 链」真实跑一次转写，
@@ -2259,6 +2467,9 @@ struct ContentView: View {
         params["模型链"] = profileStore.chain(for: activeMode).name
         params["主 ASR"] = profileStore.primaryModelID(for: activeMode)
         params["辅助链"] = profileStore.stages(for: activeMode).joined(separator: ",")
+        for (key, value) in profileStore.comboSnapshot(for: activeMode) {
+            params[key] = value
+        }
         for (key, value) in AudioIntelligence.shared.onnxEngineSnapshot {
             params[key] = value
         }
@@ -2271,7 +2482,13 @@ struct ContentView: View {
             AudioIntelligence.shared,
             using: profileStore.tuning(for: activeMode)
         )
-        engineStore.apply(for: activeMode)
+        // 「配置方案 × 模型链」解析出的执行组合在这里真正落地：
+        // 主识别模型（WhisperKit / SenseVoiceSmall）与 ONNX 引擎一起同步到
+        // 运行时，下一次转写和下一次 ORT session 都按新组合执行。
+        let combo = profileStore.combo(for: activeMode)
+        engineStore.applyCombo(engineRaw: combo.effectiveEngine,
+                               useSenseVoice: combo.useSenseVoice,
+                               for: activeMode)
     }
 
     private func setStage(_ s: Stage, detail: String, progress: Double) {
