@@ -412,7 +412,12 @@ jobs:
           echo "=== ONNX ENGINE（所选引擎 / 实际生效 provider / 回退原因） ==="
           grep -E "ONNX ENGINE|DEMO onnx engine|engine-verify|引擎教学" "$DOCS/progress.log" || true
 
-          echo "=== combo_profiles.json（A/B/C/D 四次组合） ==="
+          echo "=== COMBO FIX（主 ASR 唯一解析源 / SenseVoice 二次识别去重） ==="
+          grep -E "COMBO FIX|MODEL CHAIN skipped sense-voice" "$DOCS/progress.log" || true
+          echo "--- 调用日志中的解析一致性字段 ---"
+          grep -E '"解析一致性"|"模型资源路径"|"辅助链"' "$DOCS/model_calls.json" 2>/dev/null | tail -30 || true
+
+          echo "=== combo_profiles.json（A/B/C/D/E 组合 + 修复验证字段） ==="
           cat "$DOCS/combo_profiles.json" 2>/dev/null || echo "(missing)"
 
           echo "=== mode profiles (mode_profiles.json) ==="

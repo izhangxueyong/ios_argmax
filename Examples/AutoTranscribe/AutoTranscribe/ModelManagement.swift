@@ -1884,9 +1884,13 @@ struct ModelChainPreset: Codable, Identifiable, Equatable, Sendable {
     var id: String
     var name: String
     var note: String
-    /// "auto" 跟随模式默认；也可强制 "whisper-base" / "whisper-turbo" / "sense-voice"。
+    /// "auto" = 不指定主 ASR：交由配置方案的 primaryASR 决定；方案用 Whisper 时
+    /// 才按模式默认（普通 Base / 精准 Turbo）。也可强制
+    /// "whisper-base" / "whisper-turbo" / "sense-voice"。
+    /// 对外读取请用 ModeProfileStore.combo(for:) / primaryModelID(for:)，
+    /// 它们把配置方案与链合并成唯一结果；resolvedPrimary(for:) 只看链本身。
     var primaryModelID: String
-    /// 实际会执行的辅助模型，顺序即执行顺序。
+    /// 参与执行的辅助模型开关集合。执行顺序固定为 allStageIDs，数组顺序不参与调度。
     var stages: [String]
     /// "inherit" = 沿用配置方案的引擎；否则覆盖为 auto / cpu / coreML。
     var onnxEngineRaw: String
@@ -1937,7 +1941,7 @@ struct ModelChainPreset: Codable, Identifiable, Equatable, Sendable {
 
     var primaryLabel: String {
         switch primaryModelID {
-        case "auto": return "跟随模式默认"
+        case "auto": return "跟随配置方案"
         case "whisper-turbo": return "Whisper Turbo · 632MB"
         case "sense-voice": return "SenseVoiceSmall int8（ONNX 主识别）"
         default: return "Whisper Base"
@@ -1948,6 +1952,8 @@ struct ModelChainPreset: Codable, Identifiable, Equatable, Sendable {
         (ChainEngineChoice(rawValue: onnxEngineRaw) ?? .inherit).title
     }
 
+    /// 只解析「链自己」的主 ASR，不含配置方案；对外请用
+    /// ModeProfileStore.primaryModelID(for:) 读合并后的结果。
     func resolvedPrimary(for mode: TranscriptionMode) -> String {
         switch primaryModelID {
         case "auto": return mode == .standard ? "whisper-base" : "whisper-turbo"
@@ -2061,7 +2067,7 @@ final class ModeProfileStore: ObservableObject {
         let epoch = Date(timeIntervalSince1970: 0)
         return [
             ModelChainPreset(id: defaultChainID, name: "默认模型链",
-                             note: "主 ASR 跟随模式 + 引擎沿用方案 + VAD → 声纹 → SenseVoice → 向量索引",
+                             note: "主 ASR 交由配置方案决定（方案用 Whisper 时按模式默认）+ 引擎沿用方案 + VAD → 声纹 → SenseVoice → 向量索引",
                              primaryModelID: "auto", stages: allStageIDs,
                              onnxEngineRaw: ChainEngineChoice.inherit.rawValue,
                              isBuiltIn: true, createdAt: epoch),
@@ -2076,8 +2082,9 @@ final class ModeProfileStore: ObservableObject {
                              onnxEngineRaw: ChainEngineChoice.inherit.rawValue,
                              isBuiltIn: true, createdAt: epoch),
             ModelChainPreset(id: "chain-sense-coreml", name: "SenseVoice 主识别链",
-                             note: "链级覆盖：主 ASR = SenseVoiceSmall，引擎强制 CoreML EP（优先于方案）",
-                             primaryModelID: "sense-voice", stages: allStageIDs,
+                             note: "链级覆盖：主 ASR = SenseVoiceSmall，请求 CoreML EP（优先于方案；无 ANE 时安全回退 CPU）；主 ASR 已是 SenseVoice，辅助链不再做二次识别",
+                             primaryModelID: "sense-voice",
+                             stages: allStageIDs.filter { $0 != "sense-voice" },
                              onnxEngineRaw: OnnxInferenceEngine.coreML.rawValue,
                              isBuiltIn: true, createdAt: epoch)
         ]
@@ -2109,10 +2116,33 @@ final class ModeProfileStore: ObservableObject {
     }
 
     func tuning(for mode: TranscriptionMode) -> ModelTuning { config(for: mode).tuning }
-    func primaryModelID(for mode: TranscriptionMode) -> String { chain(for: mode).resolvedPrimary(for: mode) }
-    func folder(for mode: TranscriptionMode) -> String { chain(for: mode).resolvedFolder(for: mode) }
+
+    /// 对外的主 ASR 唯一出口：始终读「配置方案 × 模型链」合并后的 RuntimeCombo，
+    /// 避免 UI / 语言目录 / 调用日志与实际转写分支各解析一套。
+    func primaryModelID(for mode: TranscriptionMode) -> String { combo(for: mode).effectiveASR }
+    /// WhisperKit 模型目录；SenseVoice 主识别时不走 WhisperKit，回落到 base 供重转写兜底。
+    func folder(for mode: TranscriptionMode) -> String {
+        combo(for: mode).effectiveASR == "whisper-turbo" ? "whisper-turbo" : "whisper-base"
+    }
+    /// 给 UI / 日志看的真实资源路径：WhisperKit 在 Models/，SenseVoice 在 ai-models/。
+    func modelPath(for mode: TranscriptionMode) -> String {
+        switch combo(for: mode).effectiveASR {
+        case "whisper-turbo": return "Models/whisper-turbo"
+        case "sense-voice": return "ai-models/sense-voice"
+        default: return "Models/whisper-base"
+        }
+    }
     func stages(for mode: TranscriptionMode) -> [String] { chain(for: mode).stages }
-    func uses(_ modelID: String, for mode: TranscriptionMode) -> Bool { stages(for: mode).contains(modelID) }
+    /// 主 ASR 已是 SenseVoiceSmall 时，辅助链里的 sense-voice 属于重复推理，
+    /// 运行时统一跳过（兼容旧 mode_profiles.json 里已保存的链）。
+    func uses(_ modelID: String, for mode: TranscriptionMode) -> Bool {
+        if modelID == "sense-voice", combo(for: mode).useSenseVoice { return false }
+        return stages(for: mode).contains(modelID)
+    }
+    /// 实际会执行的辅助链（固定顺序），用于调用日志快照。
+    func effectiveStages(for mode: TranscriptionMode) -> [String] {
+        Self.allStageIDs.filter { uses($0, for: mode) }
+    }
 
     // MARK: 执行组合解析（配置方案 × 模型链 → 主识别模型 + ONNX 引擎）
     //
@@ -2244,7 +2274,10 @@ final class ModeProfileStore: ObservableObject {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         let finalName = trimmed.isEmpty ? "自定义链 \(customChainCount + 1)" : trimmed
         let id = "chain-custom-\(UUID().uuidString.prefix(8))"
-        let ordered = Self.allStageIDs.filter { stages.contains($0) }
+        // 主 ASR 已是 SenseVoice 时不再把同名模型放进辅助链，避免二次重复推理。
+        let ordered = Self.allStageIDs.filter {
+            stages.contains($0) && !(primary == "sense-voice" && $0 == "sense-voice")
+        }
         let chain = ModelChainPreset(id: id, name: finalName,
                                      note: "自定义 · 主 ASR \(chainLabel(primary)) · 引擎 \((ChainEngineChoice(rawValue: onnxEngineRaw) ?? .inherit).title) · 辅助 \(ordered.count) 个",
                                      primaryModelID: primary, stages: ordered,
@@ -2258,7 +2291,7 @@ final class ModeProfileStore: ObservableObject {
 
     private func chainLabel(_ primary: String) -> String {
         switch primary {
-        case "auto": return "跟随模式默认"
+        case "auto": return "跟随配置方案"
         case "whisper-turbo": return "Turbo"
         case "sense-voice": return "SenseVoiceSmall"
         default: return "Base"
@@ -2436,7 +2469,7 @@ struct ModeProfileCard: View {
             .buttonStyle(.plain)
             Text(activeChain.note).font(.caption2).foregroundColor(.secondary)
             MMKeyValue("主 ASR", activePrimaryName)
-            MMKeyValue("模型目录", "Models/\(store.folder(for: mode))")
+            MMKeyValue("模型目录", store.modelPath(for: mode))
             MMKeyValue("链引擎", activeChain.engineLabel)
             if activeChain.stages.isEmpty {
                 Text("辅助模型链为空 · 只跑主 ASR 转写")
@@ -2700,7 +2733,7 @@ struct ConfigDemoSheetView: View {
                             }
                         }
                         Section {
-                            Text("模型链决定主 ASR（可含 SenseVoiceSmall）、辅助模型顺序，以及链级引擎覆盖。inherit = 沿用配置方案；其余值优先于方案。")
+                            Text("模型链可指定主 ASR（含 SenseVoiceSmall）、决定哪些辅助模型参与（执行顺序固定），以及链级引擎覆盖。链 primary=auto 时主 ASR 由配置方案决定；inherit = 沿用方案引擎，其余值优先于方案。请求 CoreML EP 时若无 ANE 会安全回退 CPU。")
                                 .font(.caption2).foregroundColor(.secondary)
                         }
                     case .saveConfig:
@@ -2749,7 +2782,7 @@ struct ConfigDemoSheetView: View {
                         }
                         Section("主 ASR") {
                             Picker("主模型", selection: $guide.chainPrimary) {
-                                Text("跟随模式默认").tag("auto")
+                                Text("跟随配置方案").tag("auto")
                                 Text("Whisper Base").tag("whisper-base")
                                 Text("Whisper Turbo · 632MB").tag("whisper-turbo")
                                 Text("SenseVoiceSmall int8（ONNX 主识别）").tag("sense-voice")
@@ -2853,7 +2886,7 @@ struct ConfigDemoSheetView: View {
                         .font(.caption2).foregroundColor(chain.isBuiltIn ? .secondary : .blue)
                 }
                 Text(chain.note).font(.caption2).foregroundColor(.secondary)
-                Text("主 ASR \(chain.primaryLabel) · 辅助 \(chain.stages.count) 步 · \(chain.stages.joined(separator: " → "))")
+                Text("主 ASR \(chain.primaryLabel) · 辅助 \(chain.stages.count) 个（顺序固定） · \(chain.stages.joined(separator: " → "))")
                     .font(.caption2).foregroundColor(.secondary)
                 Text("引擎 \(chain.engineLabel)")
                     .font(.caption2).foregroundColor(.purple)

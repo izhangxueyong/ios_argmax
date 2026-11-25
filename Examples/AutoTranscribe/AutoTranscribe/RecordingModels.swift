@@ -193,14 +193,28 @@ enum LanguageCatalog {
     // 语言目录、默认项和非法项回落都必须跟着真实模型走，否则会丢粤语
     // 或把 yue 传给不支持它的 base tokenizer。
 
+    /// SenseVoiceSmall int8 的显式语言参数是 auto / zh / en / ja / ko / yue，
+    /// 与 Whisper tokenizer 的语言表不同，不能复用 base / turbo 的目录。
+    static let senseVoiceCodes: [String] = ["zh", "en", "ja", "ko", "yue"]
+    static let senseVoiceTargets: [TranscriptionTarget] = makeTargets(codes: senseVoiceCodes)
+
     static func targets(forModelID id: String) -> [TranscriptionTarget] {
-        id == "whisper-turbo" ? turboTargets : baseTargets
+        switch id {
+        case "whisper-turbo": return turboTargets
+        case "sense-voice": return senseVoiceTargets
+        default: return baseTargets
+        }
     }
 
     static func countLabel(forModelID id: String) -> String {
-        id == "whisper-turbo"
-            ? "Whisper Turbo · \(turboCodes.count) 种可选识别语言（含粤语）"
-            : "Whisper Base · \(baseCodes.count) 种可选识别语言（不含粤语）"
+        switch id {
+        case "whisper-turbo":
+            return "Whisper Turbo · \(turboCodes.count) 种可选识别语言（含粤语）"
+        case "sense-voice":
+            return "SenseVoiceSmall int8 · 自动检测 + 中 / 英 / 日 / 韩 / 粤"
+        default:
+            return "Whisper Base · \(baseCodes.count) 种可选识别语言（不含粤语）"
+        }
     }
 
     static func defaultTarget(forModelID id: String) -> TranscriptionTarget {

@@ -271,10 +271,9 @@ struct ContentView: View {
                 Image(systemName: selectedMode == .standard ? "bolt.fill" : "sparkles")
                     .foregroundColor(selectedMode == .standard ? .orange : .purple)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(profileStore.primaryModelID(for: selectedMode) == "whisper-turbo"
-                         ? "Whisper Turbo · 632MB" : "Whisper Base")
+                    Text(profileStore.combo(for: selectedMode).asrTitle)
                         .font(.caption.bold())
-                    Text("Models/\(profileStore.folder(for: selectedMode)) · \(profileStore.chain(for: selectedMode).name) · \(profileStore.config(for: selectedMode).name)")
+                    Text("\(profileStore.modelPath(for: selectedMode)) · \(profileStore.chain(for: selectedMode).name) · \(profileStore.config(for: selectedMode).name)")
                         .font(.caption2)
                         .foregroundColor(.secondary)
                 }
@@ -1197,6 +1196,19 @@ struct ContentView: View {
         writeSentinel(status: "DONE", text: text, seconds: elapsed)
     }
 
+    /// SenseVoice 作为主识别时，重转写 / 配置验证也走同一个 ONNX 图，
+    /// 不使用 WhisperKit 目录，避免「显示 SenseVoice、实跑 Whisper」。
+    private func senseVoiceOutcome(for url: URL, mode: TranscriptionMode) -> TranscriptionOutcome {
+        applyTuning(for: mode)
+        let start = Date()
+        let result = AudioIntelligence.shared.senseVoiceTranscribe(audioURL: url)
+        return TranscriptionOutcome(
+            text: result.text,
+            elapsed: Date().timeIntervalSince(start),
+            sourceCode: result.language.isEmpty ? nil : result.language
+        )
+    }
+
     private func makeMeta(
         mode: TranscriptionMode,
         target: TranscriptionTarget,
@@ -1208,8 +1220,7 @@ struct ContentView: View {
         // What the user asked for, NOT a translation target.
         let chosen = LanguageCatalog.displayName(for: target.languageCode)
         return TranscriptionMeta(
-            modelName: modelOverride ?? (profileStore.primaryModelID(for: mode) == "whisper-turbo"
-                ? "Whisper Turbo · 632MB" : "Whisper Base"),
+            modelName: modelOverride ?? profileStore.combo(for: mode).asrTitle,
             modeTitle: mode.title,
             modeRaw: mode.rawValue,
             elapsed: outcome.elapsed,
@@ -1318,17 +1329,51 @@ struct ContentView: View {
             retranscribeNote = "找不到录音文件"
             return
         }
-        let primary = profileStore.primaryModelID(for: mode)
+        let combo = profileStore.combo(for: mode)
+        let primary = combo.effectiveASR
         let folder = profileStore.folder(for: mode)
         let effectiveTuning = profileStore.tuning(for: mode)
         let validated = LanguageCatalog.validated(target, forModelID: primary)
         retranscribeBusy = true
         retranscribeResult = nil
-        retranscribeNote = "正在用 \(primary == "whisper-turbo" ? "Whisper Turbo" : "Whisper Base") · \(validated.title) 重新转写…"
+        retranscribeNote = "正在用 \(combo.asrTitle) · \(validated.title) 重新转写…"
         setStage(.loading, detail: retranscribeNote, progress: 0.15)
         log("RETRANSCRIBE start: \(item.fileName), mode=\(mode.rawValue), model=\(primary), chain=\(profileStore.chain(for: mode).name), config=\(profileStore.config(for: mode).name), target=\(validated.id)")
         let params = tuningParams("retranscribe", mode: mode)
         let callStart = Date()
+
+        // 主识别是 SenseVoiceSmall 时，重转写也必须走同一个 ONNX 图。
+        if combo.useSenseVoice {
+            let outcome = senseVoiceOutcome(for: url, mode: mode)
+            let meta = makeMeta(
+                mode: mode, target: validated, outcome: outcome,
+                retranscribeCount: (item.transcription?.retranscribeCount ?? 0) + 1
+            )
+            store.updateTranscription(for: item.id, text: outcome.text, meta: meta)
+            transcript = outcome.text
+            currentItemName = item.name
+            retranscribeResult = meta
+            retranscribeBusy = false
+            retranscribeNote = "✓ 重新转写完成 · \(meta.modelName) · \(meta.elapsedTitle)"
+            setStage(.done, detail: retranscribeNote, progress: 1)
+            log("RETRANSCRIBE done (sense-voice): \(item.fileName), model=\(meta.modelName), elapsed=\(outcome.elapsed), target=\(validated.id)")
+            callLog.record(
+                modelID: primary,
+                operation: "retranscribe",
+                modeRaw: mode.rawValue,
+                parameters: params,
+                elapsed: outcome.elapsed,
+                result: outcome.text.isEmpty ? "空文本 / 无效结果" : outcome.text,
+                status: outcome.text.isEmpty ? .empty : .ok,
+                origin: callOrigin
+            )
+            writeText(
+                "\(item.fileName) retranscribed model=\(meta.modelName) target=\(validated.id) seconds=\(String(format: "%.1f", outcome.elapsed))\n",
+                fileName: "retranscribe_action.log",
+                append: true
+            )
+            return
+        }
 
         do {
             let outcome = try await service.transcribe(
@@ -2217,7 +2262,7 @@ struct ContentView: View {
         // 1 · 三层关系与优先级
         configGuide.announce(step: 1,
             title: "第 1 步 · 方案 / 链 / 引擎 的三层关系",
-            detail: "配置方案 = 17 项参数 + 主识别模型 + ONNX 引擎；模型链 = 主 ASR + 辅助链 + 引擎覆盖。每张模式卡底部有「最终执行组合」。",
+            detail: "配置方案 = 17 项参数 + 主识别模型 + ONNX 引擎；模型链 = 主 ASR + 辅助链 + 引擎覆盖。链 primary=auto 时主 ASR 由配置方案决定；辅助链是开关集合、执行顺序固定。每张模式卡底部有「最终执行组合」。",
             hint: "链非 auto / 非 inherit 时优先于方案")
         await settleThenMark("组合教学 1 · 三层关系与优先级：方案 × 链 × 引擎", seconds: 6)
 
@@ -2235,6 +2280,7 @@ struct ContentView: View {
         applyTuning(for: .standard)
         let a = profileStore.combo(for: .standard)
         log("MODEL COMBO A: \(a.summary) · 方案=\(a.configName) · 链=\(a.chainName)")
+        let fixA = comboFixRow("A-sense-coreml")
         configGuide.announce(step: 3,
             title: "第 3 步 · 选「SenseVoice · CoreML EP 方案」",
             detail: "方案级组合立即生效：\(a.summary)。引擎来源=配置方案；请求 coreml 在模拟器安全回退 cpu。",
@@ -2249,6 +2295,7 @@ struct ContentView: View {
         showingModelManager = false
         scrollAnchor = "status"
         await verifyComboTranscribe(label: "A-sense-coreml")
+        await verifyComboAuxSkip(label: "A-sense-coreml")
         await settleThenMark("组合教学 4 · 方案 A 转写完成：SenseVoiceSmall 主识别输出", seconds: 6)
         showingModelManager = true
         managementSection = .bindings
@@ -2258,6 +2305,7 @@ struct ContentView: View {
         applyTuning(for: .standard)
         let b = profileStore.combo(for: .standard)
         log("MODEL COMBO B: \(b.summary) · 方案=\(b.configName) · 链=\(b.chainName)")
+        let fixB = comboFixRow("B-whisper-auto")
         configGuide.announce(step: 5,
             title: "第 5 步 · 切回「默认配置」并真实转写",
             detail: "同一模式只换一个配置方案，主识别模型变回 Whisper Base、引擎变回自动；用 WhisperKit 真跑一次（约 36 秒）。",
@@ -2273,7 +2321,7 @@ struct ContentView: View {
         configGuide.present(.chainOptions, for: .standard)
         configGuide.announce(step: 6,
             title: "第 6 步 · 展开模型链清单",
-            detail: "4 条链各自带引擎设置：默认/极简/Turbo 为 inherit（沿用方案），SenseVoice 主识别链强制覆盖 CoreML EP。",
+            detail: "4 条链各自带引擎设置：默认/极简/Turbo 为 inherit（沿用方案），SenseVoice 主识别链请求 CoreML EP 覆盖（无 ANE 回退 CPU）。默认链 primary=auto → 主 ASR 跟随配置方案；辅助链顺序固定，SenseVoice 作主识别时不再二次识别。",
             hint: "▼ 链也能配引擎", focus: .chain)
         await settleThenMark("组合教学 6 · 4 条模型链：inherit 沿用方案 / 链级引擎覆盖", seconds: 7)
 
@@ -2283,6 +2331,7 @@ struct ContentView: View {
         applyTuning(for: .standard)
         let c = profileStore.combo(for: .standard)
         log("MODEL COMBO C: \(c.summary) · 引擎来源=\(c.engineSource) · 主模型来源=\(c.asrSource)")
+        let fixC = comboFixRow("C-chain-override")
         configGuide.announce(step: 7,
             title: "第 7 步 · 选「SenseVoice 主识别链」覆盖方案",
             detail: "链 primary=sense-voice、引擎=coreML 同时覆盖方案：\(c.summary)。这就是「同一方案换条链就换引擎」。",
@@ -2315,6 +2364,7 @@ struct ContentView: View {
         profileStore.setConfig(id: customConfig, for: .standard, onLog: comboLog)
         applyTuning(for: .standard)
         let d8 = profileStore.combo(for: .standard)
+        let fixD = comboFixRow("D-custom-config")
         configGuide.announce(step: 8,
             title: "第 8 步 · 自定义方案已保存并生效",
             detail: "方案库多出「演示 · SenseVoice CPU 组合」，组合=\(d8.summary)，引擎来源=配置方案。",
@@ -2334,12 +2384,13 @@ struct ContentView: View {
         configGuide.dismiss()
         let customChain = profileStore.saveCustomChain(
             name: "演示 · CoreML 覆盖链", primary: "sense-voice",
-            stages: ["silero-vad", "campplus", "sense-voice"],
+            stages: ["silero-vad", "campplus", "embeddinggemma"],
             onnxEngineRaw: OnnxInferenceEngine.coreML.rawValue,
             for: .standard, onLog: comboLog)
         profileStore.setChain(id: customChain, for: .standard, onLog: comboLog)
         applyTuning(for: .standard)
         let d = profileStore.combo(for: .standard)
+        let fixE = comboFixRow("E-custom-chain")
         configGuide.announce(step: 9,
             title: "第 9 步 · 自定义链已保存并生效",
             detail: "方案仍是 CPU EP，只换一条链就变成 \(d.summary)；引擎来源=模型链覆盖，辅助链裁到 3 步。",
@@ -2362,8 +2413,8 @@ struct ContentView: View {
             hint: "mode_profiles.json 已复位")
         await settleThenMark("组合教学 10b · 复位：Whisper Base + 自动引擎 × inherit 链", seconds: 6)
 
-        // 导出三次组合的硬证据，CI 会复制成 AutoTranscribe-combo-profiles.json。
-        let rows: [[String: String]] = [
+        // 导出 A/B/C/D/E 组合 + 修复验证字段，CI 会复制成 AutoTranscribe-combo-profiles.json。
+        let baseRows: [[String: String]] = [
             ["label": "A-sense-coreml", "combo": a.summary, "engineSource": a.engineSource, "asrSource": a.asrSource],
             ["label": "B-whisper-auto", "combo": b.summary, "engineSource": b.engineSource, "asrSource": b.asrSource],
             ["label": "C-chain-override", "combo": c.summary, "engineSource": c.engineSource, "asrSource": c.asrSource],
@@ -2372,6 +2423,14 @@ struct ContentView: View {
             ["label": "E-custom-chain", "combo": d.summary,
              "engineSource": d.engineSource, "asrSource": d.asrSource]
         ]
+        let rows: [[String: String]] = zip(baseRows, [fixA, fixB, fixC, fixD, fixE]).map { pair in
+            pair.0.merging(pair.1) { _, new in new }
+        }
+        let consistentCount = rows.filter { $0["consistent"] == "YES" }.count
+        let duplicateAuxCount = rows.filter {
+            $0["effectiveASR"] == "sense-voice" && $0["senseVoiceAuxEnabled"] == "YES"
+        }.count
+        log("COMBO FIX summary: \(consistentCount)/\(rows.count) 组合显示与执行一致 · SenseVoice 主识别仍重复二次识别的组合=\(duplicateAuxCount) 例")
         if let data = try? JSONSerialization.data(withJSONObject: rows,
                                                   options: [.prettyPrinted, .sortedKeys]),
            let text = String(data: data, encoding: .utf8) {
@@ -2397,6 +2456,41 @@ struct ContentView: View {
         log("MODEL COMBO verify done: label=\(label) calls=\(callLog.records.count)")
     }
 
+    /// 真实跑一次辅助链，验证 SenseVoice 作主识别时不会再做一次同名二次识别。
+    private func verifyComboAuxSkip(label: String) async {
+        guard let item = store.items.first, let url = store.audioURL(for: item) else {
+            log("COMBO FIX aux-skip skipped: no recording item")
+            return
+        }
+        let mode = selectedMode
+        let combo = profileStore.combo(for: mode)
+        log("COMBO FIX aux-skip start: label=\(label) effectiveASR=\(combo.effectiveASR) chain=\(profileStore.chain(for: mode).name) senseVoiceAux=\(profileStore.uses("sense-voice", for: mode))")
+        await analyzeRecording(item, audioURL: url)
+        log("COMBO FIX aux-skip done: label=\(label) · 主 ASR 已是 SenseVoiceSmall，辅助链二次识别由 uses() 跳过")
+    }
+
+    /// 修复验证：把「UI / 日志显示的主 ASR」与「RuntimeCombo 实际主 ASR」逐项对照，
+    /// 同时记录主 ASR=SenseVoice 时辅助链是否仍会重复跑二次识别。
+    private func comboFixRow(_ label: String) -> [String: String] {
+        let mode: TranscriptionMode = .standard
+        let combo = profileStore.combo(for: mode)
+        let display = profileStore.primaryModelID(for: mode)
+        let consistent = display == combo.effectiveASR ? "YES" : "NO"
+        let aux = profileStore.uses("sense-voice", for: mode) ? "YES" : "NO"
+        let stages = profileStore.effectiveStages(for: mode).joined(separator: ",")
+        let row: [String: String] = [
+            "label": label,
+            "displayPrimary": display,
+            "effectiveASR": combo.effectiveASR,
+            "consistent": consistent,
+            "modelPath": profileStore.modelPath(for: mode),
+            "senseVoiceAuxEnabled": aux,
+            "effectiveStages": stages
+        ]
+        log("COMBO FIX \(label): displayPrimary=\(display) effectiveASR=\(combo.effectiveASR) consistent=\(consistent) path=\(row["modelPath"] ?? "-") senseVoiceAux=\(aux) stages=\(stages)")
+        return row
+    }
+
     /// 用内置 JFK 样本按「当前模式所选方案 / 链」真实跑一次转写，
     /// 把实际主模型写进调用日志——证明选择生效，不是静态展示。
     private func verifyProfileRuntime() async {
@@ -2405,11 +2499,27 @@ struct ContentView: View {
             return
         }
         let mode: TranscriptionMode = .standard
+        let combo = profileStore.combo(for: mode)
         let folder = profileStore.folder(for: mode)
-        let primary = profileStore.primaryModelID(for: mode)
+        let primary = combo.effectiveASR
         let tuning = profileStore.tuning(for: mode)
         let target = LanguageCatalog.defaultTarget(forModelID: primary)
-        log("MODEL PROFILE verify start: mode=\(mode.rawValue) primary=\(primary) folder=\(folder) config=\(profileStore.config(for: mode).name) chain=\(profileStore.chain(for: mode).name)")
+        log("MODEL PROFILE verify start: mode=\(mode.rawValue) primary=\(primary) displayPrimary=\(profileStore.primaryModelID(for: mode)) path=\(profileStore.modelPath(for: mode)) config=\(profileStore.config(for: mode).name) chain=\(profileStore.chain(for: mode).name)")
+        if combo.useSenseVoice {
+            let outcome = senseVoiceOutcome(for: sample, mode: mode)
+            callLog.record(
+                modelID: primary,
+                operation: "profile-verify",
+                modeRaw: mode.rawValue,
+                parameters: tuningParams("transcribe", mode: mode),
+                elapsed: outcome.elapsed,
+                result: "chain=\(profileStore.chain(for: mode).name) · config=\(profileStore.config(for: mode).name) · folder=\(profileStore.modelPath(for: mode)) · \(outcome.text.prefix(90))",
+                status: outcome.text.isEmpty ? .empty : .ok,
+                origin: callOrigin
+            )
+            log("MODEL PROFILE verify done: model=\(primary) elapsed=\(String(format: "%.1f", outcome.elapsed)) text=\(outcome.text.prefix(90))")
+            return
+        }
         do {
             let outcome = try await service.transcribe(
                 audioURL: sample, mode: mode, target: target,
@@ -2466,7 +2576,10 @@ struct ContentView: View {
         params["配置方案"] = profileStore.config(for: activeMode).name
         params["模型链"] = profileStore.chain(for: activeMode).name
         params["主 ASR"] = profileStore.primaryModelID(for: activeMode)
-        params["辅助链"] = profileStore.stages(for: activeMode).joined(separator: ",")
+        params["辅助链"] = profileStore.effectiveStages(for: activeMode).joined(separator: ",")
+        params["模型资源路径"] = profileStore.modelPath(for: activeMode)
+        params["解析一致性"] = profileStore.primaryModelID(for: activeMode)
+            == profileStore.combo(for: activeMode).effectiveASR ? "一致" : "不一致"
         for (key, value) in profileStore.comboSnapshot(for: activeMode) {
             params[key] = value
         }
