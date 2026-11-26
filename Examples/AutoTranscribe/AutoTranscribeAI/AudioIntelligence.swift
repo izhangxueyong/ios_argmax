@@ -370,10 +370,9 @@ public final class AudioIntelligence: @unchecked Sendable {
     }
 
     private static func modelsFolder() -> URL {
-        if let url = Bundle.main.url(forResource: "ai-models", withExtension: nil),
-           FileManager.default.fileExists(atPath: url.path) { return url }
-        let nested = Bundle.main.bundleURL.appendingPathComponent("Models/ai-models", isDirectory: true)
-        if FileManager.default.fileExists(atPath: nested.path) { return nested }
+        // Xcode folder references land at <app>/ai-models or <app>/Models/ai-models;
+        // xtool/SwiftPM resources land inside a resource bundle.
+        if let url = BundledResources.directory(named: "ai-models") { return url }
         return Bundle.main.bundleURL.appendingPathComponent("ai-models", isDirectory: true)
     }
 
@@ -385,8 +384,7 @@ public final class AudioIntelligence: @unchecked Sendable {
     public func enrollMockVoice() {
         configure()
         guard referenceVector.isEmpty,
-              let url = Bundle.main.url(forResource: "recording", withExtension: "wav")
-                ?? Bundle.main.url(forResource: "recording", withExtension: "wav", subdirectory: "Resources"),
+              let url = BundledResources.url(forResource: "recording", withExtension: "wav"),
               let samples = Self.readWAV16k(url: url) else {
             statusLines.append("voice enrollment: sample audio missing")
             return

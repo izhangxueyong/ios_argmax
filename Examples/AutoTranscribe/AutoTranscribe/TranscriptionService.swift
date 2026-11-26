@@ -24,6 +24,7 @@
 //  decoding strategy uses the SAME bundled model, never a different engine.
 
 import AVFoundation
+import AutoTranscribeAI
 import Foundation
 import SwiftUI
 import WhisperKit
@@ -263,21 +264,12 @@ final class TranscriptionService: ObservableObject {
     }
 
     private func bundledModelDirectory(named name: String) throws -> URL {
-        // Xcode copies folder references from a PBXGroup straight into the bundle
-        // root (so the model lands at <app>/<name>). If "Models" is ever turned
-        // into a folder reference instead, it lands at <app>/Models/<name>.
-        // Accept both layouts so bundling works either way.
-        if let rootURL = Bundle.main.url(forResource: name, withExtension: nil),
-           FileManager.default.fileExists(atPath: rootURL.path) {
-            return rootURL
+        // Xcode copies folder references into the bundle root (<app>/<name> or
+        // <app>/Models/<name>); xtool/SwiftPM puts resources into a
+        // <Product>_<Target>.bundle instead. BundledResources handles both.
+        guard let url = BundledResources.directory(named: name) else {
+            throw TranscriptionServiceError.bundledModelMissing(name)
         }
-        let nested = Bundle.main.bundleURL
-            .appendingPathComponent("Models", isDirectory: true)
-            .appendingPathComponent(name, isDirectory: true)
-        if FileManager.default.fileExists(atPath: nested.path) { return nested }
-        if let url = Bundle.main.url(forResource: name, withExtension: nil, subdirectory: "Models") {
-            return url
-        }
-        throw TranscriptionServiceError.bundledModelMissing(name)
+        return url
     }
 }

@@ -511,7 +511,7 @@ final class RecordingStore: ObservableObject {
 
     func audioURL(for item: RecordingItem) -> URL? {
         if item.usesBundledSample {
-            return Bundle.main.url(forResource: "recording", withExtension: "wav")
+            return BundledResources.url(forResource: "recording", withExtension: "wav")
         }
         guard let name = item.storedFileName else { return nil }
         return documentsURL.appendingPathComponent(name)
@@ -601,7 +601,7 @@ final class RecordingStore: ObservableObject {
     // MARK: - Persistence
 
     private func seed() {
-        if let url = Bundle.main.url(forResource: "recording", withExtension: "wav") {
+        if let url = BundledResources.url(forResource: "recording", withExtension: "wav") {
             let item = RecordingItem(
                 name: "JFK 演讲样本",
                 fileName: "recording.wav",

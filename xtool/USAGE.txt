@@ -1,0 +1,69 @@
+AutoTranscribe — xtool / iOS 真机迁移包使用说明
+================================================
+
+0. 这个包是什么
+   整个仓库源码（约 8 MB），不含 .workbuddy 录像产物、.git 历史和模型二进制。
+   目录 ios_argmax/ 必须整体解压，不能只取 Examples/AutoTranscribe，
+   因为 AutoTranscribe.xcodeproj 通过 XCLocalSwiftPackageReference "../.."
+   引用仓库根的 SwiftPM 包。
+
+1. 解压
+   tar -xzf ios_argmax-xtool-migration.tgz
+   cd ios_argmax
+
+2. 下载并校验端侧模型（约 1.2 GB，需要联网）
+   python3 xtool/prepare_models.py
+   python3 xtool/prepare_models.py --group verify     # 只校验
+   模型放在 Examples/AutoTranscribe/AutoTranscribe/Models/ 下，
+   与 GitHub Actions 的下载步骤完全一致；App 运行时不会联网下载模型。
+   若打包时用了 --with-models，可跳过本步。
+
+3. 准备 xtool（目标电脑 Linux / WSL / macOS 均可）
+   - 安装 xtool（Linux AppImage，macOS Homebrew），swift 工具链 6.x
+   - xtool setup            # 登录 Apple Developer 账号 + 从 Xcode.xip 提取 Darwin Swift SDK
+   - xtool devices          # 确认 iPhone 已连接并信任
+   - 如 bundleID com.argmax.autotranscribe 与你的 team 冲突，改 xtool.yml 里的 bundleID
+
+4. 构建 / 签名 / 安装（在仓库根目录执行）
+   xtool dev run -u <设备UDID>             # 一步完成构建 + 签名 + 安装 + 启动
+   # 或分步执行：
+   xtool dev build --ipa --sign
+   xtool install ./xtool/*.ipa
+   xtool launch com.argmax.autotranscribe
+
+5. 关键文件
+   xtool.yml                     app product / bundleID / Info.plist 合并
+   xtool/Info.plist              麦克风权限、方向、LaunchScreen、iOS 17
+   Package.swift                 AutoTranscribeApp library product + target
+                                 （resources: Models/ 与 Resources/）
+   Examples/AutoTranscribe/AutoTranscribeAI/BundledResources.swift
+                                 同时兼容 Xcode folder reference 与 SwiftPM
+                                 resource bundle 的模型 / 样本音频查找
+   .github/workflows/ios-autotranscribe.yml
+                                 原 CI（macos-15 / Xcode 16.4）与模型清单备查
+
+   注意：包内刻意排除了上游 `Package@swift-6.2.swift`。Swift 6.2+ 工具链
+   会优先选择这个版本化清单，而它既没有 AutoTranscribeAI 也没有
+   AutoTranscribeApp，并强制 Swift 6 语言模式，会让 xtool 找不到 app product。
+   迁移包只保留 `Package.swift`（tools 5.10 / Swift 5 语言模式），
+   Swift 6.x 工具链可以正常解析它。原仓库中的 6.2 清单保持不变。
+
+6. 已知风险（务必先看）
+   - sherpa-onnx-spm 依赖两个 XCFramework 二进制（sherpa-onnx + onnxruntime）。
+     原 CI 为绕过重复 module.modulemap 写了三阶段补丁；xtool/Linux 的
+     SwiftPM 处理 binaryTarget 路径不同，这是最可能失败的地方。
+     建议先在目标机用 `xtool new Hello` 验证工具链，再编本工程。
+   - WhisperKit 依赖 CoreML / ANE；CoreML EP 只在真机生效，模拟器回退 CPU。
+   - 若 Swift 6.x 工具链把 Package.swift 里
+     `.enableExperimentalFeature("StrictConcurrency")` 报为已废弃/不支持，
+     把 swiftSettings() 中的这一行删掉即可（只影响并发告警严格度）。
+   - iOS 17+ 的 LLDB 真机调试需额外 pymobiledevice3；xtool 目前不支持
+     App Extension / Asset Catalog / Storyboard，本 App 未使用这些能力。
+   - Apple 许可条款要求其 SDK 运行在 Apple 硬件上，商用前请自行评估。
+   - 若目标电脑是 Mac：直接用 Xcode 更省事
+     xcodebuild -project Examples/AutoTranscribe/AutoTranscribe.xcodeproj \
+                -scheme AutoTranscribe -destination 'generic/platform=iOS' ...
+
+7. 重新打包
+   ./xtool/make_migration_pack.sh                  # 仅源码
+   ./xtool/make_migration_pack.sh --with-models   # 含模型大文件

@@ -1,0 +1,17 @@
+# xtool / SwiftPM entry point for the AutoTranscribe iOS app.
+# Run from the repository root:  xtool dev build --ipa --sign
+# Docs: https://github.com/xtool-org/xtool
+version: 1
+
+# Change this to a bundle ID that your own Apple Developer team can sign.
+bundleID: com.argmax.autotranscribe
+
+# Which SwiftPM library product xtool wraps into the .app.
+product: AutoTranscribeApp
+
+# Merged over xtool's generated Info.plist (microphone permission, etc.).
+infoPath: xtool/Info.plist
+
+# App icon / entitlements are optional. Uncomment if you add them:
+# iconPath: xtool/AppIcon.png
+# entitlementsPath: xtool/AutoTranscribe.entitlements

@@ -1525,7 +1525,7 @@ struct ContentView: View {
         activeHoldSlot = nil
         activeHoldLanguage = nil
 
-        guard let sampleURL = Bundle.main.url(forResource: "recording", withExtension: "wav"),
+        guard let sampleURL = BundledResources.url(forResource: "recording", withExtension: "wav"),
               let data = try? Data(contentsOf: sampleURL) else {
             setStage(.failed, detail: "内置示例音频缺失", progress: 0)
             log("DEMO failed: bundled sample missing")
@@ -1740,7 +1740,7 @@ struct ContentView: View {
         }
         log("MODEL MGMT load calls logged: \(ModelRegistry.models.count) models")
 
-        if let sample = Bundle.main.url(forResource: "recording", withExtension: "wav") {
+        if let sample = BundledResources.url(forResource: "recording", withExtension: "wav") {
             let probeStart = Date()
             let probe = ai.senseVoiceTranscribe(audioURL: sample)
             if !probe.text.isEmpty {
@@ -2224,7 +2224,7 @@ struct ContentView: View {
             return
         }
 
-        guard let sample = Bundle.main.url(forResource: "recording", withExtension: "wav") else {
+        guard let sample = BundledResources.url(forResource: "recording", withExtension: "wav") else {
             log("ONNX ENGINE verify: bundled sample missing, primary branch already proved engine")
             return
         }
@@ -2494,7 +2494,7 @@ struct ContentView: View {
     /// 用内置 JFK 样本按「当前模式所选方案 / 链」真实跑一次转写，
     /// 把实际主模型写进调用日志——证明选择生效，不是静态展示。
     private func verifyProfileRuntime() async {
-        guard let sample = Bundle.main.url(forResource: "recording", withExtension: "wav") else {
+        guard let sample = BundledResources.url(forResource: "recording", withExtension: "wav") else {
             log("MODEL PROFILE verify skipped: bundled sample missing")
             return
         }

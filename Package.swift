@@ -35,6 +35,13 @@ let package = Package(
             name: "AutoTranscribeAI",
             targets: ["AutoTranscribeAI"]
         ),
+        // xtool entry point: xtool wraps a SwiftPM *library* product into an
+        // iOS .app. The Xcode project still compiles the same sources directly,
+        // so adding this product does not change the xcodebuild/CI path.
+        .library(
+            name: "AutoTranscribeApp",
+            targets: ["AutoTranscribeApp"]
+        ),
         .executable(
             name: "argmax-cli",
             targets: ["ArgmaxCLI"]
@@ -99,6 +106,21 @@ let package = Package(
                 .product(name: "SherpaOnnx", package: "sherpa-onnx-spm"),
             ],
             path: "Examples/AutoTranscribe/AutoTranscribeAI"
+        ),
+        // Same app sources as AutoTranscribe.xcodeproj. SwiftPM resources keep
+        // the `Models/...` and `Resources/...` layout; BundledResources resolves
+        // them inside the generated resource bundle on xtool builds.
+        .target(
+            name: "AutoTranscribeApp",
+            dependencies: [
+                "WhisperKit",
+                "AutoTranscribeAI",
+            ],
+            path: "Examples/AutoTranscribe/AutoTranscribe",
+            resources: [
+                .copy("Models"),
+                .copy("Resources"),
+            ]
         ),
         .testTarget(
             name: "ArgmaxCoreTests",
